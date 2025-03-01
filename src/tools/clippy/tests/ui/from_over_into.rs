@@ -1,7 +1,6 @@
-// run-rustfix
-
-#![feature(custom_inner_attributes)]
+#![feature(type_alias_impl_trait)]
 #![warn(clippy::from_over_into)]
+#![allow(non_local_definitions)]
 #![allow(unused)]
 
 // this should throw an error
@@ -32,7 +31,7 @@ struct SelfKeywords;
 
 impl Into<SelfKeywords> for X {
     fn into(self) -> SelfKeywords {
-        let _ = Self::default();
+        let _ = Self;
         let _ = Self::FOO;
         let _: Self = self;
 
@@ -60,9 +59,17 @@ impl From<String> for A {
     }
 }
 
-fn msrv_1_40() {
-    #![clippy::msrv = "1.40"]
+struct PathInExpansion;
 
+impl Into<String> for PathInExpansion {
+    fn into(self) -> String {
+        // non self/Self paths in expansions are fine
+        panic!()
+    }
+}
+
+#[clippy::msrv = "1.40"]
+fn msrv_1_40() {
     struct FromOverInto<T>(Vec<T>);
 
     impl<T> Into<FromOverInto<T>> for Vec<T> {
@@ -72,15 +79,22 @@ fn msrv_1_40() {
     }
 }
 
+#[clippy::msrv = "1.41"]
 fn msrv_1_41() {
-    #![clippy::msrv = "1.41"]
-
     struct FromOverInto<T>(Vec<T>);
 
     impl<T> Into<FromOverInto<T>> for Vec<T> {
         fn into(self) -> FromOverInto<T> {
             FromOverInto(self)
         }
+    }
+}
+
+fn issue_12138() {
+    struct Hello;
+
+    impl Into<()> for Hello {
+        fn into(self) {}
     }
 }
 

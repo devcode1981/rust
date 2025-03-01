@@ -41,6 +41,9 @@
 //!
 //! {"jsonrpc": "2.0", "method": "exit", "params": null}
 //! ```
+
+#![allow(clippy::print_stderr)]
+
 use std::error::Error;
 
 use lsp_types::OneOf;
@@ -64,7 +67,15 @@ fn main() -> Result<(), Box<dyn Error + Sync + Send>> {
         ..Default::default()
     })
     .unwrap();
-    let initialization_params = connection.initialize(server_capabilities)?;
+    let initialization_params = match connection.initialize(server_capabilities) {
+        Ok(it) => it,
+        Err(e) => {
+            if e.channel_is_disconnected() {
+                io_threads.join()?;
+            }
+            return Err(e.into());
+        }
+    };
     main_loop(connection, initialization_params)?;
     io_threads.join()?;
 
@@ -80,32 +91,32 @@ fn main_loop(
     let _params: InitializeParams = serde_json::from_value(params).unwrap();
     eprintln!("starting example main loop");
     for msg in &connection.receiver {
-        eprintln!("got msg: {:?}", msg);
+        eprintln!("got msg: {msg:?}");
         match msg {
             Message::Request(req) => {
                 if connection.handle_shutdown(&req)? {
                     return Ok(());
                 }
-                eprintln!("got request: {:?}", req);
+                eprintln!("got request: {req:?}");
                 match cast::<GotoDefinition>(req) {
                     Ok((id, params)) => {
-                        eprintln!("got gotoDefinition request #{}: {:?}", id, params);
+                        eprintln!("got gotoDefinition request #{id}: {params:?}");
                         let result = Some(GotoDefinitionResponse::Array(Vec::new()));
                         let result = serde_json::to_value(&result).unwrap();
                         let resp = Response { id, result: Some(result), error: None };
                         connection.sender.send(Message::Response(resp))?;
                         continue;
                     }
-                    Err(err @ ExtractError::JsonError { .. }) => panic!("{:?}", err),
+                    Err(err @ ExtractError::JsonError { .. }) => panic!("{err:?}"),
                     Err(ExtractError::MethodMismatch(req)) => req,
                 };
                 // ...
             }
             Message::Response(resp) => {
-                eprintln!("got response: {:?}", resp);
+                eprintln!("got response: {resp:?}");
             }
             Message::Notification(not) => {
-                eprintln!("got notification: {:?}", not);
+                eprintln!("got notification: {not:?}");
             }
         }
     }

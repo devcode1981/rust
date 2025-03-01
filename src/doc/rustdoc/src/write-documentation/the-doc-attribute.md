@@ -9,11 +9,11 @@ are the same:
 
 ```rust,no_run
 /// This is a doc comment.
-#[doc = " This is a doc comment."]
+#[doc = r" This is a doc comment."]
 # fn f() {}
 ```
 
-(Note the leading space in the attribute version.)
+(Note the leading space and the raw string literal in the attribute version.)
 
 In most cases, `///` is easier to use than `#[doc]`. One case where the latter is easier is
 when generating documentation in macros; the `collapse-docs` pass will combine multiple
@@ -144,10 +144,10 @@ it will not.
 ### `test(attr(...))`
 
 This form of the `doc` attribute allows you to add arbitrary attributes to all your doctests. For
-example, if you want your doctests to fail if they produce any warnings, you could add this:
+example, if you want your doctests to fail if they have dead code, you could add this:
 
 ```rust,no_run
-#![doc(test(attr(deny(warnings))))]
+#![doc(test(attr(deny(dead_code))))]
 ```
 
 ## At the item level
@@ -201,7 +201,7 @@ mod bar {
 # fn main() {}
 ```
 
-Here, because `bar` is not public, `Bar` wouldn't have its own page, so there's nowhere
+Here, because `bar` is not public, `bar` wouldn't have its own page, so there's nowhere
 to link to. `rustdoc` will inline these definitions, and so we end up in the same case
 as the `#[doc(inline)]` above; `Bar` is in a `Structs` section, as if it were defined at
 the top level. If we add the `no_inline` form of the attribute:
@@ -223,12 +223,17 @@ Now we'll have a `Re-exports` line, and `Bar` will not link to anywhere.
 One special case: In Rust 2018 and later, if you `pub use` one of your dependencies, `rustdoc` will
 not eagerly inline it as a module unless you add `#[doc(inline)]`.
 
+If you want to know more about inlining rules, take a look at the
+[`re-exports` chapter](./re-exports.md).
+
 ### `hidden`
 
 <span id="dochidden"></span>
 
-Any item annotated with `#[doc(hidden)]` will not appear in the documentation, unless
-the `strip-hidden` pass is removed.
+Any item annotated with `#[doc(hidden)]` will not appear in the documentation,
+unless the [`--document-hidden-items`](../unstable-features.md#document-hidden-items) flag is used.
+
+You can find more information in the [`re-exports` chapter](./re-exports.md).
 
 ### `alias`
 

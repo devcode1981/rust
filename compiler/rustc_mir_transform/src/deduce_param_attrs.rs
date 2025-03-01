@@ -5,13 +5,12 @@
 //! purposes on a best-effort basis. We compute them here and store them into the crate metadata so
 //! dependent crates can use them.
 
-use rustc_hir::def_id::DefId;
-use rustc_index::bit_set::BitSet;
+use rustc_hir::def_id::LocalDefId;
+use rustc_index::bit_set::DenseBitSet;
 use rustc_middle::mir::visit::{NonMutatingUseContext, PlaceContext, Visitor};
-use rustc_middle::mir::{Body, Local, Location, Operand, Terminator, TerminatorKind, RETURN_PLACE};
-use rustc_middle::ty::{self, DeducedParamAttrs, ParamEnv, Ty, TyCtxt};
+use rustc_middle::mir::{Body, Location, Operand, Place, RETURN_PLACE, Terminator, TerminatorKind};
+use rustc_middle::ty::{self, DeducedParamAttrs, Ty, TyCtxt};
 use rustc_session::config::OptLevel;
-use rustc_span::DUMMY_SP;
 
 /// A visitor that determines which arguments have been mutated. We can't use the mutability field
 /// on LocalDecl for this because it has no meaning post-optimization.
@@ -19,42 +18,43 @@ struct DeduceReadOnly {
     /// Each bit is indexed by argument number, starting at zero (so 0 corresponds to local decl
     /// 1). The bit is true if the argument may have been mutated or false if we know it hasn't
     /// been up to the point we're at.
-    mutable_args: BitSet<usize>,
+    mutable_args: DenseBitSet<usize>,
 }
 
 impl DeduceReadOnly {
     /// Returns a new DeduceReadOnly instance.
     fn new(arg_count: usize) -> Self {
-        Self { mutable_args: BitSet::new_empty(arg_count) }
+        Self { mutable_args: DenseBitSet::new_empty(arg_count) }
     }
 }
 
 impl<'tcx> Visitor<'tcx> for DeduceReadOnly {
-    fn visit_local(&mut self, local: Local, mut context: PlaceContext, _: Location) {
+    fn visit_place(&mut self, place: &Place<'tcx>, context: PlaceContext, _location: Location) {
         // We're only interested in arguments.
-        if local == RETURN_PLACE || local.index() > self.mutable_args.domain_size() {
+        if place.local == RETURN_PLACE || place.local.index() > self.mutable_args.domain_size() {
             return;
         }
 
-        // Replace place contexts that are moves with copies. This is safe in all cases except
-        // function argument position, which we already handled in `visit_terminator()` by using the
-        // ArgumentChecker. See the comment in that method for more details.
-        //
-        // In the future, we might want to move this out into a separate pass, but for now let's
-        // just do it on the fly because that's faster.
-        if matches!(context, PlaceContext::NonMutatingUse(NonMutatingUseContext::Move)) {
-            context = PlaceContext::NonMutatingUse(NonMutatingUseContext::Copy);
-        }
-
-        match context {
-            PlaceContext::MutatingUse(..)
-            | PlaceContext::NonMutatingUse(NonMutatingUseContext::Move) => {
+        let mark_as_mutable = match context {
+            PlaceContext::MutatingUse(..) => {
                 // This is a mutation, so mark it as such.
-                self.mutable_args.insert(local.index() - 1);
+                true
+            }
+            PlaceContext::NonMutatingUse(NonMutatingUseContext::RawBorrow) => {
+                // Whether mutating though a `&raw const` is allowed is still undecided, so we
+                // disable any sketchy `readonly` optimizations for now. But we only need to do
+                // this if the pointer would point into the argument. IOW: for indirect places,
+                // like `&raw (*local).field`, this surely cannot mutate `local`.
+                !place.is_indirect()
             }
             PlaceContext::NonMutatingUse(..) | PlaceContext::NonUse(..) => {
                 // Not mutating, so it's fine.
+                false
             }
+        };
+
+        if mark_as_mutable {
+            self.mutable_args.insert(place.local.index() - 1);
         }
     }
 
@@ -111,15 +111,16 @@ impl<'tcx> Visitor<'tcx> for DeduceReadOnly {
 
         if let TerminatorKind::Call { ref args, .. } = terminator.kind {
             for arg in args {
-                if let Operand::Move(_) = *arg {
-                    // ArgumentChecker panics if a direct move of an argument from a caller to a
-                    // callee was detected.
-                    //
-                    // If, in the future, MIR optimizations cause arguments to be moved directly
-                    // from callers to callees, change the panic to instead add the argument in
-                    // question to `mutating_uses`.
-                    ArgumentChecker::new(self.mutable_args.domain_size())
-                        .visit_operand(arg, location)
+                if let Operand::Move(place) = arg.node {
+                    let local = place.local;
+                    if place.is_indirect()
+                        || local == RETURN_PLACE
+                        || local.index() > self.mutable_args.domain_size()
+                    {
+                        continue;
+                    }
+
+                    self.mutable_args.insert(local.index() - 1);
                 }
             }
         };
@@ -128,37 +129,8 @@ impl<'tcx> Visitor<'tcx> for DeduceReadOnly {
     }
 }
 
-/// A visitor that simply panics if a direct move of an argument from a caller to a callee was
-/// detected.
-struct ArgumentChecker {
-    /// The number of arguments to the calling function.
-    arg_count: usize,
-}
-
-impl ArgumentChecker {
-    /// Creates a new ArgumentChecker.
-    fn new(arg_count: usize) -> Self {
-        Self { arg_count }
-    }
-}
-
-impl<'tcx> Visitor<'tcx> for ArgumentChecker {
-    fn visit_local(&mut self, local: Local, context: PlaceContext, _: Location) {
-        // Check to make sure that, if this local is an argument, we didn't move directly from it.
-        if matches!(context, PlaceContext::NonMutatingUse(NonMutatingUseContext::Move))
-            && local != RETURN_PLACE
-            && local.index() <= self.arg_count
-        {
-            // If, in the future, MIR optimizations cause arguments to be moved directly from
-            // callers to callees, change this panic to instead add the argument in question to
-            // `mutating_uses`.
-            panic!("Detected a direct move from a caller's argument to a callee's argument!")
-        }
-    }
-}
-
 /// Returns true if values of a given type will never be passed indirectly, regardless of ABI.
-fn type_will_always_be_passed_directly<'tcx>(ty: Ty<'tcx>) -> bool {
+fn type_will_always_be_passed_directly(ty: Ty<'_>) -> bool {
     matches!(
         ty.kind(),
         ty::Bool
@@ -178,42 +150,40 @@ fn type_will_always_be_passed_directly<'tcx>(ty: Ty<'tcx>) -> bool {
 /// body of the function instead of just the signature. These can be useful for optimization
 /// purposes on a best-effort basis. We compute them here and store them into the crate metadata so
 /// dependent crates can use them.
-pub fn deduced_param_attrs<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> &'tcx [DeducedParamAttrs] {
+pub(super) fn deduced_param_attrs<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: LocalDefId,
+) -> &'tcx [DeducedParamAttrs] {
     // This computation is unfortunately rather expensive, so don't do it unless we're optimizing.
     // Also skip it in incremental mode.
     if tcx.sess.opts.optimize == OptLevel::No || tcx.sess.opts.incremental.is_some() {
         return &[];
     }
 
-    // If the Freeze language item isn't present, then don't bother.
+    // If the Freeze lang item isn't present, then don't bother.
     if tcx.lang_items().freeze_trait().is_none() {
         return &[];
     }
 
     // Codegen won't use this information for anything if all the function parameters are passed
     // directly. Detect that and bail, for compilation speed.
-    let fn_ty = tcx.type_of(def_id);
-    if matches!(fn_ty.kind(), ty::FnDef(..)) {
-        if fn_ty
+    let fn_ty = tcx.type_of(def_id).instantiate_identity();
+    if matches!(fn_ty.kind(), ty::FnDef(..))
+        && fn_ty
             .fn_sig(tcx)
             .inputs()
             .skip_binder()
             .iter()
             .cloned()
             .all(type_will_always_be_passed_directly)
-        {
-            return &[];
-        }
+    {
+        return &[];
     }
 
     // Don't deduce any attributes for functions that have no MIR.
     if !tcx.is_mir_available(def_id) {
         return &[];
     }
-
-    // Deduced attributes for other crates should be read from the metadata instead of via this
-    // function.
-    debug_assert!(def_id.is_local());
 
     // Grab the optimized MIR. Analyze it to determine which arguments have been mutated.
     let body: &Body<'tcx> = tcx.optimized_mir(def_id);
@@ -228,11 +198,17 @@ pub fn deduced_param_attrs<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> &'tcx [Ded
     // see [1].
     //
     // [1]: https://github.com/rust-lang/rust/pull/103172#discussion_r999139997
+    let typing_env = body.typing_env(tcx);
     let mut deduced_param_attrs = tcx.arena.alloc_from_iter(
         body.local_decls.iter().skip(1).take(body.arg_count).enumerate().map(
             |(arg_index, local_decl)| DeducedParamAttrs {
                 read_only: !deduce_read_only.mutable_args.contains(arg_index)
-                    && local_decl.ty.is_freeze(tcx.at(DUMMY_SP), ParamEnv::reveal_all()),
+                    // We must normalize here to reveal opaques and normalize
+                    // their generic parameters, otherwise we'll see exponential
+                    // blow-up in compile times: #113372
+                    && tcx
+                        .normalize_erasing_regions(typing_env, local_decl.ty)
+                        .is_freeze(tcx, typing_env),
             },
         ),
     );

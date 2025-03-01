@@ -1,8 +1,11 @@
-use crate::{LateContext, LateLintPass, LintContext};
-use rustc_errors::{Applicability, DiagnosticBuilder, MultiSpan};
+use rustc_errors::MultiSpan;
 use rustc_hir as hir;
 use rustc_middle::ty;
-use rustc_span::Symbol;
+use rustc_session::{declare_lint, declare_lint_pass};
+use rustc_span::{Symbol, sym};
+
+use crate::lints::{NonBindingLet, NonBindingLetSub};
+use crate::{LateContext, LateLintPass, LintContext};
 
 declare_lint! {
     /// The `let_underscore_drop` lint checks for statements which don't bind
@@ -11,7 +14,8 @@ declare_lint! {
     /// scope.
     ///
     /// ### Example
-    /// ```
+    ///
+    /// ```rust
     /// struct SomeStruct;
     /// impl Drop for SomeStruct {
     ///     fn drop(&mut self) {
@@ -21,7 +25,7 @@ declare_lint! {
     ///
     /// fn main() {
     ///    #[warn(let_underscore_drop)]
-    ///     // SomeStuct is dropped immediately instead of at end of scope,
+    ///     // SomeStruct is dropped immediately instead of at end of scope,
     ///     // so "Dropping SomeStruct" is printed before "end of main".
     ///     // The order of prints would be reversed if SomeStruct was bound to
     ///     // a name (such as "_foo").
@@ -47,7 +51,7 @@ declare_lint! {
     /// intent.
     pub LET_UNDERSCORE_DROP,
     Allow,
-    "non-binding let on a type that implements `Drop`"
+    "non-binding let on a type that has a destructor"
 }
 
 declare_lint! {
@@ -56,7 +60,7 @@ declare_lint! {
     /// of at end of scope, which is typically incorrect.
     ///
     /// ### Example
-    /// ```compile_fail
+    /// ```rust,compile_fail
     /// use std::sync::{Arc, Mutex};
     /// use std::thread;
     /// let data = Arc::new(Mutex::new(0));
@@ -100,69 +104,67 @@ const SYNC_GUARD_SYMBOLS: [Symbol; 3] = [
 ];
 
 impl<'tcx> LateLintPass<'tcx> for LetUnderscore {
-    fn check_local(&mut self, cx: &LateContext<'_>, local: &hir::Local<'_>) {
-        if !matches!(local.pat.kind, hir::PatKind::Wild) {
+    fn check_local(&mut self, cx: &LateContext<'_>, local: &hir::LetStmt<'_>) {
+        if matches!(local.source, rustc_hir::LocalSource::AsyncFn) {
             return;
         }
-        if let Some(init) = local.init {
-            let init_ty = cx.typeck_results().expr_ty(init);
-            // If the type has a trivial Drop implementation, then it doesn't
-            // matter that we drop the value immediately.
-            if !init_ty.needs_drop(cx.tcx, cx.param_env) {
+
+        let mut top_level = true;
+
+        // We recursively walk through all patterns, so that we can catch cases where the lock is
+        // nested in a pattern. For the basic `let_underscore_drop` lint, we only look at the top
+        // level, since there are many legitimate reasons to bind a sub-pattern to an `_`, if we're
+        // only interested in the rest. But with locks, we prefer having the chance of "false
+        // positives" over missing cases, since the effects can be quite catastrophic.
+        local.pat.walk_always(|pat| {
+            let is_top_level = top_level;
+            top_level = false;
+
+            if !matches!(pat.kind, hir::PatKind::Wild) {
                 return;
             }
-            let is_sync_lock = match init_ty.kind() {
+
+            let ty = cx.typeck_results().pat_ty(pat);
+
+            // If the type has a trivial Drop implementation, then it doesn't
+            // matter that we drop the value immediately.
+            if !ty.needs_drop(cx.tcx, cx.typing_env()) {
+                return;
+            }
+            // Lint for patterns like `mutex.lock()`, which returns `Result<MutexGuard, _>` as well.
+            let potential_lock_type = match ty.kind() {
+                ty::Adt(adt, args) if cx.tcx.is_diagnostic_item(sym::Result, adt.did()) => {
+                    args.type_at(0)
+                }
+                _ => ty,
+            };
+            let is_sync_lock = match potential_lock_type.kind() {
                 ty::Adt(adt, _) => SYNC_GUARD_SYMBOLS
                     .iter()
                     .any(|guard_symbol| cx.tcx.is_diagnostic_item(*guard_symbol, adt.did())),
                 _ => false,
             };
 
+            let can_use_init = is_top_level.then_some(local.init).flatten();
+
+            let sub = NonBindingLetSub {
+                suggestion: pat.span,
+                // We can't suggest `drop()` when we're on the top level.
+                drop_fn_start_end: can_use_init
+                    .map(|init| (local.span.until(init.span), init.span.shrink_to_hi())),
+                is_assign_desugar: matches!(local.source, rustc_hir::LocalSource::AssignDesugar(_)),
+            };
             if is_sync_lock {
-                let mut span = MultiSpan::from_spans(vec![local.pat.span, init.span]);
-                span.push_span_label(
-                    local.pat.span,
-                    "this lock is not assigned to a binding and is immediately dropped".to_string(),
-                );
-                span.push_span_label(
-                    init.span,
-                    "this binding will immediately drop the value assigned to it".to_string(),
-                );
-                cx.struct_span_lint(
+                let span = MultiSpan::from_span(pat.span);
+                cx.emit_span_lint(
                     LET_UNDERSCORE_LOCK,
                     span,
-                    "non-binding let on a synchronization lock",
-                    |lint| build_lint(lint, local, init.span),
-                )
-            } else {
-                cx.struct_span_lint(
-                    LET_UNDERSCORE_DROP,
-                    local.span,
-                    "non-binding let on a type that implements `Drop`",
-                    |lint| build_lint(lint, local, init.span),
-                )
+                    NonBindingLet::SyncLock { sub, pat: pat.span },
+                );
+            // Only emit let_underscore_drop for top-level `_` patterns.
+            } else if can_use_init.is_some() {
+                cx.emit_span_lint(LET_UNDERSCORE_DROP, local.span, NonBindingLet::DropType { sub });
             }
-        }
+        });
     }
-}
-
-fn build_lint<'a, 'b>(
-    lint: &'a mut DiagnosticBuilder<'b, ()>,
-    local: &hir::Local<'_>,
-    init_span: rustc_span::Span,
-) -> &'a mut DiagnosticBuilder<'b, ()> {
-    lint.span_suggestion_verbose(
-        local.pat.span,
-        "consider binding to an unused variable to avoid immediately dropping the value",
-        "_unused",
-        Applicability::MachineApplicable,
-    )
-    .multipart_suggestion(
-        "consider immediately dropping the value",
-        vec![
-            (local.span.until(init_span), "drop(".to_string()),
-            (init_span.shrink_to_hi(), ")".to_string()),
-        ],
-        Applicability::MachineApplicable,
-    )
 }

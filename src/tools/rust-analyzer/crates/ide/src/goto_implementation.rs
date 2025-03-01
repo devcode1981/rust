@@ -4,81 +4,78 @@ use ide_db::{
     helpers::pick_best_token,
     RootDatabase,
 };
-use itertools::Itertools;
 use syntax::{ast, AstNode, SyntaxKind::*, T};
 
 use crate::{FilePosition, NavigationTarget, RangeInfo, TryToNav};
 
 // Feature: Go to Implementation
 //
-// Navigates to the impl blocks of types.
+// Navigates to the impl items of types.
 //
-// |===
-// | Editor  | Shortcut
+// | Editor  | Shortcut |
+// |---------|----------|
+// | VS Code | <kbd>Ctrl+F12</kbd>
 //
-// | VS Code | kbd:[Ctrl+F12]
-// |===
-//
-// image::https://user-images.githubusercontent.com/48062697/113065566-02f85480-91b1-11eb-9288-aaad8abd8841.gif[]
+// ![Go to Implementation](https://user-images.githubusercontent.com/48062697/113065566-02f85480-91b1-11eb-9288-aaad8abd8841.gif)
 pub(crate) fn goto_implementation(
     db: &RootDatabase,
-    position: FilePosition,
+    FilePosition { file_id, offset }: FilePosition,
 ) -> Option<RangeInfo<Vec<NavigationTarget>>> {
     let sema = Semantics::new(db);
-    let source_file = sema.parse(position.file_id);
+    let source_file = sema.parse_guess_edition(file_id);
     let syntax = source_file.syntax().clone();
 
-    let original_token =
-        pick_best_token(syntax.token_at_offset(position.offset), |kind| match kind {
-            IDENT | T![self] | INT_NUMBER => 1,
-            _ => 0,
-        })?;
+    let original_token = pick_best_token(syntax.token_at_offset(offset), |kind| match kind {
+        IDENT | T![self] | INT_NUMBER => 1,
+        _ => 0,
+    })?;
     let range = original_token.text_range();
     let navs = sema
-        .descend_into_macros(original_token)
-        .into_iter()
-        .filter_map(|token| token.parent().and_then(ast::NameLike::cast))
-        .filter_map(|node| match &node {
-            ast::NameLike::Name(name) => {
-                NameClass::classify(&sema, name).map(|class| match class {
-                    NameClass::Definition(it) | NameClass::ConstReference(it) => it,
-                    NameClass::PatFieldShorthand { local_def, field_ref: _ } => {
-                        Definition::Local(local_def)
+        .descend_into_macros_exact(original_token)
+        .iter()
+        .filter_map(|token| {
+            token
+                .parent()
+                .and_then(ast::NameLike::cast)
+                .and_then(|node| match &node {
+                    ast::NameLike::Name(name) => {
+                        NameClass::classify(&sema, name).and_then(|class| match class {
+                            NameClass::Definition(it) | NameClass::ConstReference(it) => Some(it),
+                            NameClass::PatFieldShorthand { .. } => None,
+                        })
                     }
+                    ast::NameLike::NameRef(name_ref) => NameRefClass::classify(&sema, name_ref)
+                        .and_then(|class| match class {
+                            NameRefClass::Definition(def, _) => Some(def),
+                            NameRefClass::FieldShorthand { .. }
+                            | NameRefClass::ExternCrateShorthand { .. } => None,
+                        }),
+                    ast::NameLike::Lifetime(_) => None,
                 })
-            }
-            ast::NameLike::NameRef(name_ref) => {
-                NameRefClass::classify(&sema, name_ref).map(|class| match class {
-                    NameRefClass::Definition(def) => def,
-                    NameRefClass::FieldShorthand { local_ref, field_ref: _ } => {
-                        Definition::Local(local_ref)
-                    }
+                .and_then(|def| {
+                    let navs = match def {
+                        Definition::Trait(trait_) => impls_for_trait(&sema, trait_),
+                        Definition::Adt(adt) => impls_for_ty(&sema, adt.ty(sema.db)),
+                        Definition::TypeAlias(alias) => impls_for_ty(&sema, alias.ty(sema.db)),
+                        Definition::BuiltinType(builtin) => {
+                            impls_for_ty(&sema, builtin.ty(sema.db))
+                        }
+                        Definition::Function(f) => {
+                            let assoc = f.as_assoc_item(sema.db)?;
+                            let name = assoc.name(sema.db)?;
+                            let trait_ = assoc.container_or_implemented_trait(sema.db)?;
+                            impls_for_trait_item(&sema, trait_, name)
+                        }
+                        Definition::Const(c) => {
+                            let assoc = c.as_assoc_item(sema.db)?;
+                            let name = assoc.name(sema.db)?;
+                            let trait_ = assoc.container_or_implemented_trait(sema.db)?;
+                            impls_for_trait_item(&sema, trait_, name)
+                        }
+                        _ => return None,
+                    };
+                    Some(navs)
                 })
-            }
-            ast::NameLike::Lifetime(_) => None,
-        })
-        .unique()
-        .filter_map(|def| {
-            let navs = match def {
-                Definition::Trait(trait_) => impls_for_trait(&sema, trait_),
-                Definition::Adt(adt) => impls_for_ty(&sema, adt.ty(sema.db)),
-                Definition::TypeAlias(alias) => impls_for_ty(&sema, alias.ty(sema.db)),
-                Definition::BuiltinType(builtin) => impls_for_ty(&sema, builtin.ty(sema.db)),
-                Definition::Function(f) => {
-                    let assoc = f.as_assoc_item(sema.db)?;
-                    let name = assoc.name(sema.db)?;
-                    let trait_ = assoc.containing_trait_or_trait_impl(sema.db)?;
-                    impls_for_trait_item(&sema, trait_, name)
-                }
-                Definition::Const(c) => {
-                    let assoc = c.as_assoc_item(sema.db)?;
-                    let name = assoc.name(sema.db)?;
-                    let trait_ = assoc.containing_trait_or_trait_impl(sema.db)?;
-                    impls_for_trait_item(&sema, trait_, name)
-                }
-                _ => return None,
-            };
-            Some(navs)
         })
         .flatten()
         .collect();
@@ -87,7 +84,11 @@ pub(crate) fn goto_implementation(
 }
 
 fn impls_for_ty(sema: &Semantics<'_, RootDatabase>, ty: hir::Type) -> Vec<NavigationTarget> {
-    Impl::all_for_type(sema.db, ty).into_iter().filter_map(|imp| imp.try_to_nav(sema.db)).collect()
+    Impl::all_for_type(sema.db, ty)
+        .into_iter()
+        .filter_map(|imp| imp.try_to_nav(sema.db))
+        .flatten()
+        .collect()
 }
 
 fn impls_for_trait(
@@ -97,6 +98,7 @@ fn impls_for_trait(
     Impl::all_for_trait(sema.db, trait_)
         .into_iter()
         .filter_map(|imp| imp.try_to_nav(sema.db))
+        .flatten()
         .collect()
 }
 
@@ -110,21 +112,22 @@ fn impls_for_trait_item(
         .filter_map(|imp| {
             let item = imp.items(sema.db).iter().find_map(|itm| {
                 let itm_name = itm.name(sema.db)?;
-                (itm_name == fun_name).then(|| *itm)
+                (itm_name == fun_name).then_some(*itm)
             })?;
             item.try_to_nav(sema.db)
         })
+        .flatten()
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use ide_db::base_db::FileRange;
+    use ide_db::FileRange;
     use itertools::Itertools;
 
     use crate::fixture;
 
-    fn check(ra_fixture: &str) {
+    fn check(#[rust_analyzer::rust_fixture] ra_fixture: &str) {
         let (analysis, position, expected) = fixture::annotations(ra_fixture);
 
         let navs = analysis.goto_implementation(position).unwrap().unwrap().info;
@@ -254,7 +257,7 @@ impl T for &Foo {}
             r#"
 //- minicore: copy, derive
   #[derive(Copy)]
-//^^^^^^^^^^^^^^^
+         //^^^^
 struct Foo$0;
 "#,
         );
@@ -297,6 +300,7 @@ impl Foo<str> {}
 //- /lib.rs crate:main deps:core
 fn foo(_: bool$0) {{}}
 //- /libcore.rs crate:core
+#![rustc_coherence_is_core]
 #[lang = "bool"]
 impl bool {}
    //^^^^
@@ -337,6 +341,77 @@ struct S;
 impl Tr for S {
     const C: usize = 4;
         //^
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn goto_adt_implementation_inside_block() {
+        check(
+            r#"
+//- minicore: copy, derive
+trait Bar {}
+
+fn test() {
+    #[derive(Copy)]
+  //^^^^^^^^^^^^^^^
+    struct Foo$0;
+
+    impl Foo {}
+       //^^^
+
+    trait Baz {}
+
+    impl Bar for Foo {}
+               //^^^
+
+    impl Baz for Foo {}
+               //^^^
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn goto_trait_implementation_inside_block() {
+        check(
+            r#"
+struct Bar;
+
+fn test() {
+    trait Foo$0 {}
+
+    struct Baz;
+
+    impl Foo for Bar {}
+               //^^^
+
+    impl Foo for Baz {}
+               //^^^
+}
+"#,
+        );
+        check(
+            r#"
+struct Bar;
+
+fn test() {
+    trait Foo {
+        fn foo$0() {}
+    }
+
+    struct Baz;
+
+    impl Foo for Bar {
+        fn foo() {}
+         //^^^
+    }
+
+    impl Foo for Baz {
+        fn foo() {}
+         //^^^
+    }
 }
 "#,
         );

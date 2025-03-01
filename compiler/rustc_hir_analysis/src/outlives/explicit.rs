@@ -1,24 +1,24 @@
-use rustc_data_structures::fx::FxHashMap;
+use rustc_data_structures::fx::FxIndexMap;
 use rustc_hir::def_id::DefId;
 use rustc_middle::ty::{self, OutlivesPredicate, TyCtxt};
 
 use super::utils::*;
 
 #[derive(Debug)]
-pub struct ExplicitPredicatesMap<'tcx> {
-    map: FxHashMap<DefId, ty::EarlyBinder<RequiredPredicates<'tcx>>>,
+pub(crate) struct ExplicitPredicatesMap<'tcx> {
+    map: FxIndexMap<DefId, ty::EarlyBinder<'tcx, RequiredPredicates<'tcx>>>,
 }
 
 impl<'tcx> ExplicitPredicatesMap<'tcx> {
-    pub fn new() -> ExplicitPredicatesMap<'tcx> {
-        ExplicitPredicatesMap { map: FxHashMap::default() }
+    pub(crate) fn new() -> ExplicitPredicatesMap<'tcx> {
+        ExplicitPredicatesMap { map: FxIndexMap::default() }
     }
 
     pub(crate) fn explicit_predicates_of(
         &mut self,
         tcx: TyCtxt<'tcx>,
         def_id: DefId,
-    ) -> &ty::EarlyBinder<RequiredPredicates<'tcx>> {
+    ) -> &ty::EarlyBinder<'tcx, RequiredPredicates<'tcx>> {
         self.map.entry(def_id).or_insert_with(|| {
             let predicates = if def_id.is_local() {
                 tcx.explicit_predicates_of(def_id)
@@ -30,7 +30,7 @@ impl<'tcx> ExplicitPredicatesMap<'tcx> {
             // process predicates and convert to `RequiredPredicates` entry, see below
             for &(predicate, span) in predicates.predicates {
                 match predicate.kind().skip_binder() {
-                    ty::PredicateKind::TypeOutlives(OutlivesPredicate(ty, reg)) => {
+                    ty::ClauseKind::TypeOutlives(OutlivesPredicate(ty, reg)) => {
                         insert_outlives_predicate(
                             tcx,
                             ty.into(),
@@ -40,7 +40,7 @@ impl<'tcx> ExplicitPredicatesMap<'tcx> {
                         )
                     }
 
-                    ty::PredicateKind::RegionOutlives(OutlivesPredicate(reg1, reg2)) => {
+                    ty::ClauseKind::RegionOutlives(OutlivesPredicate(reg1, reg2)) => {
                         insert_outlives_predicate(
                             tcx,
                             reg1.into(),
@@ -49,21 +49,16 @@ impl<'tcx> ExplicitPredicatesMap<'tcx> {
                             &mut required_predicates,
                         )
                     }
-
-                    ty::PredicateKind::Trait(..)
-                    | ty::PredicateKind::Projection(..)
-                    | ty::PredicateKind::WellFormed(..)
-                    | ty::PredicateKind::ObjectSafe(..)
-                    | ty::PredicateKind::ClosureKind(..)
-                    | ty::PredicateKind::Subtype(..)
-                    | ty::PredicateKind::Coerce(..)
-                    | ty::PredicateKind::ConstEvaluatable(..)
-                    | ty::PredicateKind::ConstEquate(..)
-                    | ty::PredicateKind::TypeWellFormedFromEnv(..) => (),
+                    ty::ClauseKind::Trait(_)
+                    | ty::ClauseKind::Projection(_)
+                    | ty::ClauseKind::ConstArgHasType(_, _)
+                    | ty::ClauseKind::WellFormed(_)
+                    | ty::ClauseKind::ConstEvaluatable(_)
+                    | ty::ClauseKind::HostEffect(..) => {}
                 }
             }
 
-            ty::EarlyBinder(required_predicates)
+            ty::EarlyBinder::bind(required_predicates)
         })
     }
 }

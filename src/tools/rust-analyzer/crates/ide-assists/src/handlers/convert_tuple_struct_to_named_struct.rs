@@ -1,8 +1,8 @@
 use either::Either;
 use ide_db::defs::{Definition, NameRefClass};
 use syntax::{
-    ast::{self, AstNode, HasGenericParams, HasVisibility},
-    match_ast, SyntaxNode,
+    ast::{self, AstNode, HasAttrs, HasGenericParams, HasVisibility},
+    match_ast, ted, SyntaxKind, SyntaxNode,
 };
 
 use crate::{assist_context::SourceChangeBuilder, AssistContext, AssistId, AssistKind, Assists};
@@ -50,10 +50,8 @@ pub(crate) fn convert_tuple_struct_to_named_struct(
     acc: &mut Assists,
     ctx: &AssistContext<'_>,
 ) -> Option<()> {
-    let strukt = ctx
-        .find_node_at_offset::<ast::Struct>()
-        .map(Either::Left)
-        .or_else(|| ctx.find_node_at_offset::<ast::Variant>().map(Either::Right))?;
+    let name = ctx.find_node_at_offset::<ast::Name>()?;
+    let strukt = name.syntax().parent().and_then(<Either<ast::Struct, ast::Variant>>::cast)?;
     let field_list = strukt.as_ref().either(|s| s.field_list(), |v| v.field_list())?;
     let tuple_fields = match field_list {
         ast::FieldList::TupleFieldList(it) => it,
@@ -85,10 +83,14 @@ fn edit_struct_def(
     tuple_fields: ast::TupleFieldList,
     names: Vec<ast::Name>,
 ) {
-    let record_fields = tuple_fields
-        .fields()
-        .zip(names)
-        .filter_map(|(f, name)| Some(ast::make::record_field(f.visibility(), name, f.ty()?)));
+    let record_fields = tuple_fields.fields().zip(names).filter_map(|(f, name)| {
+        let field = ast::make::record_field(f.visibility(), name, f.ty()?).clone_for_update();
+        ted::insert_all(
+            ted::Position::first_child_of(field.syntax()),
+            f.attrs().map(|attr| attr.syntax().clone_subtree().clone_for_update().into()).collect(),
+        );
+        Some(field)
+    });
     let record_fields = ast::make::record_field_list(record_fields);
     let tuple_fields_text_range = tuple_fields.syntax().text_range();
 
@@ -102,7 +104,9 @@ fn edit_struct_def(
                 ast::make::tokens::single_newline().text(),
             );
             edit.insert(tuple_fields_text_range.start(), w.syntax().text());
-            edit.insert(tuple_fields_text_range.start(), ",");
+            if w.syntax().last_token().is_none_or(|t| t.kind() != SyntaxKind::COMMA) {
+                edit.insert(tuple_fields_text_range.start(), ",");
+            }
             edit.insert(
                 tuple_fields_text_range.start(),
                 ast::make::tokens::single_newline().text(),
@@ -136,8 +140,10 @@ fn edit_struct_references(
         match_ast! {
             match node {
                 ast::TupleStructPat(tuple_struct_pat) => {
+                    let file_range = ctx.sema.original_range_opt(&node)?;
+                    edit.edit_file(file_range.file_id);
                     edit.replace(
-                        tuple_struct_pat.syntax().text_range(),
+                        file_range.range,
                         ast::make::record_pat_with_fields(
                             tuple_struct_pat.path()?,
                             ast::make::record_pat_field_list(tuple_struct_pat.fields().zip(names).map(
@@ -147,7 +153,7 @@ fn edit_struct_references(
                                         pat,
                                     )
                                 },
-                            )),
+                            ), None),
                         )
                         .to_string(),
                     );
@@ -159,8 +165,8 @@ fn edit_struct_references(
                     // this also includes method calls like Foo::new(42), we should skip them
                     if let Some(name_ref) = path.segment().and_then(|s| s.name_ref()) {
                         match NameRefClass::classify(&ctx.sema, &name_ref) {
-                            Some(NameRefClass::Definition(Definition::SelfType(_))) => {},
-                            Some(NameRefClass::Definition(def)) if def == strukt_def => {},
+                            Some(NameRefClass::Definition(Definition::SelfType(_), _)) => {},
+                            Some(NameRefClass::Definition(def, _)) if def == strukt_def => {},
                             _ => return None,
                         };
                     }
@@ -168,7 +174,7 @@ fn edit_struct_references(
                     let arg_list = call_expr.syntax().descendants().find_map(ast::ArgList::cast)?;
 
                     edit.replace(
-                        call_expr.syntax().text_range(),
+                        ctx.sema.original_range(&node).range,
                         ast::make::record_expr(
                             path,
                             ast::make::record_expr_field_list(arg_list.args().zip(names).map(
@@ -190,7 +196,7 @@ fn edit_struct_references(
     };
 
     for (file_id, refs) in usages {
-        edit.edit_file(file_id);
+        edit.edit_file(file_id.file_id());
         for r in refs {
             for node in r.name.syntax().ancestors() {
                 if edit_node(edit, node).is_some() {
@@ -215,10 +221,10 @@ fn edit_field_references(
         let def = Definition::Field(field);
         let usages = def.usages(&ctx.sema).all();
         for (file_id, refs) in usages {
-            edit.edit_file(file_id);
+            edit.edit_file(file_id.file_id());
             for r in refs {
                 if let Some(name_ref) = r.name.as_name_ref() {
-                    edit.replace(name_ref.syntax().text_range(), name.text());
+                    edit.replace(ctx.sema.original_range(name_ref.syntax()).range, name.text());
                 }
             }
         }
@@ -226,7 +232,13 @@ fn edit_field_references(
 }
 
 fn generate_names(fields: impl Iterator<Item = ast::TupleField>) -> Vec<ast::Name> {
-    fields.enumerate().map(|(i, _)| ast::make::name(&format!("field{}", i + 1))).collect()
+    fields
+        .enumerate()
+        .map(|(i, _)| {
+            let idx = i + 1;
+            ast::make::name(&format!("field{idx}"))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -242,6 +254,24 @@ mod tests {
             r#"struct Foo$0 { bar: u32 };"#,
         );
         check_assist_not_applicable(convert_tuple_struct_to_named_struct, r#"struct Foo$0;"#);
+    }
+    #[test]
+    fn convert_in_macro_args() {
+        check_assist(
+            convert_tuple_struct_to_named_struct,
+            r#"
+macro_rules! foo {($i:expr) => {$i} }
+struct T$0(u8);
+fn test() {
+    foo!(T(1));
+}"#,
+            r#"
+macro_rules! foo {($i:expr) => {$i} }
+struct T { field1: u8 }
+fn test() {
+    foo!(T { field1: 1 });
+}"#,
+        );
     }
 
     #[test]
@@ -549,6 +579,29 @@ where
     }
 
     #[test]
+    fn convert_variant_in_macro_args() {
+        check_assist(
+            convert_tuple_struct_to_named_struct,
+            r#"
+macro_rules! foo {($i:expr) => {$i} }
+enum T {
+  V$0(u8)
+}
+fn test() {
+    foo!(T::V(1));
+}"#,
+            r#"
+macro_rules! foo {($i:expr) => {$i} }
+enum T {
+  V { field1: u8 }
+}
+fn test() {
+    foo!(T::V { field1: 1 });
+}"#,
+        );
+    }
+
+    #[test]
     fn convert_simple_variant() {
         check_assist(
             convert_tuple_struct_to_named_struct,
@@ -833,6 +886,140 @@ mod foo;
 use crate::{A::Variant, Inner};
 fn f() {
     let a = Variant { field1: Inner };
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn where_clause_with_trailing_comma() {
+        check_assist(
+            convert_tuple_struct_to_named_struct,
+            r#"
+trait Foo {}
+
+struct Bar$0<T>(pub T)
+where
+    T: Foo,;
+"#,
+            r#"
+trait Foo {}
+
+struct Bar<T>
+where
+    T: Foo,
+{ pub field1: T }
+
+"#,
+        );
+    }
+
+    #[test]
+    fn fields_with_attrs() {
+        check_assist(
+            convert_tuple_struct_to_named_struct,
+            r#"
+pub struct $0Foo(#[my_custom_attr] u32);
+"#,
+            r#"
+pub struct Foo { #[my_custom_attr] field1: u32 }
+"#,
+        );
+    }
+
+    #[test]
+    fn convert_in_macro_pattern_args() {
+        check_assist(
+            convert_tuple_struct_to_named_struct,
+            r#"
+macro_rules! foo {
+    ($expression:expr, $pattern:pat) => {
+        match $expression {
+            $pattern => true,
+            _ => false
+        }
+    };
+}
+enum Expr {
+    A$0(usize),
+}
+fn main() {
+    let e = Expr::A(0);
+    foo!(e, Expr::A(0));
+}
+"#,
+            r#"
+macro_rules! foo {
+    ($expression:expr, $pattern:pat) => {
+        match $expression {
+            $pattern => true,
+            _ => false
+        }
+    };
+}
+enum Expr {
+    A { field1: usize },
+}
+fn main() {
+    let e = Expr::A { field1: 0 };
+    foo!(e, Expr::A { field1: 0 });
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn convert_in_multi_file_macro_pattern_args() {
+        check_assist(
+            convert_tuple_struct_to_named_struct,
+            r#"
+//- /main.rs
+mod foo;
+
+enum Test {
+    A$0(i32)
+}
+
+//- /foo.rs
+use crate::Test;
+
+macro_rules! foo {
+    ($expression:expr, $pattern:pat) => {
+        match $expression {
+            $pattern => true,
+            _ => false
+        }
+    };
+}
+
+fn foo() {
+    let a = Test::A(0);
+    foo!(a, Test::A(0));
+}
+"#,
+            r#"
+//- /main.rs
+mod foo;
+
+enum Test {
+    A { field1: i32 }
+}
+
+//- /foo.rs
+use crate::Test;
+
+macro_rules! foo {
+    ($expression:expr, $pattern:pat) => {
+        match $expression {
+            $pattern => true,
+            _ => false
+        }
+    };
+}
+
+fn foo() {
+    let a = Test::A { field1: 0 };
+    foo!(a, Test::A { field1: 0 });
 }
 "#,
         );

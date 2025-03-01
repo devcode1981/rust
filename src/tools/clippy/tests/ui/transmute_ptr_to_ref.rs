@@ -1,8 +1,9 @@
-// run-rustfix
-
-#![feature(custom_inner_attributes)]
 #![warn(clippy::transmute_ptr_to_ref)]
-#![allow(clippy::match_single_binding)]
+#![allow(
+    clippy::match_single_binding,
+    clippy::unnecessary_cast,
+    clippy::missing_transmute_annotations
+)]
 
 unsafe fn _ptr_to_ref<T, U>(p: *const T, m: *mut T, o: *const U, om: *mut U) {
     let _: &T = std::mem::transmute(p);
@@ -51,8 +52,8 @@ unsafe fn _issue8924<'a, 'b, 'c>(x: *const &'a u32, y: *const &'b u32) -> &'c &'
     }
 }
 
+#[clippy::msrv = "1.38"]
 unsafe fn _meets_msrv<'a, 'b, 'c>(x: *const &'a u32) -> &'c &'b u32 {
-    #![clippy::msrv = "1.38"]
     let a = 0u32;
     let a = &a as *const u32;
     let _: &u32 = std::mem::transmute(a);
@@ -63,8 +64,8 @@ unsafe fn _meets_msrv<'a, 'b, 'c>(x: *const &'a u32) -> &'c &'b u32 {
     }
 }
 
+#[clippy::msrv = "1.37"]
 unsafe fn _under_msrv<'a, 'b, 'c>(x: *const &'a u32) -> &'c &'b u32 {
-    #![clippy::msrv = "1.37"]
     let a = 0u32;
     let a = &a as *const u32;
     let _: &u32 = std::mem::transmute(a);

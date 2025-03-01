@@ -1,7 +1,10 @@
-use super::{nfa, Byte, Nfa, Ref};
-use crate::Map;
 use std::fmt;
 use std::sync::atomic::{AtomicU32, Ordering};
+
+use tracing::instrument;
+
+use super::{Byte, Nfa, Ref, nfa};
+use crate::Map;
 
 #[derive(PartialEq, Clone, Debug)]
 pub(crate) struct Dfa<R>
@@ -35,6 +38,7 @@ impl<R> Transitions<R>
 where
     R: Ref,
 {
+    #[cfg(test)]
     fn insert(&mut self, transition: Transition<R>, state: State) {
         match transition {
             Transition::Byte(b) => {
@@ -82,14 +86,6 @@ impl<R> Dfa<R>
 where
     R: Ref,
 {
-    pub(crate) fn unit() -> Self {
-        let transitions: Map<State, Transitions<R>> = Map::default();
-        let start = State::new();
-        let accepting = start;
-
-        Self { transitions, start, accepting }
-    }
-
     #[cfg(test)]
     pub(crate) fn bool() -> Self {
         let mut transitions: Map<State, Transitions<R>> = Map::default();

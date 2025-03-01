@@ -1,14 +1,17 @@
-// run-rustfix
-
-#![feature(lint_reasons)]
+//@aux-build:proc_macros.rs
+#![feature(yeet_expr)]
 #![allow(unused)]
 #![allow(
     clippy::if_same_then_else,
     clippy::single_match,
     clippy::needless_bool,
-    clippy::equatable_if_let
+    clippy::equatable_if_let,
+    clippy::needless_else
 )]
 #![warn(clippy::needless_return)]
+
+extern crate proc_macros;
+use proc_macros::with_span;
 
 use std::cell::RefCell;
 
@@ -28,6 +31,16 @@ fn test_end_of_fn() -> bool {
 
 fn test_no_semicolon() -> bool {
     return true;
+}
+
+#[rustfmt::skip]
+fn test_multiple_semicolon() -> bool {
+    return true;;;
+}
+
+#[rustfmt::skip]
+fn test_multiple_semicolon_with_spaces() -> bool {
+    return true;; ; ;
 }
 
 fn test_if_block() -> bool {
@@ -227,9 +240,39 @@ fn needless_return_macro() -> String {
     return format!("Hello {}", "world!");
 }
 
-fn issue_9361() -> i32 {
-    #[allow(clippy::integer_arithmetic)]
-    return 1 + 2;
+fn issue_9361(n: i32) -> i32 {
+    #[expect(clippy::arithmetic_side_effects)]
+    return n + n;
+}
+
+mod issue_12998 {
+    fn expect_lint() -> i32 {
+        let x = 1;
+
+        #[expect(clippy::needless_return)]
+        return x;
+    }
+
+    fn expect_group() -> i32 {
+        let x = 1;
+
+        #[expect(clippy::style)]
+        return x;
+    }
+
+    fn expect_all() -> i32 {
+        let x = 1;
+
+        #[expect(clippy::all)]
+        return x;
+    }
+
+    fn expect_warnings() -> i32 {
+        let x = 1;
+
+        #[expect(warnings)]
+        return x;
+    }
 }
 
 fn issue8336(x: i32) -> bool {
@@ -269,4 +312,89 @@ fn issue9503(x: usize) -> isize {
     };
 }
 
+mod issue9416 {
+    pub fn with_newline() {
+        let _ = 42;
+
+        return;
+    }
+
+    #[rustfmt::skip]
+    pub fn oneline() {
+        let _ = 42; return;
+    }
+}
+
+fn issue9947() -> Result<(), String> {
+    do yeet "hello";
+}
+
+// without anyhow, but triggers the same bug I believe
+#[expect(clippy::useless_format)]
+fn issue10051() -> Result<String, String> {
+    if true {
+        return Ok(format!("ok!"));
+    } else {
+        return Err(format!("err!"));
+    }
+}
+
+mod issue10049 {
+    fn single() -> u32 {
+        return if true { 1 } else { 2 };
+    }
+
+    fn multiple(b1: bool, b2: bool, b3: bool) -> u32 {
+        return if b1 { 0 } else { 1 } | if b2 { 2 } else { 3 } | if b3 { 4 } else { 5 };
+    }
+}
+
+fn test_match_as_stmt() {
+    let x = 9;
+    match x {
+        1 => 2,
+        2 => return,
+        _ => 0,
+    };
+}
+
+fn allow_works() -> i32 {
+    #[allow(clippy::needless_return, clippy::match_single_binding)]
+    match () {
+        () => return 42,
+    }
+}
+
+fn conjunctive_blocks() -> String {
+    return { "a".to_string() } + "b" + { "c" };
+}
+
+fn issue12907() -> String {
+    return "".split("").next().unwrap().to_string();
+}
+
+fn issue13458() {
+    with_span!(span return);
+}
+
 fn main() {}
+
+fn a(x: Option<u8>) -> Option<u8> {
+    match x {
+        Some(_) => None,
+        None => {
+            #[expect(clippy::needless_return, reason = "Use early return for errors.")]
+            return None;
+        },
+    }
+}
+
+fn b(x: Option<u8>) -> Option<u8> {
+    match x {
+        Some(_) => None,
+        None => {
+            #[expect(clippy::needless_return)]
+            return None;
+        },
+    }
+}

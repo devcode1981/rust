@@ -1,131 +1,133 @@
-use clap::{Arg, ArgAction, ArgMatches, Command};
-use std::env;
+use clap::{Parser, Subcommand, ValueEnum};
+use std::num::NonZero;
 use std::path::PathBuf;
 
-fn get_clap_config() -> ArgMatches {
-    Command::new("lintcheck")
-        .about("run clippy on a set of crates and check output")
-        .args([
-            Arg::new("only")
-                .action(ArgAction::Set)
-                .value_name("CRATE")
-                .long("only")
-                .help("Only process a single crate of the list"),
-            Arg::new("crates-toml")
-                .action(ArgAction::Set)
-                .value_name("CRATES-SOURCES-TOML-PATH")
-                .long("crates-toml")
-                .help("Set the path for a crates.toml where lintcheck should read the sources from"),
-            Arg::new("threads")
-                .action(ArgAction::Set)
-                .value_name("N")
-                .value_parser(clap::value_parser!(usize))
-                .short('j')
-                .long("jobs")
-                .help("Number of threads to use, 0 automatic choice"),
-            Arg::new("fix")
-                .long("fix")
-                .help("Runs cargo clippy --fix and checks if all suggestions apply"),
-            Arg::new("filter")
-                .long("filter")
-                .action(ArgAction::Append)
-                .value_name("clippy_lint_name")
-                .help("Apply a filter to only collect specified lints, this also overrides `allow` attributes"),
-            Arg::new("markdown")
-                .long("markdown")
-                .help("Change the reports table to use markdown links"),
-            Arg::new("recursive")
-                .long("--recursive")
-                .help("Run clippy on the dependencies of crates specified in crates-toml")
-                .conflicts_with("threads")
-                .conflicts_with("fix"),
-        ])
-        .get_matches()
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Parser, Clone, Debug)]
+#[command(args_conflicts_with_subcommands = true)]
+pub(crate) struct LintcheckConfig {
+    /// Number of threads to use (default: all unless --fix or --recursive)
+    #[clap(
+        long = "jobs",
+        short = 'j',
+        value_name = "N",
+        default_value_t = 0,
+        default_value_if("perf", "true", Some("1")), // Limit jobs to 1 when benchmarking
+        conflicts_with("perf"),
+        required = false,
+        hide_default_value = true
+    )]
+    pub max_jobs: usize,
+    /// Set the path for a crates.toml where lintcheck should read the sources from
+    #[clap(
+        long = "crates-toml",
+        value_name = "CRATES-SOURCES-TOML-PATH",
+        default_value = "lintcheck/lintcheck_crates.toml",
+        hide_default_value = true,
+        env = "LINTCHECK_TOML",
+        hide_env = true
+    )]
+    pub sources_toml_path: PathBuf,
+    /// File to save the clippy lint results here
+    #[clap(skip = "")]
+    pub lintcheck_results_path: PathBuf, // Overridden in new()
+    /// Only process a single crate on the list
+    #[clap(long, value_name = "CRATE")]
+    pub only: Option<String>,
+    /// Runs cargo clippy --fix and checks if all suggestions apply
+    #[clap(long, conflicts_with("max_jobs"))]
+    pub fix: bool,
+    /// Apply a filter to only collect specified lints
+    #[clap(long = "filter", value_name = "clippy_lint_name", use_value_delimiter = true)]
+    pub lint_filter: Vec<String>,
+    /// Check all Clippy lints, by default only `clippy::all` and `clippy::pedantic` are checked.
+    /// Usually, it's better to use `--filter` instead
+    #[clap(long, conflicts_with("lint_filter"))]
+    pub all_lints: bool,
+    /// Set the output format of the log file
+    #[clap(long, short, default_value = "text")]
+    pub format: OutputFormat,
+    /// Run clippy on the dependencies of crates specified in crates-toml
+    #[clap(long, conflicts_with("max_jobs"))]
+    pub recursive: bool,
+    /// Also produce a `perf.data` file, implies --jobs=1,
+    /// the `perf.data` file can be found at
+    /// `target/lintcheck/sources/<package>-<version>/perf.data`
+    #[clap(long)]
+    pub perf: bool,
+    #[command(subcommand)]
+    pub subcommand: Option<Commands>,
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct LintcheckConfig {
-    /// max number of jobs to spawn (default 1)
-    pub max_jobs: usize,
-    /// we read the sources to check from here
-    pub sources_toml_path: PathBuf,
-    /// we save the clippy lint results here
-    pub lintcheck_results_path: PathBuf,
-    /// Check only a specified package
-    pub only: Option<String>,
-    /// whether to just run --fix and not collect all the warnings
-    pub fix: bool,
-    /// A list of lints that this lintcheck run should focus on
-    pub lint_filter: Vec<String>,
-    /// Indicate if the output should support markdown syntax
-    pub markdown: bool,
-    /// Run clippy on the dependencies of crates
-    pub recursive: bool,
+#[derive(Subcommand, Clone, Debug)]
+pub(crate) enum Commands {
+    /// Display a markdown diff between two lintcheck log files in JSON format
+    Diff {
+        old: PathBuf,
+        new: PathBuf,
+        /// This will limit the number of warnings that will be printed for each lint
+        #[clap(long)]
+        truncate: bool,
+    },
+    /// Create a lintcheck crates TOML file containing the top N popular crates
+    Popular {
+        /// Output TOML file name
+        output: PathBuf,
+        /// Number of crate names to download
+        #[clap(short, long, default_value_t = 100)]
+        number: usize,
+    },
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OutputFormat {
+    Text,
+    Markdown,
+    Json,
+}
+
+impl OutputFormat {
+    fn file_extension(self) -> &'static str {
+        match self {
+            OutputFormat::Text => "txt",
+            OutputFormat::Markdown => "md",
+            OutputFormat::Json => "json",
+        }
+    }
 }
 
 impl LintcheckConfig {
     pub fn new() -> Self {
-        let clap_config = get_clap_config();
-
-        // first, check if we got anything passed via the LINTCHECK_TOML env var,
-        // if not, ask clap if we got any value for --crates-toml  <foo>
-        // if not, use the default "lintcheck/lintcheck_crates.toml"
-        let sources_toml = env::var("LINTCHECK_TOML").unwrap_or_else(|_| {
-            clap_config
-                .get_one::<String>("crates-toml")
-                .map_or("lintcheck/lintcheck_crates.toml", |s| &**s)
-                .into()
-        });
-
-        let markdown = clap_config.contains_id("markdown");
-        let sources_toml_path = PathBuf::from(sources_toml);
+        let mut config = LintcheckConfig::parse();
 
         // for the path where we save the lint results, get the filename without extension (so for
         // wasd.toml, use "wasd"...)
-        let filename: PathBuf = sources_toml_path.file_stem().unwrap().into();
-        let lintcheck_results_path = PathBuf::from(format!(
+        let filename: PathBuf = config.sources_toml_path.file_stem().unwrap().into();
+        config.lintcheck_results_path = PathBuf::from(format!(
             "lintcheck-logs/{}_logs.{}",
             filename.display(),
-            if markdown { "md" } else { "txt" }
+            config.format.file_extension(),
         ));
 
-        // look at the --threads arg, if 0 is passed, ask rayon rayon how many threads it would spawn and
-        // use half of that for the physical core count
-        // by default use a single thread
-        let max_jobs = match clap_config.get_one::<usize>("threads") {
-            Some(&0) => {
-                // automatic choice
-                // Rayon seems to return thread count so half that for core count
-                rayon::current_num_threads() / 2
-            },
-            Some(&threads) => threads,
-            // no -j passed, use a single thread
-            None => 1,
-        };
-
-        let lint_filter: Vec<String> = clap_config
-            .get_many::<String>("filter")
-            .map(|iter| {
-                iter.map(|lint_name| {
-                    let mut filter = lint_name.replace('_', "-");
-                    if !filter.starts_with("clippy::") {
-                        filter.insert_str(0, "clippy::");
-                    }
-                    filter
-                })
-                .collect()
-            })
-            .unwrap_or_default();
-
-        LintcheckConfig {
-            max_jobs,
-            sources_toml_path,
-            lintcheck_results_path,
-            only: clap_config.get_one::<String>("only").map(String::from),
-            fix: clap_config.contains_id("fix"),
-            lint_filter,
-            markdown,
-            recursive: clap_config.contains_id("recursive"),
+        // look at the --threads arg, if 0 is passed, use the threads count
+        if config.max_jobs == 0 {
+            config.max_jobs = if config.fix || config.recursive {
+                1
+            } else {
+                std::thread::available_parallelism().map_or(1, NonZero::get)
+            };
         }
+
+        for lint_name in &mut config.lint_filter {
+            *lint_name = format!(
+                "clippy::{}",
+                lint_name
+                    .strip_prefix("clippy::")
+                    .unwrap_or(lint_name)
+                    .replace('_', "-")
+            );
+        }
+
+        config
     }
 }

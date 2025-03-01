@@ -1,5 +1,4 @@
-// run-rustfix
-// aux-build: proc_macro_with_span.rs
+//@aux-build: proc_macros.rs
 
 #![allow(
     dead_code,
@@ -10,8 +9,8 @@
     clippy::unusual_byte_groupings
 )]
 
-extern crate proc_macro_with_span;
-use proc_macro_with_span::with_span;
+extern crate proc_macros;
+use proc_macros::with_span;
 
 fn main() {
     let fail14 = 2_32;
@@ -33,7 +32,7 @@ fn main() {
     // testing that the suggestion actually fits in its type
     let fail30 = 127_8; // should be i8
     let fail31 = 240_8; // should be u8
-    let ok32 = 360_8; // doesnt fit in either, should be ignored
+    let ok32 = 360_8; // doesn't fit in either, should be ignored
     let fail33 = 0x1234_16;
     let fail34 = 0xABCD_16;
     let ok35 = 0x12345_16;

@@ -1,13 +1,6 @@
-// run-rustfix
-#![feature(custom_inner_attributes)]
 #![warn(clippy::manual_retain)]
-#![allow(unused)]
-use std::collections::BTreeMap;
-use std::collections::BTreeSet;
-use std::collections::BinaryHeap;
-use std::collections::HashMap;
-use std::collections::HashSet;
-use std::collections::VecDeque;
+#![allow(unused, clippy::redundant_clone)]
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
 
 fn main() {
     binary_heap_retain();
@@ -21,25 +14,42 @@ fn main() {
     _msrv_153();
     _msrv_126();
     _msrv_118();
+
+    issue_10393();
+    issue_12081();
 }
 
 fn binary_heap_retain() {
-    // NOTE: Do not lint now, because binary_heap_retain is nighyly API.
-    // And we need to add a test case for msrv if we update this implmention.
-    // https://github.com/rust-lang/rust/issues/71503
-    let mut heap = BinaryHeap::from([1, 2, 3]);
-    heap = heap.into_iter().filter(|x| x % 2 == 0).collect();
-    heap = heap.iter().filter(|&x| x % 2 == 0).copied().collect();
-    heap = heap.iter().filter(|&x| x % 2 == 0).cloned().collect();
+    let mut binary_heap = BinaryHeap::from([1, 2, 3]);
+    // Do lint.
+    binary_heap = binary_heap.into_iter().filter(|x| x % 2 == 0).collect();
+    binary_heap = binary_heap.iter().filter(|&x| x % 2 == 0).copied().collect();
+    binary_heap = binary_heap.iter().filter(|&x| x % 2 == 0).cloned().collect();
+
+    // Do lint, because we use pattern matching
+    let mut tuples = BinaryHeap::from([(0, 1), (1, 2), (2, 3)]);
+    tuples = tuples.iter().filter(|(ref x, ref y)| *x == 0).copied().collect();
+    tuples = tuples.iter().filter(|(x, y)| *x == 0).copied().collect();
 
     // Do not lint, because type conversion is performed
-    heap = heap.into_iter().filter(|x| x % 2 == 0).collect::<BinaryHeap<i8>>();
-    heap = heap.iter().filter(|&x| x % 2 == 0).copied().collect::<BinaryHeap<i8>>();
-    heap = heap.iter().filter(|&x| x % 2 == 0).cloned().collect::<BinaryHeap<i8>>();
+    binary_heap = binary_heap
+        .into_iter()
+        .filter(|x| x % 2 == 0)
+        .collect::<BinaryHeap<i8>>();
+    binary_heap = binary_heap
+        .iter()
+        .filter(|&x| x % 2 == 0)
+        .copied()
+        .collect::<BinaryHeap<i8>>();
+    binary_heap = binary_heap
+        .iter()
+        .filter(|&x| x % 2 == 0)
+        .cloned()
+        .collect::<BinaryHeap<i8>>();
 
     // Do not lint, because this expression is not assign.
-    let mut bar: BinaryHeap<i8> = heap.iter().filter(|&x| x % 2 == 0).copied().collect();
-    let mut foobar: BinaryHeap<i8> = heap.into_iter().filter(|x| x % 2 == 0).collect();
+    let mut bar: BinaryHeap<i8> = binary_heap.iter().filter(|&x| x % 2 == 0).copied().collect();
+    let mut foobar: BinaryHeap<i8> = binary_heap.into_iter().filter(|x| x % 2 == 0).collect();
 
     // Do not lint, because it is an assignment to a different variable.
     bar = foobar.iter().filter(|&x| x % 2 == 0).copied().collect();
@@ -55,6 +65,9 @@ fn btree_map_retain() {
         .into_iter()
         .filter(|(k, v)| (k % 2 == 0) && (v % 2 == 0))
         .collect();
+
+    // Do not lint, because the parameters are not matched in tuple pattern
+    btree_map = btree_map.into_iter().filter(|t| t.0 % 2 == 0).collect();
 
     // Do not lint.
     btree_map = btree_map
@@ -76,6 +89,11 @@ fn btree_set_retain() {
     btree_set = btree_set.iter().filter(|&x| x % 2 == 0).copied().collect();
     btree_set = btree_set.iter().filter(|&x| x % 2 == 0).cloned().collect();
     btree_set = btree_set.into_iter().filter(|x| x % 2 == 0).collect();
+
+    // Do lint, because we use pattern matching
+    let mut tuples = BTreeSet::from([(0, 1), (1, 2), (2, 3)]);
+    tuples = tuples.iter().filter(|(ref x, ref y)| *x == 0).copied().collect();
+    tuples = tuples.iter().filter(|(x, y)| *x == 0).copied().collect();
 
     // Do not lint, because type conversion is performed
     btree_set = btree_set
@@ -112,6 +130,9 @@ fn hash_map_retain() {
         .filter(|(k, v)| (k % 2 == 0) && (v % 2 == 0))
         .collect();
 
+    // Do not lint, because the parameters are not matched in tuple pattern
+    hash_map = hash_map.into_iter().filter(|t| t.0 % 2 == 0).collect();
+
     // Do not lint.
     hash_map = hash_map
         .into_iter()
@@ -131,6 +152,11 @@ fn hash_set_retain() {
     hash_set = hash_set.into_iter().filter(|x| x % 2 == 0).collect();
     hash_set = hash_set.iter().filter(|&x| x % 2 == 0).copied().collect();
     hash_set = hash_set.iter().filter(|&x| x % 2 == 0).cloned().collect();
+
+    // Do lint, because we use pattern matching
+    let mut tuples = HashSet::from([(0, 1), (1, 2), (2, 3)]);
+    tuples = tuples.iter().filter(|(ref x, ref y)| *x == 0).copied().collect();
+    tuples = tuples.iter().filter(|(x, y)| *x == 0).copied().collect();
 
     // Do not lint, because type conversion is performed
     hash_set = hash_set.into_iter().filter(|x| x % 2 == 0).collect::<HashSet<i8>>();
@@ -174,6 +200,11 @@ fn vec_retain() {
     vec = vec.iter().filter(|&x| x % 2 == 0).copied().collect();
     vec = vec.iter().filter(|&x| x % 2 == 0).cloned().collect();
     vec = vec.into_iter().filter(|x| x % 2 == 0).collect();
+
+    // Do lint, because we use pattern matching
+    let mut tuples = vec![(0, 1), (1, 2), (2, 3)];
+    tuples = tuples.iter().filter(|(ref x, ref y)| *x == 0).copied().collect();
+    tuples = tuples.iter().filter(|(x, y)| *x == 0).copied().collect();
 
     // Do not lint, because type conversion is performed
     vec = vec.into_iter().filter(|x| x % 2 == 0).collect::<Vec<i8>>();
@@ -222,8 +253,14 @@ fn vec_deque_retain() {
     bar = foobar.into_iter().filter(|x| x % 2 == 0).collect();
 }
 
+#[clippy::msrv = "1.69"]
+fn _msrv_169() {
+    let mut binary_heap = BinaryHeap::from([1, 2, 3]);
+    binary_heap = binary_heap.into_iter().filter(|x| x % 2 == 0).collect();
+}
+
+#[clippy::msrv = "1.52"]
 fn _msrv_153() {
-    #![clippy::msrv = "1.52"]
     let mut btree_map: BTreeMap<i8, i8> = (0..8).map(|x| (x, x * 10)).collect();
     btree_map = btree_map.into_iter().filter(|(k, _)| k % 2 == 0).collect();
 
@@ -231,16 +268,50 @@ fn _msrv_153() {
     btree_set = btree_set.iter().filter(|&x| x % 2 == 0).copied().collect();
 }
 
+#[clippy::msrv = "1.25"]
 fn _msrv_126() {
-    #![clippy::msrv = "1.25"]
     let mut s = String::from("foobar");
     s = s.chars().filter(|&c| c != 'o').to_owned().collect();
 }
 
+#[clippy::msrv = "1.17"]
 fn _msrv_118() {
-    #![clippy::msrv = "1.17"]
     let mut hash_set = HashSet::from([1, 2, 3, 4, 5, 6]);
     hash_set = hash_set.into_iter().filter(|x| x % 2 == 0).collect();
     let mut hash_map: HashMap<i8, i8> = (0..8).map(|x| (x, x * 10)).collect();
     hash_map = hash_map.into_iter().filter(|(k, _)| k % 2 == 0).collect();
+}
+
+fn issue_10393() {
+    // Do lint
+    let mut vec = vec![(0, 1), (1, 2), (2, 3)];
+    vec = vec.into_iter().filter(|(x, y)| *x == 0).collect();
+
+    // Do lint
+    let mut tuples = vec![(true, -2), (false, 3)];
+    tuples = tuples.into_iter().filter(|(_, n)| *n > 0).collect();
+}
+
+fn issue_11457() {
+    // Do not lint, as we need to modify the closure
+    let mut vals = vec![1, 2, 3, 4];
+    vals = vals.iter().filter(|v| **v != 1).cloned().collect();
+
+    // Do not lint, as we need to modify the closure
+    let mut s = String::from("foobar");
+    s = s.chars().filter(|c| *c != 'o').to_owned().collect();
+}
+
+fn issue_12081() {
+    let mut vec = vec![0, 1, 2];
+
+    // Do lint
+    vec = vec.iter().filter(|&&x| x == 0).copied().collect();
+    vec = vec.iter().filter(|&&x| x == 0).cloned().collect();
+    vec = vec.into_iter().filter(|&x| x == 0).collect();
+
+    // Do lint
+    vec = vec.iter().filter(|&x| *x == 0).copied().collect();
+    vec = vec.iter().filter(|&x| *x == 0).cloned().collect();
+    vec = vec.into_iter().filter(|x| *x == 0).collect();
 }

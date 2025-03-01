@@ -3,11 +3,11 @@
 use std::cell::Cell;
 
 use drop_bomb::DropBomb;
-use limit::Limit;
 
 use crate::{
     event::Event,
     input::Input,
+    Edition,
     SyntaxKind::{self, EOF, ERROR, TOMBSTONE},
     TokenSet, T,
 };
@@ -26,13 +26,14 @@ pub(crate) struct Parser<'t> {
     pos: usize,
     events: Vec<Event>,
     steps: Cell<u32>,
+    edition: Edition,
 }
 
-static PARSER_STEP_LIMIT: Limit = Limit::new(15_000_000);
+const PARSER_STEP_LIMIT: usize = 15_000_000;
 
 impl<'t> Parser<'t> {
-    pub(super) fn new(inp: &'t Input) -> Parser<'t> {
-        Parser { inp, pos: 0, events: Vec::new(), steps: Cell::new(0) }
+    pub(super) fn new(inp: &'t Input, edition: Edition) -> Parser<'t> {
+        Parser { inp, pos: 0, events: Vec::new(), steps: Cell::new(0), edition }
     }
 
     pub(crate) fn finish(self) -> Vec<Event> {
@@ -52,7 +53,7 @@ impl<'t> Parser<'t> {
         assert!(n <= 3);
 
         let steps = self.steps.get();
-        assert!(PARSER_STEP_LIMIT.check(steps as usize).is_ok(), "the parser seems stuck");
+        assert!((steps as usize) < PARSER_STEP_LIMIT, "the parser seems stuck");
         self.steps.set(steps + 1);
 
         self.inp.kind(self.pos + n)
@@ -129,6 +130,14 @@ impl<'t> Parser<'t> {
         true
     }
 
+    pub(crate) fn eat_contextual_kw(&mut self, kind: SyntaxKind) -> bool {
+        if !self.at_contextual_kw(kind) {
+            return false;
+        }
+        self.bump_remap(kind);
+        true
+    }
+
     fn at_composite2(&self, n: usize, k1: SyntaxKind, k2: SyntaxKind) -> bool {
         self.inp.kind(self.pos + n) == k1
             && self.inp.kind(self.pos + n + 1) == k2
@@ -148,9 +157,14 @@ impl<'t> Parser<'t> {
         kinds.contains(self.current())
     }
 
-    /// Checks if the current token is contextual keyword with text `t`.
+    /// Checks if the current token is contextual keyword `kw`.
     pub(crate) fn at_contextual_kw(&self, kw: SyntaxKind) -> bool {
         self.inp.contextual_kind(self.pos) == kw
+    }
+
+    /// Checks if the nth token is contextual keyword `kw`.
+    pub(crate) fn nth_at_contextual_kw(&self, n: usize, kw: SyntaxKind) -> bool {
+        self.inp.contextual_kind(self.pos + n) == kw
     }
 
     /// Starts a new node in the syntax tree. All nodes and tokens
@@ -162,7 +176,7 @@ impl<'t> Parser<'t> {
         Marker::new(pos)
     }
 
-    /// Consume the next token if `kind` matches.
+    /// Consume the next token. Panics if the parser isn't currently at `kind`.
     pub(crate) fn bump(&mut self, kind: SyntaxKind) {
         assert!(self.eat(kind));
     }
@@ -174,6 +188,35 @@ impl<'t> Parser<'t> {
             return;
         }
         self.do_bump(kind, 1);
+    }
+
+    /// Advances the parser by one token
+    pub(crate) fn split_float(&mut self, mut marker: Marker) -> (bool, Marker) {
+        assert!(self.at(SyntaxKind::FLOAT_NUMBER));
+        // we have parse `<something>.`
+        // `<something>`.0.1
+        // here we need to insert an extra event
+        //
+        // `<something>`. 0. 1;
+        // here we need to change the follow up parse, the return value will cause us to emulate a dot
+        // the actual splitting happens later
+        let ends_in_dot = !self.inp.is_joint(self.pos);
+        if !ends_in_dot {
+            let new_marker = self.start();
+            let idx = marker.pos as usize;
+            match &mut self.events[idx] {
+                Event::Start { forward_parent, kind } => {
+                    *kind = SyntaxKind::FIELD_EXPR;
+                    *forward_parent = Some(new_marker.pos - marker.pos);
+                }
+                _ => unreachable!(),
+            }
+            marker.bomb.defuse();
+            marker = new_marker;
+        };
+        self.pos += 1;
+        self.push_event(Event::FloatSplitHack { ends_in_dot });
+        (ends_in_dot, marker)
     }
 
     /// Advances the parser by one token, remapping its kind.
@@ -205,7 +248,7 @@ impl<'t> Parser<'t> {
         if self.eat(kind) {
             return true;
         }
-        self.error(format!("expected {:?}", kind));
+        self.error(format!("expected {kind:?}"));
         false
     }
 
@@ -214,34 +257,39 @@ impl<'t> Parser<'t> {
         self.err_recover(message, TokenSet::EMPTY);
     }
 
-    /// Create an error node and consume the next token.
-    pub(crate) fn err_recover(&mut self, message: &str, recovery: TokenSet) {
-        match self.current() {
-            T!['{'] | T!['}'] => {
-                self.error(message);
-                return;
-            }
-            _ => (),
+    /// Create an error node and consume the next token unless it is in the recovery set.
+    ///
+    /// Returns true if recovery kicked in.
+    pub(crate) fn err_recover(&mut self, message: &str, recovery: TokenSet) -> bool {
+        if matches!(self.current(), T!['{'] | T!['}']) {
+            self.error(message);
+            return true;
         }
 
         if self.at_ts(recovery) {
             self.error(message);
-            return;
+            return true;
         }
 
         let m = self.start();
         self.error(message);
         self.bump_any();
         m.complete(self, ERROR);
+        false
     }
 
     fn do_bump(&mut self, kind: SyntaxKind, n_raw_tokens: u8) {
         self.pos += n_raw_tokens as usize;
+        self.steps.set(0);
         self.push_event(Event::Token { kind, n_raw_tokens });
     }
 
     fn push_event(&mut self, event: Event) {
         self.events.push(event);
+    }
+
+    pub(crate) fn edition(&self) -> Edition {
+        self.edition
     }
 }
 
@@ -269,7 +317,8 @@ impl Marker {
             _ => unreachable!(),
         }
         p.push_event(Event::Finish);
-        CompletedMarker::new(self.pos, kind)
+        let end_pos = p.events.len() as u32;
+        CompletedMarker::new(self.pos, end_pos, kind)
     }
 
     /// Abandons the syntax tree node. All its children
@@ -278,22 +327,23 @@ impl Marker {
         self.bomb.defuse();
         let idx = self.pos as usize;
         if idx == p.events.len() - 1 {
-            match p.events.pop() {
-                Some(Event::Start { kind: TOMBSTONE, forward_parent: None }) => (),
-                _ => unreachable!(),
-            }
+            assert!(matches!(
+                p.events.pop(),
+                Some(Event::Start { kind: TOMBSTONE, forward_parent: None })
+            ));
         }
     }
 }
 
 pub(crate) struct CompletedMarker {
-    pos: u32,
+    start_pos: u32,
+    end_pos: u32,
     kind: SyntaxKind,
 }
 
 impl CompletedMarker {
-    fn new(pos: u32, kind: SyntaxKind) -> Self {
-        CompletedMarker { pos, kind }
+    fn new(start_pos: u32, end_pos: u32, kind: SyntaxKind) -> Self {
+        CompletedMarker { start_pos, end_pos, kind }
     }
 
     /// This method allows to create a new node which starts
@@ -311,10 +361,10 @@ impl CompletedMarker {
     /// distance to `NEWSTART` into forward_parent(=2 in this case);
     pub(crate) fn precede(self, p: &mut Parser<'_>) -> Marker {
         let new_pos = p.start();
-        let idx = self.pos as usize;
+        let idx = self.start_pos as usize;
         match &mut p.events[idx] {
             Event::Start { forward_parent, .. } => {
-                *forward_parent = Some(new_pos.pos - self.pos);
+                *forward_parent = Some(new_pos.pos - self.start_pos);
             }
             _ => unreachable!(),
         }
@@ -327,7 +377,7 @@ impl CompletedMarker {
         let idx = m.pos as usize;
         match &mut p.events[idx] {
             Event::Start { forward_parent, .. } => {
-                *forward_parent = Some(self.pos - m.pos);
+                *forward_parent = Some(self.start_pos - m.pos);
             }
             _ => unreachable!(),
         }
@@ -336,5 +386,14 @@ impl CompletedMarker {
 
     pub(crate) fn kind(&self) -> SyntaxKind {
         self.kind
+    }
+
+    pub(crate) fn last_token(&self, p: &Parser<'_>) -> Option<SyntaxKind> {
+        let end_pos = self.end_pos as usize;
+        debug_assert_eq!(p.events[end_pos - 1], Event::Finish);
+        p.events[..end_pos].iter().rev().find_map(|event| match event {
+            Event::Token { kind, .. } => Some(*kind),
+            _ => None,
+        })
     }
 }

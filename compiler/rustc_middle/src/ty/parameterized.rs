@@ -1,16 +1,12 @@
-use rustc_data_structures::fx::FxHashMap;
-use rustc_hir::def_id::{DefId, DefIndex};
-use rustc_index::vec::{Idx, IndexVec};
+use std::hash::Hash;
 
-use crate::middle::exported_symbols::ExportedSymbol;
-use crate::mir::Body;
-use crate::ty::abstract_const::Node;
-use crate::ty::{
-    self, Const, FnSig, GeneratorDiagnosticData, GenericPredicates, Predicate, TraitRef, Ty,
-};
+use rustc_data_structures::unord::UnordMap;
+use rustc_hir::def_id::DefIndex;
+use rustc_index::{Idx, IndexVec};
+
+use crate::ty;
 
 pub trait ParameterizedOverTcx: 'static {
-    #[allow(unused_lifetimes)]
     type Value<'tcx>;
 }
 
@@ -30,12 +26,16 @@ impl<I: Idx + 'static, T: ParameterizedOverTcx> ParameterizedOverTcx for IndexVe
     type Value<'tcx> = IndexVec<I, T::Value<'tcx>>;
 }
 
-impl<I: 'static, T: ParameterizedOverTcx> ParameterizedOverTcx for FxHashMap<I, T> {
-    type Value<'tcx> = FxHashMap<I, T::Value<'tcx>>;
+impl<I: Hash + Eq + 'static, T: ParameterizedOverTcx> ParameterizedOverTcx for UnordMap<I, T> {
+    type Value<'tcx> = UnordMap<I, T::Value<'tcx>>;
 }
 
 impl<T: ParameterizedOverTcx> ParameterizedOverTcx for ty::Binder<'static, T> {
     type Value<'tcx> = ty::Binder<'tcx, T::Value<'tcx>>;
+}
+
+impl<T: ParameterizedOverTcx> ParameterizedOverTcx for ty::EarlyBinder<'static, T> {
+    type Value<'tcx> = ty::EarlyBinder<'tcx, T::Value<'tcx>>;
 }
 
 #[macro_export]
@@ -54,41 +54,54 @@ trivially_parameterized_over_tcx! {
     usize,
     (),
     u32,
+    u64,
+    bool,
     std::string::String,
     crate::metadata::ModChild,
     crate::middle::codegen_fn_attrs::CodegenFnAttrs,
+    crate::middle::debugger_visualizer::DebuggerVisualizerFile,
     crate::middle::exported_symbols::SymbolExportInfo,
-    crate::middle::resolve_lifetime::ObjectLifetimeDefault,
+    crate::middle::lib_features::FeatureStability,
+    crate::middle::resolve_bound_vars::ObjectLifetimeDefault,
     crate::mir::ConstQualifs,
     ty::AssocItemContainer,
+    ty::Asyncness,
     ty::DeducedParamAttrs,
     ty::Generics,
     ty::ImplPolarity,
+    ty::ImplTraitInTraitData,
     ty::ReprOptions,
     ty::TraitDef,
+    ty::UnusedGenericParams,
     ty::Visibility<DefIndex>,
     ty::adjustment::CoerceUnsizedInfo,
-    ty::fast_reject::SimplifiedTypeGen<DefId>,
+    ty::fast_reject::SimplifiedType,
+    ty::IntrinsicDef,
     rustc_ast::Attribute,
-    rustc_ast::MacArgs,
-    rustc_attr::ConstStability,
-    rustc_attr::DefaultBodyStability,
-    rustc_attr::Deprecation,
-    rustc_attr::Stability,
+    rustc_ast::DelimArgs,
+    rustc_ast::expand::StrippedCfgItem<rustc_hir::def_id::DefIndex>,
+    rustc_attr_parsing::ConstStability,
+    rustc_attr_parsing::DefaultBodyStability,
+    rustc_attr_parsing::Deprecation,
+    rustc_attr_parsing::Stability,
     rustc_hir::Constness,
     rustc_hir::Defaultness,
-    rustc_hir::GeneratorKind,
+    rustc_hir::Safety,
+    rustc_hir::CoroutineKind,
     rustc_hir::IsAsync,
     rustc_hir::LangItem,
     rustc_hir::def::DefKind,
+    rustc_hir::def::DocLinkResMap,
+    rustc_hir::def_id::DefId,
     rustc_hir::def_id::DefIndex,
     rustc_hir::definitions::DefKey,
-    rustc_index::bit_set::BitSet<u32>,
+    rustc_hir::OpaqueTyOrigin<rustc_hir::def_id::DefId>,
+    rustc_index::bit_set::DenseBitSet<u32>,
     rustc_index::bit_set::FiniteBitSet<u32>,
     rustc_session::cstore::ForeignModule,
     rustc_session::cstore::LinkagePreference,
     rustc_session::cstore::NativeLib,
-    rustc_span::DebuggerVisualizerFile,
+    rustc_session::config::TargetModifier,
     rustc_span::ExpnData,
     rustc_span::ExpnHash,
     rustc_span::ExpnId,
@@ -97,33 +110,37 @@ trivially_parameterized_over_tcx! {
     rustc_span::Symbol,
     rustc_span::def_id::DefPathHash,
     rustc_span::hygiene::SyntaxContextData,
-    rustc_span::symbol::Ident,
+    rustc_span::Ident,
     rustc_type_ir::Variance,
+    rustc_hir::Attribute,
 }
 
-// HACK(compiler-errors): This macro rule can only take an ident,
-// not a path, due to parsing ambiguity reasons. That means we gotta
-// import all of these types above.
+// HACK(compiler-errors): This macro rule can only take a fake path,
+// not a real, due to parsing ambiguity reasons.
 #[macro_export]
 macro_rules! parameterized_over_tcx {
-    ($($ident:ident),+ $(,)?) => {
+    ($($($fake_path:ident)::+),+ $(,)?) => {
         $(
-            impl $crate::ty::ParameterizedOverTcx for $ident<'static> {
-                type Value<'tcx> = $ident<'tcx>;
+            impl $crate::ty::ParameterizedOverTcx for $($fake_path)::+<'static> {
+                type Value<'tcx> = $($fake_path)::+<'tcx>;
             }
         )*
     }
 }
 
 parameterized_over_tcx! {
-    Ty,
-    FnSig,
-    GenericPredicates,
-    TraitRef,
-    Const,
-    Predicate,
-    GeneratorDiagnosticData,
-    Body,
-    Node,
-    ExportedSymbol,
+    crate::middle::exported_symbols::ExportedSymbol,
+    crate::mir::Body,
+    crate::mir::CoroutineLayout,
+    crate::mir::interpret::ConstAllocation,
+    ty::Ty,
+    ty::FnSig,
+    ty::GenericPredicates,
+    ty::ConstConditions,
+    ty::TraitRef,
+    ty::Const,
+    ty::Predicate,
+    ty::Clause,
+    ty::ClauseKind,
+    ty::ImplTraitHeader,
 }

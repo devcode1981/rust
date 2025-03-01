@@ -1,8 +1,9 @@
-// We want to control preemption here.
-//@compile-flags: -Zmiri-preemption-rate=0
+// We want to control preemption here. Stacked borrows interferes by having its own accesses.
+//@compile-flags: -Zmiri-preemption-rate=0 -Zmiri-disable-stacked-borrows
+// Avoid accidental synchronization via address reuse inside `thread::spawn`.
+//@compile-flags: -Zmiri-address-reuse-cross-thread-rate=0
 
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::spawn;
 
 #[derive(Copy, Clone)]
@@ -17,13 +18,15 @@ pub fn main() {
     let c = EvilSend(b);
     unsafe {
         let j1 = spawn(move || {
+            let c = c; // avoid field capturing
             let atomic_ref = &mut *c.0;
             atomic_ref.store(64, Ordering::SeqCst);
         });
 
         let j2 = spawn(move || {
+            let c = c; // avoid field capturing
             let atomic_ref = &mut *c.0;
-            *atomic_ref.get_mut() = 32; //~ ERROR: Data race detected between Write on thread `<unnamed>` and Atomic Store on thread `<unnamed>`
+            *atomic_ref.get_mut() = 32; //~ ERROR: Data race detected between (1) atomic store on thread `unnamed-1` and (2) non-atomic write on thread `unnamed-2`
         });
 
         j1.join().unwrap();

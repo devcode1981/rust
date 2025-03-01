@@ -1,7 +1,5 @@
-// run-rustfix
-
 #![warn(clippy::manual_filter)]
-#![allow(unused_variables, dead_code)]
+#![allow(unused_variables, dead_code, clippy::useless_vec)]
 
 fn main() {
     match Some(0) {
@@ -137,7 +135,7 @@ fn main() {
         };
     }
 
-    #[allow(clippy::blocks_in_if_conditions)]
+    #[allow(clippy::blocks_in_conditions)]
     match Some(11) {
         // Lint, statement is preserved by `.filter`
         Some(x) => {
@@ -193,9 +191,7 @@ fn main() {
         None => None,
     };
     let _ = match Some(15) {
-        Some(x) => unsafe {
-            if f(x) { Some(x) } else { None }
-        },
+        Some(x) => unsafe { if f(x) { Some(x) } else { None } },
         None => None,
     };
 
@@ -240,4 +236,45 @@ fn main() {
         },
         None => None,
     };
+
+    match Some(20) {
+        // Don't Lint, because `Some(3*x)` is not `None`
+        None => None,
+        Some(x) => {
+            if x > 0 {
+                Some(3 * x)
+            } else {
+                Some(x)
+            }
+        },
+    };
+
+    // Don't lint: https://github.com/rust-lang/rust-clippy/issues/10088
+    let result = if let Some(a) = maybe_some() {
+        if let Some(b) = maybe_some() {
+            Some(a + b)
+        } else {
+            Some(a)
+        }
+    } else {
+        None
+    };
+
+    let allowed_integers = vec![3, 4, 5, 6];
+    // Don't lint, since there's a side effect in the else branch
+    match Some(21) {
+        Some(x) => {
+            if allowed_integers.contains(&x) {
+                Some(x)
+            } else {
+                println!("Invalid integer: {x:?}");
+                None
+            }
+        },
+        None => None,
+    };
+}
+
+fn maybe_some() -> Option<u32> {
+    Some(0)
 }

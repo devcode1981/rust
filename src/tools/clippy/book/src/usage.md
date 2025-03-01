@@ -19,7 +19,7 @@ cargo clippy
 ### Lint configuration
 
 The above command will run the default set of lints, which are included in the
-lint group `clippy::all`. You might want to use even more lints or you might not
+lint group `clippy::all`. You might want to use even more lints, or you may not
 agree with every Clippy lint, and for that there are ways to configure lint
 levels.
 
@@ -33,10 +33,10 @@ You can configure lint levels on the command line by adding
 `-A/W/D clippy::lint_name` like this:
 
 ```bash
-cargo clippy -- -Aclippy::style -Wclippy::double_neg -Dclippy::perf
+cargo clippy -- -Aclippy::style -Wclippy::box_default -Dclippy::perf
 ```
 
-For [CI] all warnings can be elevated to errors which will inturn fail
+For [CI] all warnings can be elevated to errors which will in turn fail
 the build and cause Clippy to exit with a code other than `0`.
 
 ```
@@ -98,20 +98,20 @@ other of Clippy's lint groups.
 You can configure lint levels in source code the same way you can configure
 `rustc` lints:
 
-```rust
+```rust,ignore
 #![allow(clippy::style)]
 
-#[warn(clippy::double_neg)]
+#[warn(clippy::box_default)]
 fn main() {
-    let x = 1;
-    let y = --x;
-    //      ^^ warning: double negation
+    let _ = Box::<String>::new(Default::default());
+    // ^ warning: `Box::new(_)` of default value
 }
 ```
 
 ### Automatically applying Clippy suggestions
 
-Clippy can automatically apply some lint suggestions, just like the compiler.
+Clippy can automatically apply some lint suggestions, just like the compiler. Note that `--fix` implies
+`--all-targets`, so it can fix as much code as it can.
 
 ```terminal
 cargo clippy --fix

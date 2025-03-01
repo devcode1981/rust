@@ -1,4 +1,5 @@
-//@ignore-target-windows: Channels on Windows are not supported yet.
+//@revisions: stack tree
+//@[tree]compile-flags: -Zmiri-tree-borrows
 //@compile-flags: -Zmiri-strict-provenance
 
 use std::sync::mpsc::{channel, sync_channel};

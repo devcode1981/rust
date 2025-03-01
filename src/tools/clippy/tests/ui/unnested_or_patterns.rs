@@ -1,8 +1,12 @@
-// run-rustfix
-
-#![feature(box_patterns, custom_inner_attributes)]
+#![feature(box_patterns)]
 #![warn(clippy::unnested_or_patterns)]
-#![allow(clippy::cognitive_complexity, clippy::match_ref_pats, clippy::upper_case_acronyms)]
+#![allow(
+    clippy::cognitive_complexity,
+    clippy::match_ref_pats,
+    clippy::upper_case_acronyms,
+    clippy::needless_if,
+    clippy::manual_range_patterns
+)]
 #![allow(unreachable_patterns, irrefutable_let_patterns, unused)]
 
 fn main() {
@@ -34,14 +38,12 @@ fn main() {
     if let S { x: 0, y, .. } | S { y, x: 1 } = (S { x: 0, y: 1 }) {}
 }
 
+#[clippy::msrv = "1.52"]
 fn msrv_1_52() {
-    #![clippy::msrv = "1.52"]
-
     if let [1] | [52] = [0] {}
 }
 
+#[clippy::msrv = "1.53"]
 fn msrv_1_53() {
-    #![clippy::msrv = "1.53"]
-
     if let [1] | [53] = [0] {}
 }

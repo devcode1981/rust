@@ -1,4 +1,4 @@
-FROM ubuntu:18.04
+FROM ubuntu:22.04
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
   clang \
@@ -13,9 +13,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   sudo \
   bzip2 \
   xz-utils \
+  texinfo \
   wget \
   libssl-dev \
-  pkg-config
+  pkg-config \
+  && rm -rf /var/lib/apt/lists/*
 
 COPY scripts/freebsd-toolchain.sh /tmp/
 RUN /tmp/freebsd-toolchain.sh x86_64

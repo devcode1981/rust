@@ -1,4 +1,3 @@
-// run-rustfix
 #![warn(clippy::needless_for_each)]
 #![allow(unused)]
 #![allow(
@@ -110,8 +109,12 @@ fn should_not_lint() {
         }),
     }
 
-    // `for_each` is in a let bingind.
+    // `for_each` is in a let binding.
     let _ = v.iter().for_each(|elem| {
+        acc += elem;
+    });
+    // `for_each` has a closure with an unsafe block.
+    v.iter().for_each(|elem| unsafe {
         acc += elem;
     });
 }

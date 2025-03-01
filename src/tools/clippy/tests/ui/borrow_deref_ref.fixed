@@ -1,6 +1,9 @@
-// run-rustfix
+//@aux-build: proc_macros.rs
 
 #![allow(dead_code, unused_variables)]
+
+extern crate proc_macros;
+use proc_macros::with_span;
 
 fn main() {}
 
@@ -47,6 +50,17 @@ mod should_not_lint2 {
     }
 }
 
+with_span!(
+    span
+
+    fn just_returning(x: &u32) -> &u32 {
+        x
+    }
+
+    fn dont_lint_proc_macro() {
+        let a = &mut &*just_returning(&12);
+    }
+);
 // this mod explains why we should not lint `& &* (&T)`
 mod false_negative {
     fn foo() {
@@ -56,4 +70,10 @@ mod false_negative {
         // let addr_y = &x as *const _ as usize; // assert fail
         assert_ne!(addr_x, addr_y);
     }
+}
+
+fn issue_13584() {
+    let s = "Hello, world!\n";
+    let p = &raw const *s;
+    let _ = p as *const i8;
 }

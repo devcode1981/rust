@@ -147,6 +147,11 @@ pub fn append_child_raw(node: &(impl Into<SyntaxNode> + Clone), child: impl Elem
     insert_raw(position, child);
 }
 
+pub fn prepend_child(node: &(impl Into<SyntaxNode> + Clone), child: impl Element) {
+    let position = Position::first_child_of(node);
+    insert(position, child);
+}
+
 fn ws_before(position: &Position, new: &SyntaxElement) -> Option<SyntaxToken> {
     let prev = match &position.repr {
         PositionRepr::FirstChild(_) => return None,
@@ -157,7 +162,7 @@ fn ws_before(position: &Position, new: &SyntaxElement) -> Option<SyntaxToken> {
         if let Some(item_list) = prev.parent().and_then(ast::ItemList::cast) {
             let mut indent = IndentLevel::from_element(&item_list.syntax().clone().into());
             indent.0 += 1;
-            return Some(make::tokens::whitespace(&format!("\n{}", indent)));
+            return Some(make::tokens::whitespace(&format!("\n{indent}")));
         }
     }
 
@@ -165,7 +170,7 @@ fn ws_before(position: &Position, new: &SyntaxElement) -> Option<SyntaxToken> {
         if let Some(stmt_list) = prev.parent().and_then(ast::StmtList::cast) {
             let mut indent = IndentLevel::from_element(&stmt_list.syntax().clone().into());
             indent.0 += 1;
-            return Some(make::tokens::whitespace(&format!("\n{}", indent)));
+            return Some(make::tokens::whitespace(&format!("\n{indent}")));
         }
     }
 
@@ -200,7 +205,7 @@ fn ws_between(left: &SyntaxElement, right: &SyntaxElement) -> Option<SyntaxToken
         if left.kind() == SyntaxKind::USE {
             indent.0 = IndentLevel::from_element(right).0.max(indent.0);
         }
-        return Some(make::tokens::whitespace(&format!("\n{}", indent)));
+        return Some(make::tokens::whitespace(&format!("\n{indent}")));
     }
     Some(make::tokens::single_space())
 }

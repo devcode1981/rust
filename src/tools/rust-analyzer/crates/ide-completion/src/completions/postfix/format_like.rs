@@ -14,16 +14,18 @@
 // ** `logw` -> `log::warn!(...)`
 // ** `loge` -> `log::error!(...)`
 //
-// image::https://user-images.githubusercontent.com/48062697/113020656-b560f500-917a-11eb-87de-02991f61beb8.gif[]
+// ![Format String Completion](https://user-images.githubusercontent.com/48062697/113020656-b560f500-917a-11eb-87de-02991f61beb8.gif)
 
 use ide_db::{
-    syntax_helpers::format_string_exprs::{parse_format_exprs, with_placeholders},
+    syntax_helpers::format_string_exprs::{parse_format_exprs, with_placeholders, Arg},
     SnippetCap,
 };
 use syntax::{ast, AstToken};
 
 use crate::{
-    completions::postfix::build_postfix_snippet_builder, context::CompletionContext, Completions,
+    completions::postfix::{build_postfix_snippet_builder, escape_snippet_bits},
+    context::CompletionContext,
+    Completions,
 };
 
 /// Mapping ("postfix completion item" => "macro to use")
@@ -51,12 +53,24 @@ pub(crate) fn add_format_like_completions(
         None => return,
     };
 
-    if let Ok((out, exprs)) = parse_format_exprs(receiver_text.text()) {
+    if let Ok((mut out, mut exprs)) = parse_format_exprs(receiver_text.text()) {
+        // Escape any snippet bits in the out text and any of the exprs.
+        escape_snippet_bits(&mut out);
+        for arg in &mut exprs {
+            if let Arg::Ident(text) | Arg::Expr(text) = arg {
+                escape_snippet_bits(text)
+            }
+        }
+
         let exprs = with_placeholders(exprs);
         for (label, macro_name) in KINDS {
-            let snippet = format!(r#"{}({}, {})"#, macro_name, out, exprs.join(", "));
+            let snippet = if exprs.is_empty() {
+                format!(r#"{macro_name}({out})"#)
+            } else {
+                format!(r#"{}({}, {})"#, macro_name, out, exprs.join(", "))
+            };
 
-            postfix_snippet(label, macro_name, &snippet).add_to(acc);
+            postfix_snippet(label, macro_name, &snippet).add_to(acc, ctx.db);
         }
     }
 }
@@ -72,16 +86,29 @@ mod tests {
             ("eprintln!", "{}", r#"eprintln!("{}", $1)"#),
             (
                 "log::info!",
-                "{} {expr} {} {2 + 2}",
-                r#"log::info!("{} {} {} {}", $1, expr, $2, 2 + 2)"#,
+                "{} {ident} {} {2 + 2}",
+                r#"log::info!("{} {ident} {} {}", $1, $2, 2 + 2)"#,
             ),
-            ("format!", "{expr:?}", r#"format!("{:?}", expr)"#),
         ];
 
         for (kind, input, output) in test_vector {
             let (parsed_string, exprs) = parse_format_exprs(input).unwrap();
             let exprs = with_placeholders(exprs);
-            let snippet = format!(r#"{}("{}", {})"#, kind, parsed_string, exprs.join(", "));
+            let snippet = format!(r#"{kind}("{parsed_string}", {})"#, exprs.join(", "));
+            assert_eq!(&snippet, output);
+        }
+    }
+
+    #[test]
+    fn test_into_suggestion_no_epxrs() {
+        let test_vector = &[
+            ("println!", "{ident}", r#"println!("{ident}")"#),
+            ("format!", "{ident:?}", r#"format!("{ident:?}")"#),
+        ];
+
+        for (kind, input, output) in test_vector {
+            let (parsed_string, _exprs) = parse_format_exprs(input).unwrap();
+            let snippet = format!(r#"{kind}("{parsed_string}")"#);
             assert_eq!(&snippet, output);
         }
     }

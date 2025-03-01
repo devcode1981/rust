@@ -33,12 +33,12 @@ pub(crate) fn reformat_number_literal(acc: &mut Assists, ctx: &AssistContext<'_>
     }
 
     let radix = literal.radix();
-    let mut converted = prefix.to_string();
+    let mut converted = prefix.to_owned();
     converted.push_str(&add_group_separators(value, group_size(radix)));
     converted.push_str(suffix);
 
     let group_id = GroupLabel("Reformat number literal".into());
-    let label = format!("Convert {} to {}", literal, converted);
+    let label = format!("Convert {literal} to {converted}");
     let range = literal.syntax().text_range();
     acc.add_group(
         &group_id,

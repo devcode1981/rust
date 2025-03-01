@@ -2,10 +2,8 @@
 
 #![allow(deprecated)] // the types in this module are deprecated
 
-use crate::cmp;
 use crate::marker::PhantomData;
-use crate::mem;
-use crate::ptr;
+use crate::{cmp, mem, ptr};
 
 /// An implementation of SipHash 1-3.
 ///
@@ -14,7 +12,7 @@ use crate::ptr;
 ///
 /// See: <https://131002.net/siphash>
 #[unstable(feature = "hashmap_internals", issue = "none")]
-#[deprecated(since = "1.13.0", note = "use `std::collections::hash_map::DefaultHasher` instead")]
+#[deprecated(since = "1.13.0", note = "use `std::hash::DefaultHasher` instead")]
 #[derive(Debug, Clone, Default)]
 #[doc(hidden)]
 pub struct SipHasher13 {
@@ -25,7 +23,7 @@ pub struct SipHasher13 {
 ///
 /// See: <https://131002.net/siphash/>
 #[unstable(feature = "hashmap_internals", issue = "none")]
-#[deprecated(since = "1.13.0", note = "use `std::collections::hash_map::DefaultHasher` instead")]
+#[deprecated(since = "1.13.0", note = "use `std::hash::DefaultHasher` instead")]
 #[derive(Debug, Clone, Default)]
 struct SipHasher24 {
     hasher: Hasher<Sip24Rounds>,
@@ -44,7 +42,7 @@ struct SipHasher24 {
 /// it is not intended for cryptographic purposes. As such, all
 /// cryptographic uses of this implementation are _strongly discouraged_.
 #[stable(feature = "rust1", since = "1.0.0")]
-#[deprecated(since = "1.13.0", note = "use `std::collections::hash_map::DefaultHasher` instead")]
+#[deprecated(since = "1.13.0", note = "use `std::hash::DefaultHasher` instead")]
 #[derive(Debug, Clone, Default)]
 pub struct SipHasher(SipHasher24);
 
@@ -76,18 +74,19 @@ macro_rules! compress {
     ($state:expr) => {{ compress!($state.v0, $state.v1, $state.v2, $state.v3) }};
     ($v0:expr, $v1:expr, $v2:expr, $v3:expr) => {{
         $v0 = $v0.wrapping_add($v1);
+        $v2 = $v2.wrapping_add($v3);
         $v1 = $v1.rotate_left(13);
         $v1 ^= $v0;
-        $v0 = $v0.rotate_left(32);
-        $v2 = $v2.wrapping_add($v3);
         $v3 = $v3.rotate_left(16);
         $v3 ^= $v2;
-        $v0 = $v0.wrapping_add($v3);
-        $v3 = $v3.rotate_left(21);
-        $v3 ^= $v0;
+        $v0 = $v0.rotate_left(32);
+
         $v2 = $v2.wrapping_add($v1);
+        $v0 = $v0.wrapping_add($v3);
         $v1 = $v1.rotate_left(17);
         $v1 ^= $v2;
+        $v3 = $v3.rotate_left(21);
+        $v3 ^= $v0;
         $v2 = $v2.rotate_left(32);
     }};
 }
@@ -138,7 +137,8 @@ unsafe fn u8to64_le(buf: &[u8], start: usize, len: usize) -> u64 {
         out |= (unsafe { *buf.get_unchecked(start + i) } as u64) << (i * 8);
         i += 1;
     }
-    debug_assert_eq!(i, len);
+    //FIXME(fee1-dead): use debug_assert_eq
+    debug_assert!(i == len);
     out
 }
 
@@ -146,10 +146,7 @@ impl SipHasher {
     /// Creates a new `SipHasher` with the two initial keys set to 0.
     #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]
-    #[deprecated(
-        since = "1.13.0",
-        note = "use `std::collections::hash_map::DefaultHasher` instead"
-    )]
+    #[deprecated(since = "1.13.0", note = "use `std::hash::DefaultHasher` instead")]
     #[must_use]
     pub fn new() -> SipHasher {
         SipHasher::new_with_keys(0, 0)
@@ -158,10 +155,7 @@ impl SipHasher {
     /// Creates a `SipHasher` that is keyed off the provided keys.
     #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]
-    #[deprecated(
-        since = "1.13.0",
-        note = "use `std::collections::hash_map::DefaultHasher` instead"
-    )]
+    #[deprecated(since = "1.13.0", note = "use `std::hash::DefaultHasher` instead")]
     #[must_use]
     pub fn new_with_keys(key0: u64, key1: u64) -> SipHasher {
         SipHasher(SipHasher24 { hasher: Hasher::new_with_keys(key0, key1) })
@@ -172,10 +166,7 @@ impl SipHasher13 {
     /// Creates a new `SipHasher13` with the two initial keys set to 0.
     #[inline]
     #[unstable(feature = "hashmap_internals", issue = "none")]
-    #[deprecated(
-        since = "1.13.0",
-        note = "use `std::collections::hash_map::DefaultHasher` instead"
-    )]
+    #[deprecated(since = "1.13.0", note = "use `std::hash::DefaultHasher` instead")]
     pub fn new() -> SipHasher13 {
         SipHasher13::new_with_keys(0, 0)
     }
@@ -183,10 +174,7 @@ impl SipHasher13 {
     /// Creates a `SipHasher13` that is keyed off the provided keys.
     #[inline]
     #[unstable(feature = "hashmap_internals", issue = "none")]
-    #[deprecated(
-        since = "1.13.0",
-        note = "use `std::collections::hash_map::DefaultHasher` instead"
-    )]
+    #[deprecated(since = "1.13.0", note = "use `std::hash::DefaultHasher` instead")]
     pub fn new_with_keys(key0: u64, key1: u64) -> SipHasher13 {
         SipHasher13 { hasher: Hasher::new_with_keys(key0, key1) }
     }
@@ -194,7 +182,7 @@ impl SipHasher13 {
 
 impl<S: Sip> Hasher<S> {
     #[inline]
-    fn new_with_keys(key0: u64, key1: u64) -> Hasher<S> {
+    const fn new_with_keys(key0: u64, key1: u64) -> Hasher<S> {
         let mut state = Hasher {
             k0: key0,
             k1: key1,
@@ -209,7 +197,7 @@ impl<S: Sip> Hasher<S> {
     }
 
     #[inline]
-    fn reset(&mut self) {
+    const fn reset(&mut self) {
         self.length = 0;
         self.state.v0 = self.k0 ^ 0x736f6d6570736575;
         self.state.v1 = self.k1 ^ 0x646f72616e646f6d;

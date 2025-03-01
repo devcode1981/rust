@@ -1,4 +1,4 @@
-use crate::{LexedStr, PrefixEntryPoint, Step};
+use crate::{Edition, LexedStr, PrefixEntryPoint, Step};
 
 #[test]
 fn vis() {
@@ -6,7 +6,6 @@ fn vis() {
     check(PrefixEntryPoint::Vis, "fn foo() {}", "");
     check(PrefixEntryPoint::Vis, "pub(fn foo() {}", "pub");
     check(PrefixEntryPoint::Vis, "pub(crate fn foo() {}", "pub(crate");
-    check(PrefixEntryPoint::Vis, "crate fn foo() {}", "crate");
 }
 
 #[test]
@@ -33,8 +32,7 @@ fn stmt() {
 fn pat() {
     check(PrefixEntryPoint::Pat, "x y", "x");
     check(PrefixEntryPoint::Pat, "fn f() {}", "fn");
-    // FIXME: This one is wrong, we should consume only one pattern.
-    check(PrefixEntryPoint::Pat, ".. ..", ".. ..");
+    check(PrefixEntryPoint::Pat, ".. ..", "..");
 }
 
 #[test]
@@ -51,6 +49,9 @@ fn expr() {
     check(PrefixEntryPoint::Expr, "-1", "-1");
     check(PrefixEntryPoint::Expr, "fn foo() {}", "fn");
     check(PrefixEntryPoint::Expr, "#[attr] ()", "#[attr] ()");
+    check(PrefixEntryPoint::Expr, "foo.0", "foo.0");
+    check(PrefixEntryPoint::Expr, "foo.0.1", "foo.0.1");
+    check(PrefixEntryPoint::Expr, "foo.0. foo", "foo.0. foo");
 }
 
 #[test]
@@ -81,13 +82,14 @@ fn meta_item() {
 
 #[track_caller]
 fn check(entry: PrefixEntryPoint, input: &str, prefix: &str) {
-    let lexed = LexedStr::new(input);
-    let input = lexed.to_input();
+    let lexed = LexedStr::new(Edition::CURRENT, input);
+    let input = lexed.to_input(Edition::CURRENT);
 
     let mut n_tokens = 0;
-    for step in entry.parse(&input).iter() {
+    for step in entry.parse(&input, Edition::CURRENT).iter() {
         match step {
             Step::Token { n_input_tokens, .. } => n_tokens += n_input_tokens as usize,
+            Step::FloatSplit { .. } => n_tokens += 1,
             Step::Enter { .. } | Step::Exit | Step::Error { .. } => (),
         }
     }

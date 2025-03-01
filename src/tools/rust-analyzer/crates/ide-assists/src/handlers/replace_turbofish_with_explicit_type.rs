@@ -1,7 +1,6 @@
 use hir::HirDisplay;
 use syntax::{
-    ast::{Expr, GenericArg, GenericArgList},
-    ast::{LetStmt, Type::InferType},
+    ast::{Expr, GenericArg, GenericArgList, HasGenericArgs, LetStmt, Type::InferType},
     AstNode, TextRange,
 };
 
@@ -42,7 +41,7 @@ pub(crate) fn replace_turbofish_with_explicit_type(
     let r_angle = generic_args.r_angle_token()?;
     let turbofish_range = TextRange::new(colon2.text_range().start(), r_angle.text_range().end());
 
-    let turbofish_args: Vec<GenericArg> = generic_args.generic_args().into_iter().collect();
+    let turbofish_args: Vec<GenericArg> = generic_args.generic_args().collect();
 
     // Find type of ::<_>
     if turbofish_args.len() != 1 {
@@ -55,7 +54,7 @@ pub(crate) fn replace_turbofish_with_explicit_type(
     let returned_type = match ctx.sema.type_of_expr(&initializer) {
         Some(returned_type) if !returned_type.original.contains_unknown() => {
             let module = ctx.sema.scope(let_stmt.syntax())?.module();
-            returned_type.original.display_source_code(ctx.db(), module.into()).ok()?
+            returned_type.original.display_source_code(ctx.db(), module.into(), false).ok()?
         }
         _ => {
             cov_mark::hit!(fallback_to_turbofish_type_if_type_info_not_available);
@@ -69,7 +68,7 @@ pub(crate) fn replace_turbofish_with_explicit_type(
         return None;
     }
 
-    if let None = let_stmt.colon_token() {
+    if let_stmt.colon_token().is_none() {
         // If there's no colon in a let statement, then there is no explicit type.
         // let x = fn::<...>();
         let ident_range = let_stmt.pat()?.syntax().text_range();
@@ -79,7 +78,7 @@ pub(crate) fn replace_turbofish_with_explicit_type(
             "Replace turbofish with explicit type",
             TextRange::new(initializer_start, turbofish_range.end()),
             |builder| {
-                builder.insert(ident_range.end(), format!(": {}", returned_type));
+                builder.insert(ident_range.end(), format!(": {returned_type}"));
                 builder.delete(turbofish_range);
             },
         );
@@ -111,7 +110,7 @@ fn generic_arg_list(expr: &Expr) -> Option<GenericArgList> {
                 pe.path()?.segment()?.generic_arg_list()
             } else {
                 cov_mark::hit!(not_applicable_if_non_path_function_call);
-                return None;
+                None
             }
         }
         Expr::AwaitExpr(expr) => generic_arg_list(&expr.expr()?),

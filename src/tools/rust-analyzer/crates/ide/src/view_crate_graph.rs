@@ -1,11 +1,9 @@
-use std::sync::Arc;
-
 use dot::{Id, LabelText};
 use ide_db::{
-    base_db::{CrateGraph, CrateId, Dependency, SourceDatabase, SourceDatabaseExt},
-    RootDatabase,
+    base_db::{CrateGraph, CrateId, Dependency, SourceDatabase, SourceRootDatabase},
+    FxHashSet, RootDatabase,
 };
-use stdx::hash::NoHashHashSet;
+use triomphe::Arc;
 
 // Feature: View Crate Graph
 //
@@ -14,11 +12,9 @@ use stdx::hash::NoHashHashSet;
 //
 // Only workspace crates are included, no crates.io dependencies or sysroot crates.
 //
-// |===
-// | Editor  | Action Name
-//
-// | VS Code | **rust-analyzer: View Crate Graph**
-// |===
+// | Editor  | Action Name |
+// |---------|-------------|
+// | VS Code | **rust-analyzer: View Crate Graph** |
 pub(crate) fn view_crate_graph(db: &RootDatabase, full: bool) -> Result<String, String> {
     let crate_graph = db.crate_graph();
     let crates_to_render = crate_graph
@@ -42,7 +38,7 @@ pub(crate) fn view_crate_graph(db: &RootDatabase, full: bool) -> Result<String, 
 
 struct DotCrateGraph {
     graph: Arc<CrateGraph>,
-    crates_to_render: NoHashHashSet<CrateId>,
+    crates_to_render: FxHashSet<CrateId>,
 }
 
 type Edge<'a> = (CrateId, &'a Dependency);
@@ -80,7 +76,7 @@ impl<'a> dot::Labeller<'a, CrateId, Edge<'a>> for DotCrateGraph {
     }
 
     fn node_id(&'a self, n: &CrateId) -> Id<'a> {
-        Id::new(format!("_{}", n.0)).unwrap()
+        Id::new(format!("_{}", u32::from(n.into_raw()))).unwrap()
     }
 
     fn node_shape(&'a self, _node: &CrateId) -> Option<LabelText<'a>> {
@@ -88,7 +84,8 @@ impl<'a> dot::Labeller<'a, CrateId, Edge<'a>> for DotCrateGraph {
     }
 
     fn node_label(&'a self, n: &CrateId) -> LabelText<'a> {
-        let name = self.graph[*n].display_name.as_ref().map_or("(unnamed crate)", |name| &*name);
+        let name =
+            self.graph[*n].display_name.as_ref().map_or("(unnamed crate)", |name| name.as_str());
         LabelText::LabelStr(name.into())
     }
 }

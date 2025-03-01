@@ -1,9 +1,9 @@
 //! Renderer for patterns.
 
-use hir::{db::HirDatabase, HasAttrs, Name, StructKind};
-use ide_db::SnippetCap;
+use hir::{db::HirDatabase, Name, StructKind};
+use ide_db::{documentation::HasDocs, SnippetCap};
 use itertools::Itertools;
-use syntax::SmolStr;
+use syntax::{Edition, SmolStr, ToSmolStr};
 
 use crate::{
     context::{ParamContext, ParamKind, PathCompletionCtx, PatternContext},
@@ -20,7 +20,7 @@ pub(crate) fn render_struct_pat(
     strukt: hir::Struct,
     local_name: Option<Name>,
 ) -> Option<CompletionItem> {
-    let _p = profile::span("render_struct_pat");
+    let _p = tracing::info_span!("render_struct_pat").entered();
 
     let fields = strukt.fields(ctx.db());
     let (visible_fields, fields_omitted) = visible_fields(ctx.completion, &fields, strukt)?;
@@ -31,13 +31,16 @@ pub(crate) fn render_struct_pat(
     }
 
     let name = local_name.unwrap_or_else(|| strukt.name(ctx.db()));
-    let (name, escaped_name) = (name.unescaped().to_smol_str(), name.to_smol_str());
+    let (name, escaped_name) =
+        (name.as_str(), name.display(ctx.db(), ctx.completion.edition).to_smolstr());
     let kind = strukt.kind(ctx.db());
-    let label = format_literal_label(name.as_str(), kind);
-    let lookup = format_literal_lookup(name.as_str(), kind);
+    let label = format_literal_label(name, kind, ctx.snippet_cap());
+    let lookup = format_literal_lookup(name, kind);
     let pat = render_pat(&ctx, pattern_ctx, &escaped_name, kind, &visible_fields, fields_omitted)?;
 
-    Some(build_completion(ctx, label, lookup, pat, strukt))
+    let db = ctx.db();
+
+    Some(build_completion(ctx, label, lookup, pat, strukt, strukt.ty(db), false))
 }
 
 pub(crate) fn render_variant_pat(
@@ -48,16 +51,24 @@ pub(crate) fn render_variant_pat(
     local_name: Option<Name>,
     path: Option<&hir::ModPath>,
 ) -> Option<CompletionItem> {
-    let _p = profile::span("render_variant_pat");
+    let _p = tracing::info_span!("render_variant_pat").entered();
 
     let fields = variant.fields(ctx.db());
     let (visible_fields, fields_omitted) = visible_fields(ctx.completion, &fields, variant)?;
+    let enum_ty = variant.parent_enum(ctx.db()).ty(ctx.db());
 
     let (name, escaped_name) = match path {
-        Some(path) => (path.unescaped().to_string().into(), path.to_string().into()),
+        Some(path) => (
+            path.display_verbatim(ctx.db()).to_smolstr(),
+            path.display(ctx.db(), ctx.completion.edition).to_smolstr(),
+        ),
         None => {
             let name = local_name.unwrap_or_else(|| variant.name(ctx.db()));
-            (name.unescaped().to_smol_str(), name.to_smol_str())
+            let it = (
+                name.as_str().to_smolstr(),
+                name.display(ctx.db(), ctx.completion.edition).to_smolstr(),
+            );
+            it
         }
     };
 
@@ -67,7 +78,7 @@ pub(crate) fn render_variant_pat(
         }
         _ => {
             let kind = variant.kind(ctx.db());
-            let label = format_literal_label(name.as_str(), kind);
+            let label = format_literal_label(name.as_str(), kind, ctx.snippet_cap());
             let lookup = format_literal_lookup(name.as_str(), kind);
             let pat = render_pat(
                 &ctx,
@@ -81,7 +92,15 @@ pub(crate) fn render_variant_pat(
         }
     };
 
-    Some(build_completion(ctx, label, lookup, pat, variant))
+    Some(build_completion(
+        ctx,
+        label,
+        lookup,
+        pat,
+        variant,
+        enum_ty,
+        pattern_ctx.missing_variants.contains(&variant),
+    ))
 }
 
 fn build_completion(
@@ -89,19 +108,33 @@ fn build_completion(
     label: SmolStr,
     lookup: SmolStr,
     pat: String,
-    def: impl HasAttrs + Copy,
+    def: impl HasDocs + Copy,
+    adt_ty: hir::Type,
+    // Missing in context of match statement completions
+    is_variant_missing: bool,
 ) -> CompletionItem {
-    let mut item = CompletionItem::new(CompletionItemKind::Binding, ctx.source_range(), label);
+    let mut relevance = ctx.completion_relevance();
+
+    if is_variant_missing {
+        relevance.type_match = super::compute_type_match(ctx.completion, &adt_ty);
+    }
+
+    let mut item = CompletionItem::new(
+        CompletionItemKind::Binding,
+        ctx.source_range(),
+        label,
+        ctx.completion.edition,
+    );
     item.set_documentation(ctx.docs(def))
         .set_deprecated(ctx.is_deprecated(def))
         .detail(&pat)
         .lookup_by(lookup)
-        .set_relevance(ctx.completion_relevance());
+        .set_relevance(relevance);
     match ctx.snippet_cap() {
         Some(snippet_cap) => item.insert_snippet(snippet_cap, pat),
         None => item.insert_text(pat),
     };
-    item.build()
+    item.build(ctx.db())
 }
 
 fn render_pat(
@@ -114,10 +147,15 @@ fn render_pat(
 ) -> Option<String> {
     let mut pat = match kind {
         StructKind::Tuple => render_tuple_as_pat(ctx.snippet_cap(), fields, name, fields_omitted),
-        StructKind::Record => {
-            render_record_as_pat(ctx.db(), ctx.snippet_cap(), fields, name, fields_omitted)
-        }
-        StructKind::Unit => name.to_string(),
+        StructKind::Record => render_record_as_pat(
+            ctx.db(),
+            ctx.snippet_cap(),
+            fields,
+            name,
+            fields_omitted,
+            ctx.completion.edition,
+        ),
+        StructKind::Unit => name.to_owned(),
     };
 
     let needs_ascription = matches!(
@@ -145,6 +183,7 @@ fn render_record_as_pat(
     fields: &[hir::Field],
     name: &str,
     fields_omitted: bool,
+    edition: Edition,
 ) -> String {
     let fields = fields.iter();
     match snippet_cap {
@@ -152,7 +191,7 @@ fn render_record_as_pat(
             format!(
                 "{name} {{ {}{} }}",
                 fields.enumerate().format_with(", ", |(idx, field), f| {
-                    f(&format_args!("{}${}", field.name(db), idx + 1))
+                    f(&format_args!("{}${}", field.name(db).display(db.upcast(), edition), idx + 1))
                 }),
                 if fields_omitted { ", .." } else { "" },
                 name = name
@@ -161,7 +200,7 @@ fn render_record_as_pat(
         None => {
             format!(
                 "{name} {{ {}{} }}",
-                fields.map(|field| field.name(db).to_smol_str()).format(", "),
+                fields.map(|field| field.name(db).display_no_db(edition).to_smolstr()).format(", "),
                 if fields_omitted { ", .." } else { "" },
                 name = name
             )
