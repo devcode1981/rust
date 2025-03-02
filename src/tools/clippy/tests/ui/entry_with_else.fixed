@@ -1,5 +1,3 @@
-// run-rustfix
-
 #![allow(unused, clippy::needless_pass_by_value, clippy::collapsible_if)]
 #![warn(clippy::map_entry)]
 
@@ -15,6 +13,7 @@ fn foo() {}
 fn insert_if_absent0<K: Eq + Hash + Copy, V: Copy>(m: &mut HashMap<K, V>, k: K, v: V, v2: V) {
     match m.entry(k) {
         std::collections::hash_map::Entry::Vacant(e) => {
+            //~^ map_entry
             e.insert(v);
         }
         std::collections::hash_map::Entry::Occupied(mut e) => {
@@ -24,6 +23,7 @@ fn insert_if_absent0<K: Eq + Hash + Copy, V: Copy>(m: &mut HashMap<K, V>, k: K, 
 
     match m.entry(k) {
         std::collections::hash_map::Entry::Occupied(mut e) => {
+            //~^ map_entry
             e.insert(v);
         }
         std::collections::hash_map::Entry::Vacant(e) => {
@@ -32,6 +32,7 @@ fn insert_if_absent0<K: Eq + Hash + Copy, V: Copy>(m: &mut HashMap<K, V>, k: K, 
     }
 
     if let std::collections::hash_map::Entry::Vacant(e) = m.entry(k) {
+        //~^ map_entry
         e.insert(v);
     } else {
         foo();
@@ -40,11 +41,13 @@ fn insert_if_absent0<K: Eq + Hash + Copy, V: Copy>(m: &mut HashMap<K, V>, k: K, 
     if let std::collections::hash_map::Entry::Occupied(mut e) = m.entry(k) {
         e.insert(v);
     } else {
+        //~^ map_entry
         foo();
     }
 
     match m.entry(k) {
         std::collections::hash_map::Entry::Vacant(e) => {
+            //~^ map_entry
             e.insert(v);
         }
         std::collections::hash_map::Entry::Occupied(mut e) => {
@@ -54,6 +57,7 @@ fn insert_if_absent0<K: Eq + Hash + Copy, V: Copy>(m: &mut HashMap<K, V>, k: K, 
 
     match m.entry(k) {
         std::collections::hash_map::Entry::Occupied(mut e) => {
+            //~^ map_entry
             if true { Some(e.insert(v)) } else { Some(e.insert(v2)) }
         }
         std::collections::hash_map::Entry::Vacant(e) => {
@@ -63,6 +67,7 @@ fn insert_if_absent0<K: Eq + Hash + Copy, V: Copy>(m: &mut HashMap<K, V>, k: K, 
     };
 
     if let std::collections::hash_map::Entry::Occupied(mut e) = m.entry(k) {
+        //~^ map_entry
         foo();
         Some(e.insert(v))
     } else {

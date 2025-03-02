@@ -8,13 +8,12 @@
 //! specific JSON shapes here -- there's little value in such tests, as we can't
 //! be sure without a real client anyway.
 
-#![warn(rust_2018_idioms, unused_lifetimes, semicolon_in_expressions_from_macros)]
+#![allow(clippy::disallowed_types)]
 
-#[cfg(not(feature = "in-rust-tree"))]
-mod sourcegen;
+mod cli;
+mod ratoml;
 mod support;
 mod testdir;
-mod tidy;
 
 use std::{collections::HashMap, path::PathBuf, time::Instant};
 
@@ -22,24 +21,23 @@ use lsp_types::{
     notification::DidOpenTextDocument,
     request::{
         CodeActionRequest, Completion, Formatting, GotoTypeDefinition, HoverRequest,
-        WillRenameFiles, WorkspaceSymbol,
+        InlayHintRequest, InlayHintResolveRequest, RangeFormatting, WillRenameFiles,
+        WorkspaceSymbolRequest,
     },
     CodeActionContext, CodeActionParams, CompletionParams, DidOpenTextDocumentParams,
-    DocumentFormattingParams, FileRename, FormattingOptions, GotoDefinitionParams, HoverParams,
+    DocumentFormattingParams, DocumentRangeFormattingParams, FileRename, FormattingOptions,
+    GotoDefinitionParams, HoverParams, InlayHint, InlayHintLabel, InlayHintParams,
     PartialResultParams, Position, Range, RenameFilesParams, TextDocumentItem,
     TextDocumentPositionParams, WorkDoneProgressParams,
 };
-use rust_analyzer::lsp_ext::{OnEnter, Runnables, RunnablesParams};
+use rust_analyzer::lsp::ext::{OnEnter, Runnables, RunnablesParams};
 use serde_json::json;
+use stdx::format_to_acc;
+
 use test_utils::skip_slow_tests;
+use testdir::TestDir;
 
-use crate::{
-    support::{project, Project},
-    testdir::TestDir,
-};
-
-const PROFILE: &str = "";
-// const PROFILE: &'static str = "*@3>100";
+use crate::support::{project, Project};
 
 #[test]
 fn completes_items_from_standard_library() {
@@ -59,7 +57,7 @@ use std::collections::Spam;
 "#,
     )
     .with_config(serde_json::json!({
-        "cargo": { "sysroot": "discover" }
+        "cargo": { "sysroot": "discover" },
     }))
     .server()
     .wait_until_workspace_is_loaded();
@@ -74,6 +72,148 @@ use std::collections::Spam;
         work_done_progress_params: WorkDoneProgressParams::default(),
     });
     assert!(res.to_string().contains("HashMap"));
+}
+
+#[test]
+fn resolves_inlay_hints() {
+    if skip_slow_tests() {
+        return;
+    }
+
+    let server = Project::with_fixture(
+        r#"
+//- /Cargo.toml
+[package]
+name = "foo"
+version = "0.0.0"
+
+//- /src/lib.rs
+struct Foo;
+fn f() {
+    let x = Foo;
+}
+"#,
+    )
+    .server()
+    .wait_until_workspace_is_loaded();
+
+    let res = server.send_request::<InlayHintRequest>(InlayHintParams {
+        range: Range::new(Position::new(0, 0), Position::new(3, 1)),
+        text_document: server.doc_id("src/lib.rs"),
+        work_done_progress_params: WorkDoneProgressParams::default(),
+    });
+    let mut hints = serde_json::from_value::<Option<Vec<InlayHint>>>(res).unwrap().unwrap();
+    let hint = hints.pop().unwrap();
+    assert!(hint.data.is_some());
+    assert!(
+        matches!(&hint.label, InlayHintLabel::LabelParts(parts) if parts[1].location.is_none())
+    );
+    let res = server.send_request::<InlayHintResolveRequest>(hint);
+    let hint = serde_json::from_value::<InlayHint>(res).unwrap();
+    assert!(hint.data.is_none());
+    assert!(
+        matches!(&hint.label, InlayHintLabel::LabelParts(parts) if parts[1].location.is_some())
+    );
+}
+
+#[test]
+fn completes_items_from_standard_library_in_cargo_script() {
+    // this test requires nightly so CI can't run it
+    if skip_slow_tests() || std::env::var("CI").is_ok() {
+        return;
+    }
+
+    let server = Project::with_fixture(
+        r#"
+//- /dependency/Cargo.toml
+[package]
+name = "dependency"
+version = "0.1.0"
+//- /dependency/src/lib.rs
+pub struct SpecialHashMap;
+//- /dependency2/Cargo.toml
+[package]
+name = "dependency2"
+version = "0.1.0"
+//- /dependency2/src/lib.rs
+pub struct SpecialHashMap2;
+//- /src/lib.rs
+#!/usr/bin/env -S cargo +nightly -Zscript
+---
+[dependencies]
+dependency = { path = "../dependency" }
+---
+use dependency::Spam;
+use dependency2::Spam;
+"#,
+    )
+    .with_config(serde_json::json!({
+        "cargo": { "sysroot": null },
+        "linkedProjects": ["src/lib.rs"],
+    }))
+    .server()
+    .wait_until_workspace_is_loaded();
+
+    let res = server.send_request::<Completion>(CompletionParams {
+        text_document_position: TextDocumentPositionParams::new(
+            server.doc_id("src/lib.rs"),
+            Position::new(5, 18),
+        ),
+        context: None,
+        partial_result_params: PartialResultParams::default(),
+        work_done_progress_params: WorkDoneProgressParams::default(),
+    });
+    assert!(res.to_string().contains("SpecialHashMap"), "{}", res.to_string());
+
+    let res = server.send_request::<Completion>(CompletionParams {
+        text_document_position: TextDocumentPositionParams::new(
+            server.doc_id("src/lib.rs"),
+            Position::new(6, 18),
+        ),
+        context: None,
+        partial_result_params: PartialResultParams::default(),
+        work_done_progress_params: WorkDoneProgressParams::default(),
+    });
+    assert!(!res.to_string().contains("SpecialHashMap"));
+
+    server.write_file_and_save(
+        "src/lib.rs",
+        r#"#!/usr/bin/env -S cargo +nightly -Zscript
+---
+[dependencies]
+dependency2 = { path = "../dependency2" }
+---
+use dependency::Spam;
+use dependency2::Spam;
+"#
+        .to_owned(),
+    );
+
+    let server = server.wait_until_workspace_is_loaded();
+
+    std::thread::sleep(std::time::Duration::from_secs(3));
+
+    let res = server.send_request::<Completion>(CompletionParams {
+        text_document_position: TextDocumentPositionParams::new(
+            server.doc_id("src/lib.rs"),
+            Position::new(5, 18),
+        ),
+        context: None,
+        partial_result_params: PartialResultParams::default(),
+        work_done_progress_params: WorkDoneProgressParams::default(),
+    });
+    assert!(!res.to_string().contains("SpecialHashMap"));
+
+    let res = server.send_request::<Completion>(CompletionParams {
+        text_document_position: TextDocumentPositionParams::new(
+            server.doc_id("src/lib.rs"),
+            Position::new(6, 18),
+        ),
+        context: None,
+        partial_result_params: PartialResultParams::default(),
+        work_done_progress_params: WorkDoneProgressParams::default(),
+    });
+    assert!(res.to_string().contains("SpecialHashMap"));
 }
 
 #[test]
@@ -116,9 +256,9 @@ fn main() {}
           {
             "args": {
               "cargoArgs": ["test", "--package", "foo", "--test", "spam"],
-              "executableArgs": ["test_eggs", "--exact", "--nocapture"],
-              "cargoExtraArgs": [],
+              "executableArgs": ["test_eggs", "--exact", "--show-output"],
               "overrideCargo": null,
+              "cwd": server.path().join("foo"),
               "workspaceRoot": server.path().join("foo")
             },
             "kind": "cargo",
@@ -138,6 +278,7 @@ fn main() {}
           {
             "args": {
               "overrideCargo": null,
+              "cwd": server.path().join("foo"),
               "workspaceRoot": server.path().join("foo"),
               "cargoArgs": [
                 "test",
@@ -146,10 +287,9 @@ fn main() {}
                 "--test",
                 "spam"
               ],
-              "cargoExtraArgs": [],
               "executableArgs": [
                 "",
-                "--nocapture"
+                "--show-output"
               ]
             },
             "kind": "cargo",
@@ -182,8 +322,8 @@ fn main() {}
             "args": {
               "cargoArgs": ["check", "--package", "foo", "--all-targets"],
               "executableArgs": [],
-              "cargoExtraArgs": [],
               "overrideCargo": null,
+              "cwd": server.path().join("foo"),
               "workspaceRoot": server.path().join("foo")
             },
             "kind": "cargo",
@@ -193,8 +333,8 @@ fn main() {}
             "args": {
               "cargoArgs": ["test", "--package", "foo", "--all-targets"],
               "executableArgs": [],
-              "cargoExtraArgs": [],
               "overrideCargo": null,
+              "cwd": server.path().join("foo"),
               "workspaceRoot": server.path().join("foo")
             },
             "kind": "cargo",
@@ -263,7 +403,7 @@ mod tests {
     for runnable in ["consumer", "dependency", "devdependency"] {
         server.request::<Runnables>(
             RunnablesParams {
-                text_document: server.doc_id(&format!("{}/src/lib.rs", runnable)),
+                text_document: server.doc_id(&format!("{runnable}/src/lib.rs")),
                 position: None,
             },
             json!([
@@ -274,13 +414,13 @@ mod tests {
                     "args": {
                         "overrideCargo": null,
                         "workspaceRoot": server.path().join(runnable),
+                        "cwd": server.path().join(runnable),
                         "cargoArgs": [
                             "test",
                             "--package",
                             runnable,
                             "--all-targets"
                         ],
-                        "cargoExtraArgs": [],
                         "executableArgs": []
                     },
                 },
@@ -289,6 +429,92 @@ mod tests {
             ]),
         );
     }
+}
+
+// The main fn in packages should be run from the workspace root
+#[test]
+fn test_runnables_cwd() {
+    if skip_slow_tests() {
+        return;
+    }
+
+    let server = Project::with_fixture(
+        r#"
+//- /foo/Cargo.toml
+[workspace]
+members = ["mainpkg", "otherpkg"]
+
+//- /foo/mainpkg/Cargo.toml
+[package]
+name = "mainpkg"
+version = "0.1.0"
+
+//- /foo/mainpkg/src/main.rs
+fn main() {}
+
+//- /foo/otherpkg/Cargo.toml
+[package]
+name = "otherpkg"
+version = "0.1.0"
+
+//- /foo/otherpkg/src/lib.rs
+#[test]
+fn otherpkg() {}
+"#,
+    )
+    .root("foo")
+    .server()
+    .wait_until_workspace_is_loaded();
+
+    server.request::<Runnables>(
+        RunnablesParams { text_document: server.doc_id("foo/mainpkg/src/main.rs"), position: None },
+        json!([
+            "{...}",
+            {
+                "label": "cargo test -p mainpkg --all-targets",
+                "kind": "cargo",
+                "args": {
+                    "overrideCargo": null,
+                    "workspaceRoot": server.path().join("foo"),
+                    "cwd": server.path().join("foo"),
+                    "cargoArgs": [
+                        "test",
+                        "--package",
+                        "mainpkg",
+                        "--all-targets"
+                    ],
+                    "executableArgs": []
+                },
+            },
+            "{...}",
+            "{...}"
+        ]),
+    );
+
+    server.request::<Runnables>(
+        RunnablesParams { text_document: server.doc_id("foo/otherpkg/src/lib.rs"), position: None },
+        json!([
+            "{...}",
+            {
+                "label": "cargo test -p otherpkg --all-targets",
+                "kind": "cargo",
+                "args": {
+                    "overrideCargo": null,
+                    "workspaceRoot": server.path().join("foo"),
+                    "cwd": server.path().join("foo").join("otherpkg"),
+                    "cargoArgs": [
+                        "test",
+                        "--package",
+                        "otherpkg",
+                        "--all-targets"
+                    ],
+                    "executableArgs": []
+                },
+            },
+            "{...}",
+            "{...}"
+        ]),
+    );
 }
 
 #[test]
@@ -437,6 +663,70 @@ fn main() {}
 }
 
 #[test]
+fn test_format_document_range() {
+    if skip_slow_tests() {
+        return;
+    }
+
+    let server = Project::with_fixture(
+        r#"
+//- /Cargo.toml
+[package]
+name = "foo"
+version = "0.0.0"
+
+//- /src/lib.rs
+fn main() {
+    let unit_offsets_cache = collect(dwarf.units  ())  ?;
+}
+"#,
+    )
+    .with_config(serde_json::json!({
+        "rustfmt": {
+            "overrideCommand": [ "rustfmt", "+nightly", ],
+            "rangeFormatting": { "enable": true }
+        },
+    }))
+    .server()
+    .wait_until_workspace_is_loaded();
+
+    server.request::<RangeFormatting>(
+        DocumentRangeFormattingParams {
+            range: Range {
+                end: Position { line: 1, character: 0 },
+                start: Position { line: 1, character: 0 },
+            },
+            text_document: server.doc_id("src/lib.rs"),
+            options: FormattingOptions {
+                tab_size: 4,
+                insert_spaces: false,
+                insert_final_newline: None,
+                trim_final_newlines: None,
+                trim_trailing_whitespace: None,
+                properties: HashMap::new(),
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+        },
+        json!([
+            {
+                "newText": "",
+                "range": {
+                    "start": { "character": 48, "line": 1 },
+                    "end": { "character": 50, "line": 1 },
+                },
+            },
+            {
+                "newText": "",
+                "range": {
+                    "start": { "character": 53, "line": 1 },
+                    "end": { "character": 55, "line": 1 },
+                },
+            }
+        ]),
+    );
+}
+
+#[test]
 fn test_missing_module_code_action() {
     if skip_slow_tests() {
         return;
@@ -508,7 +798,7 @@ fn main() {}
 #[test]
 fn test_missing_module_code_action_in_json_project() {
     if skip_slow_tests() {
-        // return;
+        return;
     }
 
     let tmp_dir = TestDir::new();
@@ -527,15 +817,14 @@ fn test_missing_module_code_action_in_json_project() {
 
     let code = format!(
         r#"
-//- /rust-project.json
-{PROJECT}
+//- /.rust-project.json
+{project}
 
 //- /src/lib.rs
 mod bar;
 
 fn main() {{}}
 "#,
-        PROJECT = project,
     );
 
     let server =
@@ -595,8 +884,10 @@ fn diagnostics_dont_block_typing() {
         return;
     }
 
-    let librs: String = (0..10).map(|i| format!("mod m{};", i)).collect();
-    let libs: String = (0..10).map(|i| format!("//- /src/m{}.rs\nfn foo() {{}}\n\n", i)).collect();
+    let librs: String = (0..10).fold(String::new(), |mut acc, i| format_to_acc!(acc, "mod m{i};"));
+    let libs: String = (0..10).fold(String::new(), |mut acc, i| {
+        format_to_acc!(acc, "//- /src/m{i}.rs\nfn foo() {{}}\n\n")
+    });
     let server = Project::with_fixture(&format!(
         r#"
 //- /Cargo.toml
@@ -605,16 +896,15 @@ name = "foo"
 version = "0.0.0"
 
 //- /src/lib.rs
-{}
+{librs}
 
-{}
+{libs}
 
 fn main() {{}}
-"#,
-        librs, libs
+"#
     ))
     .with_config(serde_json::json!({
-        "cargo": { "sysroot": "discover" }
+        "cargo": { "sysroot": "discover" },
     }))
     .server()
     .wait_until_workspace_is_loaded();
@@ -622,10 +912,10 @@ fn main() {{}}
     for i in 0..10 {
         server.notification::<DidOpenTextDocument>(DidOpenTextDocumentParams {
             text_document: TextDocumentItem {
-                uri: server.doc_id(&format!("src/m{}.rs", i)).uri,
-                language_id: "rust".to_string(),
+                uri: server.doc_id(&format!("src/m{i}.rs")).uri,
+                language_id: "rust".to_owned(),
                 version: 0,
-                text: "/// Docs\nfn foo() {}".to_string(),
+                text: "/// Docs\nfn foo() {}".to_owned(),
             },
         });
     }
@@ -645,7 +935,7 @@ fn main() {{}}
         }]),
     );
     let elapsed = start.elapsed();
-    assert!(elapsed.as_millis() < 2000, "typing enter took {:?}", elapsed);
+    assert!(elapsed.as_millis() < 2000, "typing enter took {elapsed:?}");
 }
 
 #[test]
@@ -684,13 +974,12 @@ version = \"0.0.0\"
     );
 }
 
-#[test]
-fn out_dirs_check() {
+fn out_dirs_check_impl(root_contains_symlink: bool) {
     if skip_slow_tests() {
-        // return;
+        return;
     }
 
-    let server = Project::with_fixture(
+    let mut server = Project::with_fixture(
         r###"
 //- /Cargo.toml
 [package]
@@ -713,10 +1002,21 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
 }
 //- /src/main.rs
-#[rustc_builtin_macro] macro_rules! include {}
-#[rustc_builtin_macro] macro_rules! include_str {}
-#[rustc_builtin_macro] macro_rules! concat {}
-#[rustc_builtin_macro] macro_rules! env {}
+#![allow(warnings)]
+#![feature(rustc_attrs)]
+#[rustc_builtin_macro] macro_rules! include {
+    ($file:expr $(,)?) => {{ /* compiler built-in */ }};
+}
+#[rustc_builtin_macro] macro_rules! include_str {
+    ($file:expr $(,)?) => {{ /* compiler built-in */ }};
+}
+#[rustc_builtin_macro] macro_rules! concat {
+    ($($e:ident),+ $(,)?) => {{ /* compiler built-in */ }};
+}
+#[rustc_builtin_macro] macro_rules! env {
+    ($name:expr $(,)?) => {{ /* compiler built-in */ }};
+    ($name:expr, $error_msg:expr $(,)?) => {{ /* compiler built-in */ }};
+}
 
 include!(concat!(env!("OUT_DIR"), "/hello.rs"));
 
@@ -736,22 +1036,31 @@ fn main() {
     let another_str = include_str!("main.rs");
 }
 "###,
-    )
-    .with_config(serde_json::json!({
-        "cargo": {
-            "buildScripts": {
-                "enable": true
-            },
-            "sysroot": null,
-        }
-    }))
-    .server()
-    .wait_until_workspace_is_loaded();
+    );
+
+    if root_contains_symlink {
+        server = server.with_root_dir_contains_symlink();
+    }
+
+    let server = server
+        .with_config(serde_json::json!({
+            "cargo": {
+                "buildScripts": {
+                    "enable": true
+                },
+                "sysroot": null,
+                "extraEnv": {
+                    "RUSTC_BOOTSTRAP": "1"
+                }
+            }
+        }))
+        .server()
+        .wait_until_workspace_is_loaded();
 
     let res = server.send_request::<HoverRequest>(HoverParams {
         text_document_position_params: TextDocumentPositionParams::new(
             server.doc_id("src/main.rs"),
-            Position::new(19, 10),
+            Position::new(30, 10),
         ),
         work_done_progress_params: Default::default(),
     });
@@ -760,7 +1069,7 @@ fn main() {
     let res = server.send_request::<HoverRequest>(HoverParams {
         text_document_position_params: TextDocumentPositionParams::new(
             server.doc_id("src/main.rs"),
-            Position::new(20, 10),
+            Position::new(31, 10),
         ),
         work_done_progress_params: Default::default(),
     });
@@ -770,23 +1079,23 @@ fn main() {
         GotoDefinitionParams {
             text_document_position_params: TextDocumentPositionParams::new(
                 server.doc_id("src/main.rs"),
-                Position::new(17, 9),
+                Position::new(28, 9),
             ),
             work_done_progress_params: Default::default(),
             partial_result_params: Default::default(),
         },
         json!([{
             "originSelectionRange": {
-                "end": { "character": 10, "line": 17 },
-                "start": { "character": 8, "line": 17 }
+                "end": { "character": 10, "line": 28 },
+                "start": { "character": 8, "line": 28 }
             },
             "targetRange": {
-                "end": { "character": 9, "line": 8 },
-                "start": { "character": 0, "line": 7 }
+                "end": { "character": 9, "line": 19 },
+                "start": { "character": 0, "line": 18 }
             },
             "targetSelectionRange": {
-                "end": { "character": 8, "line": 8 },
-                "start": { "character": 7, "line": 8 }
+                "end": { "character": 8, "line": 19 },
+                "start": { "character": 7, "line": 19 }
             },
             "targetUri": "file:///[..]src/main.rs"
         }]),
@@ -796,23 +1105,23 @@ fn main() {
         GotoDefinitionParams {
             text_document_position_params: TextDocumentPositionParams::new(
                 server.doc_id("src/main.rs"),
-                Position::new(18, 9),
+                Position::new(29, 9),
             ),
             work_done_progress_params: Default::default(),
             partial_result_params: Default::default(),
         },
         json!([{
             "originSelectionRange": {
-                "end": { "character": 10, "line": 18 },
-                "start": { "character": 8, "line": 18 }
+                "end": { "character": 10, "line": 29 },
+                "start": { "character": 8, "line": 29 }
             },
             "targetRange": {
-                "end": { "character": 9, "line": 12 },
-                "start": { "character": 0, "line":11 }
+                "end": { "character": 9, "line": 23 },
+                "start": { "character": 0, "line": 22 }
             },
             "targetSelectionRange": {
-                "end": { "character": 8, "line": 12 },
-                "start": { "character": 7, "line": 12 }
+                "end": { "character": 8, "line": 23 },
+                "start": { "character": 7, "line": 23 }
             },
             "targetUri": "file:///[..]src/main.rs"
         }]),
@@ -820,13 +1129,36 @@ fn main() {
 }
 
 #[test]
-// FIXME: Re-enable once we can run proc-macro tests on rust-lang/rust-analyzer again
-#[cfg(any())]
+fn out_dirs_check() {
+    out_dirs_check_impl(false);
+}
+
+#[test]
+#[cfg(not(windows))] // windows requires elevated permissions to create symlinks
+fn root_contains_symlink_out_dirs_check() {
+    out_dirs_check_impl(true);
+}
+
+#[test]
+#[cfg(any(feature = "sysroot-abi", rust_analyzer))]
 fn resolve_proc_macro() {
     use expect_test::expect;
+    use vfs::AbsPathBuf;
     if skip_slow_tests() {
         return;
     }
+
+    let mut sysroot = project_model::Sysroot::discover(
+        &AbsPathBuf::assert_utf8(std::env::current_dir().unwrap()),
+        &Default::default(),
+    );
+    let loaded_sysroot =
+        sysroot.load_workspace(&project_model::RustSourceWorkspaceConfig::default_cargo());
+    if let Some(loaded_sysroot) = loaded_sysroot {
+        sysroot.set_workspace(loaded_sysroot);
+    }
+
+    let proc_macro_server_path = sysroot.discover_proc_macro_srv().unwrap();
 
     let server = Project::with_fixture(
         r###"
@@ -839,6 +1171,8 @@ edition = "2021"
 bar = {path = "../bar"}
 
 //- /foo/src/main.rs
+#![allow(internal_features)]
+#![feature(rustc_attrs, decl_macro)]
 use bar::Bar;
 
 #[rustc_builtin_macro]
@@ -862,7 +1196,6 @@ edition = "2021"
 proc-macro = true
 
 //- /bar/src/lib.rs
-extern crate proc_macro;
 use proc_macro::{Delimiter, Group, Ident, Span, TokenStream, TokenTree};
 macro_rules! t {
     ($n:literal) => {
@@ -904,7 +1237,7 @@ pub fn foo(_input: TokenStream) -> TokenStream {
         },
         "procMacro": {
             "enable": true,
-            "server": PathBuf::from(env!("CARGO_BIN_EXE_rust-analyzer")),
+            "server": proc_macro_server_path.as_path().as_str(),
         }
     }))
     .root("foo")
@@ -915,7 +1248,7 @@ pub fn foo(_input: TokenStream) -> TokenStream {
     let res = server.send_request::<HoverRequest>(HoverParams {
         text_document_position_params: TextDocumentPositionParams::new(
             server.doc_id("foo/src/main.rs"),
-            Position::new(10, 9),
+            Position::new(12, 9),
         ),
         work_done_progress_params: Default::default(),
     });
@@ -941,8 +1274,8 @@ fn test_will_rename_files_same_level() {
 
     let tmp_dir = TestDir::new();
     let tmp_dir_path = tmp_dir.path().to_owned();
-    let tmp_dir_str = tmp_dir_path.to_str().unwrap();
-    let base_path = PathBuf::from(format!("file://{}", tmp_dir_str));
+    let tmp_dir_str = tmp_dir_path.as_str();
+    let base_path = PathBuf::from(format!("file://{tmp_dir_str}"));
 
     let code = r#"
 //- /Cargo.toml
@@ -960,6 +1293,11 @@ fn main() {}
 //- /src/old_file.rs
 
 //- /src/old_folder/mod.rs
+mod nested;
+
+//- /src/old_folder/nested.rs
+struct foo;
+use crate::old_folder::nested::foo as bar;
 
 //- /src/from_mod/mod.rs
 
@@ -973,15 +1311,15 @@ fn main() {}
     server.request::<WillRenameFiles>(
         RenameFilesParams {
             files: vec![FileRename {
-                old_uri: base_path.join("src/old_file.rs").to_str().unwrap().to_string(),
-                new_uri: base_path.join("src/new_file.rs").to_str().unwrap().to_string(),
+                old_uri: base_path.join("src/old_file.rs").to_str().unwrap().to_owned(),
+                new_uri: base_path.join("src/new_file.rs").to_str().unwrap().to_owned(),
             }],
         },
         json!({
           "documentChanges": [
             {
               "textDocument": {
-                "uri": format!("file://{}", tmp_dir_path.join("src").join("lib.rs").to_str().unwrap().to_string().replace("C:\\", "/c:/").replace('\\', "/")),
+                "uri": format!("file://{}", tmp_dir_path.join("src").join("lib.rs").as_str().to_owned().replace("C:\\", "/c:/").replace('\\', "/")),
                 "version": null
               },
               "edits": [
@@ -1008,8 +1346,8 @@ fn main() {}
     server.request::<WillRenameFiles>(
         RenameFilesParams {
             files: vec![FileRename {
-                old_uri: base_path.join("src/from_mod/mod.rs").to_str().unwrap().to_string(),
-                new_uri: base_path.join("src/from_mod/foo.rs").to_str().unwrap().to_string(),
+                old_uri: base_path.join("src/from_mod/mod.rs").to_str().unwrap().to_owned(),
+                new_uri: base_path.join("src/from_mod/foo.rs").to_str().unwrap().to_owned(),
             }],
         },
         json!(null),
@@ -1019,8 +1357,8 @@ fn main() {}
     server.request::<WillRenameFiles>(
         RenameFilesParams {
             files: vec![FileRename {
-                old_uri: base_path.join("src/to_mod/foo.rs").to_str().unwrap().to_string(),
-                new_uri: base_path.join("src/to_mod/mod.rs").to_str().unwrap().to_string(),
+                old_uri: base_path.join("src/to_mod/foo.rs").to_str().unwrap().to_owned(),
+                new_uri: base_path.join("src/to_mod/mod.rs").to_str().unwrap().to_owned(),
             }],
         },
         json!(null),
@@ -1030,15 +1368,15 @@ fn main() {}
     server.request::<WillRenameFiles>(
         RenameFilesParams {
             files: vec![FileRename {
-                old_uri: base_path.join("src/old_folder").to_str().unwrap().to_string(),
-                new_uri: base_path.join("src/new_folder").to_str().unwrap().to_string(),
+                old_uri: base_path.join("src/old_folder").to_str().unwrap().to_owned(),
+                new_uri: base_path.join("src/new_folder").to_str().unwrap().to_owned(),
             }],
         },
         json!({
           "documentChanges": [
             {
               "textDocument": {
-                "uri": format!("file://{}", tmp_dir_path.join("src").join("lib.rs").to_str().unwrap().to_string().replace("C:\\", "/c:/").replace('\\', "/")),
+                "uri": format!("file://{}", tmp_dir_path.join("src").join("lib.rs").as_str().to_owned().replace("C:\\", "/c:/").replace('\\', "/")),
                 "version": null
               },
               "edits": [
@@ -1051,6 +1389,27 @@ fn main() {}
                     "end": {
                       "line": 3,
                       "character": 14
+                    }
+                  },
+                  "newText": "new_folder"
+                }
+              ]
+            },
+            {
+              "textDocument": {
+                "uri": format!("file://{}", tmp_dir_path.join("src").join("old_folder").join("nested.rs").as_str().to_owned().replace("C:\\", "/c:/").replace('\\', "/")),
+                "version": null
+              },
+              "edits": [
+                {
+                  "range": {
+                    "start": {
+                      "line": 1,
+                      "character": 11
+                    },
+                    "end": {
+                      "line": 1,
+                      "character": 21
                     }
                   },
                   "newText": "new_folder"
@@ -1083,19 +1442,61 @@ pub fn foo() {}
 name = "bar"
 version = "0.0.0"
 
+[dependencies]
+foo = { path = "../foo" }
+
 //- /bar/src/lib.rs
-pub fn bar() {}
 "#,
     )
     .root("foo")
     .root("bar")
+    .root("baz")
     .with_config(json!({
        "files": {
-           "excludeDirs": ["foo", "bar"]
+           "exclude": ["foo"]
         }
     }))
     .server()
     .wait_until_workspace_is_loaded();
 
-    server.request::<WorkspaceSymbol>(Default::default(), json!([]));
+    server.request::<WorkspaceSymbolRequest>(Default::default(), json!([]));
+
+    let server = Project::with_fixture(
+        r#"
+//- /foo/Cargo.toml
+[package]
+name = "foo"
+version = "0.0.0"
+
+//- /foo/src/lib.rs
+pub fn foo() {}
+
+//- /bar/Cargo.toml
+[package]
+name = "bar"
+version = "0.0.0"
+
+//- /bar/src/lib.rs
+pub fn bar() {}
+
+//- /baz/Cargo.toml
+[package]
+name = "baz"
+version = "0.0.0"
+
+//- /baz/src/lib.rs
+"#,
+    )
+    .root("foo")
+    .root("bar")
+    .root("baz")
+    .with_config(json!({
+       "files": {
+           "exclude": ["foo", "bar"]
+        }
+    }))
+    .server()
+    .wait_until_workspace_is_loaded();
+
+    server.request::<WorkspaceSymbolRequest>(Default::default(), json!([]));
 }

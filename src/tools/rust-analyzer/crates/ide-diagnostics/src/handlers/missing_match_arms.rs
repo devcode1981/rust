@@ -1,6 +1,4 @@
-use hir::InFile;
-
-use crate::{Diagnostic, DiagnosticsContext};
+use crate::{Diagnostic, DiagnosticCode, DiagnosticsContext};
 
 // Diagnostic: missing-match-arm
 //
@@ -9,20 +7,42 @@ pub(crate) fn missing_match_arms(
     ctx: &DiagnosticsContext<'_>,
     d: &hir::MissingMatchArms,
 ) -> Diagnostic {
-    Diagnostic::new(
-        "missing-match-arm",
+    Diagnostic::new_with_syntax_node_ptr(
+        ctx,
+        DiagnosticCode::RustcHardError("E0004"),
         format!("missing match arm: {}", d.uncovered_patterns),
-        ctx.sema.diagnostics_display_range(InFile::new(d.file, d.match_expr.clone().into())).range,
+        d.scrutinee_expr.map(Into::into),
     )
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::tests::check_diagnostics;
+    use crate::{
+        tests::{
+            check_diagnostics, check_diagnostics_with_config, check_diagnostics_with_disabled,
+        },
+        DiagnosticsConfig,
+    };
+    use test_utils::skip_slow_tests;
 
-    fn check_diagnostics_no_bails(ra_fixture: &str) {
+    #[track_caller]
+    fn check_diagnostics_no_bails(#[rust_analyzer::rust_fixture] ra_fixture: &str) {
         cov_mark::check_count!(validate_match_bailed_out, 0);
         crate::tests::check_diagnostics(ra_fixture)
+    }
+
+    #[test]
+    fn empty_body() {
+        let mut config = DiagnosticsConfig::test_sample();
+        config.disabled.insert("syntax-error".to_owned());
+        check_diagnostics_with_config(
+            config,
+            r#"
+fn main() {
+    match 0;
+}
+"#,
+        );
     }
 
     #[test]
@@ -265,7 +285,7 @@ fn main() {
         cov_mark::check_count!(validate_match_bailed_out, 4);
         // Match statements with arms that don't match the
         // expression pattern do not fire this diagnostic.
-        check_diagnostics(
+        check_diagnostics_with_disabled(
             r#"
 enum Either { A, B }
 enum Either2 { C, D }
@@ -273,18 +293,43 @@ enum Either2 { C, D }
 fn main() {
     match Either::A {
         Either2::C => (),
+      //^^^^^^^^^^ error: expected Either, found Either2
         Either2::D => (),
+      //^^^^^^^^^^ error: expected Either, found Either2
     }
     match (true, false) {
         (true, false, true) => (),
+      //^^^^^^^^^^^^^^^^^^^ error: expected (bool, bool), found (bool, bool, bool)
         (true) => (),
       // ^^^^  error: expected (bool, bool), found bool
     }
     match (true, false) { (true,) => {} }
+                        //^^^^^^^ error: expected (bool, bool), found (bool,)
     match (0) { () => () }
+              //^^ error: expected i32, found ()
     match Unresolved::Bar { Unresolved::Baz => () }
 }
         "#,
+            &["E0425"],
+        );
+    }
+
+    #[test]
+    fn mismatched_types_issue_15883() {
+        // Check we don't panic.
+        cov_mark::check!(validate_match_bailed_out);
+        check_diagnostics(
+            r#"
+//- minicore: option
+fn main() {
+    match Some((true, false)) {
+        Some(true) | Some(false) => {}
+        //   ^^^^ error: expected (bool, bool), found bool
+        //                ^^^^^ error: expected (bool, bool), found bool
+        None => {}
+    }
+}
+            "#,
         );
     }
 
@@ -295,7 +340,9 @@ fn main() {
             r#"
 fn main() {
     match false { true | () => {} }
+                       //^^ error: expected bool, found ()
     match (false,) { (true | (),) => {} }
+                           //^^ error: expected bool, found ()
 }
 "#,
         );
@@ -313,6 +360,7 @@ fn main() {
     match Either::A {
         Either::A => (),
         Either::B() => (),
+              // ^^ error: this pattern has 0 fields, but the corresponding tuple struct has 1 field
     }
 }
 "#,
@@ -328,9 +376,11 @@ enum A { B(isize, isize), C }
 fn main() {
     match A::B(1, 2) {
         A::B(_, _, _) => (),
+                // ^^ error: this pattern has 3 fields, but the corresponding tuple struct has 2 fields
     }
     match A::B(1, 2) {
         A::C(_) => (),
+         // ^^^ error: this pattern has 1 field, but the corresponding tuple struct has 0 fields
     }
 }
 "#,
@@ -352,11 +402,11 @@ fn main() {
     match loop {} {
         Either::A => (),
     }
-    match loop { break Foo::A } {
-        //^^^^^^^^^^^^^^^^^^^^^ error: missing match arm: `B` not covered
+    match loop { break Either::A } {
+        //^^^^^^^^^^^^^^^^^^^^^^^^ error: missing match arm: `B` not covered
         Either::A => (),
     }
-    match loop { break Foo::A } {
+    match loop { break Either::A } {
         Either::A => (),
         Either::B => (),
     }
@@ -549,24 +599,35 @@ fn bang(never: !) {
 
     #[test]
     fn unknown_type() {
-        cov_mark::check_count!(validate_match_bailed_out, 1);
-
-        check_diagnostics(
+        check_diagnostics_no_bails(
             r#"
 enum Option<T> { Some(T), None }
 
+#[allow(unused)]
 fn main() {
     // `Never` is deliberately not defined so that it's an uninferred type.
+    // We ignore these to avoid triggering bugs in the analysis.
     match Option::<Never>::None {
-        None => (),
-        Some(never) => match never {},
+        Option::None => (),
+        Option::Some(never) => match never {},
     }
     match Option::<Never>::None {
-        //^^^^^^^^^^^^^^^^^^^^^ error: missing match arm: `None` not covered
         Option::Some(_never) => {},
     }
 }
 "#,
+        );
+    }
+
+    #[test]
+    fn arity_mismatch_issue_16746() {
+        check_diagnostics_with_disabled(
+            r#"
+fn main() {
+    let (a, ) = (0, 0);
+}
+"#,
+            &["E0308"],
         );
     }
 
@@ -710,7 +771,7 @@ fn main() {
             r#"
 struct S { a: char}
 fn main(v: S) {
-    match v { S{ a }      => {} }
+    match v { S{ a }      => { _ = a; } }
     match v { S{ a: _x }  => {} }
     match v { S{ a: 'a' } => {} }
     match v { S{..}       => {} }
@@ -740,17 +801,13 @@ fn main() {
 
     #[test]
     fn binding_ref_has_correct_type() {
-        cov_mark::check_count!(validate_match_bailed_out, 1);
-
         // Asserts `PatKind::Binding(ref _x): bool`, not &bool.
         // If that's not true match checking will panic with "incompatible constructors"
         // FIXME: make facilities to test this directly like `tests::check_infer(..)`
-        check_diagnostics(
+        check_diagnostics_no_bails(
             r#"
 enum Foo { A }
 fn main() {
-    // FIXME: this should not bail out but current behavior is such as the old algorithm.
-    // ExprValidator::validate_match(..) checks types of top level patterns incorrectly.
     match Foo::A {
         ref _x => {}
         Foo::A => {}
@@ -844,6 +901,7 @@ fn main() {
 struct Foo { }
 fn main(f: Foo) {
     match f { Foo { bar } => () }
+                 // ^^^ error: no such field
 }
 "#,
         );
@@ -895,7 +953,7 @@ enum E{ A, B }
 fn foo() {
     match &E::A {
         E::A => {}
-        x => {}
+        _x => {}
     }
 }",
         );
@@ -934,7 +992,7 @@ fn f(ty: Enum) {
     #[test]
     fn unexpected_ty_fndef() {
         cov_mark::check!(validate_match_bailed_out);
-        check_diagnostics(
+        check_diagnostics_with_disabled(
             r"
 enum Exp {
     Tuple(()),
@@ -944,6 +1002,71 @@ fn f() {
         Exp::Tuple => {}
     }
 }",
+            &["E0425"],
+        );
+    }
+
+    #[test]
+    fn exponential_match() {
+        if skip_slow_tests() {
+            return;
+        }
+        // Constructs a match where match checking takes exponential time. Ensures we bail early.
+        use std::fmt::Write;
+        let struct_arity = 50;
+        let mut code = String::new();
+        write!(code, "struct BigStruct {{").unwrap();
+        for i in 0..struct_arity {
+            write!(code, "  field{i}: bool,").unwrap();
+        }
+        write!(code, "}}").unwrap();
+        write!(code, "fn big_match(s: BigStruct) {{").unwrap();
+        write!(code, "  match s {{").unwrap();
+        for i in 0..struct_arity {
+            write!(code, "    BigStruct {{ field{i}: true, ..}} => {{}},").unwrap();
+            write!(code, "    BigStruct {{ field{i}: false, ..}} => {{}},").unwrap();
+        }
+        write!(code, "    _ => {{}},").unwrap();
+        write!(code, "  }}").unwrap();
+        write!(code, "}}").unwrap();
+        check_diagnostics_no_bails(&code);
+    }
+
+    #[test]
+    fn min_exhaustive() {
+        check_diagnostics(
+            r#"
+//- minicore: result
+fn test(x: Result<i32, !>) {
+    match x {
+        Ok(_y) => {}
+    }
+}
+"#,
+        );
+        check_diagnostics(
+            r#"
+//- minicore: result
+fn test(ptr: *const Result<i32, !>) {
+    unsafe {
+        match *ptr {
+            //^^^^ error: missing match arm: `Err(!)` not covered
+            Ok(_x) => {}
+        }
+    }
+}
+"#,
+        );
+        check_diagnostics(
+            r#"
+//- minicore: result
+fn test(x: Result<i32, &'static !>) {
+    match x {
+        //^ error: missing match arm: `Err(_)` not covered
+        Ok(_y) => {}
+    }
+}
+"#,
         );
     }
 
@@ -991,6 +1114,25 @@ fn test(x: Option<lib::PrivatelyUninhabited>) {
         }
     }
 
+    #[test]
+    fn non_exhaustive_may_be_empty() {
+        check_diagnostics_no_bails(
+            r"
+//- /main.rs crate:main deps:dep
+// In a different crate
+fn empty_match_on_empty_struct<T>(x: dep::UninhabitedStruct) -> T {
+    match x {}
+}
+//- /dep.rs crate:dep
+#[non_exhaustive]
+pub struct UninhabitedStruct {
+    pub never: !,
+    // other fields
+}
+",
+        );
+    }
+
     mod false_negatives {
         //! The implementation of match checking here is a work in progress. As we roll this out, we
         //! prefer false negatives to false positives (ideally there would be no false positives). This
@@ -1026,6 +1168,7 @@ fn main() {
 
             check_diagnostics(
                 r#"
+//- minicore: copy
 fn main() {
     match &false {
         &true => {}
@@ -1037,12 +1180,13 @@ fn main() {
 
         #[test]
         fn reference_patterns_in_fields() {
-            cov_mark::check_count!(validate_match_bailed_out, 2);
-
+            cov_mark::check_count!(validate_match_bailed_out, 1);
             check_diagnostics(
                 r#"
+//- minicore: copy
 fn main() {
     match (&false,) {
+        //^^^^^^^^^ error: missing match arm: `(&false,)` not covered
         (true,) => {}
     }
     match (&false,) {

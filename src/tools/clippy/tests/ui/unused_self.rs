@@ -9,16 +9,34 @@ mod unused_self {
 
     impl A {
         fn unused_self_move(self) {}
+        //~^ unused_self
+
         fn unused_self_ref(&self) {}
+        //~^ unused_self
+
         fn unused_self_mut_ref(&mut self) {}
+        //~^ unused_self
+
         fn unused_self_pin_ref(self: Pin<&Self>) {}
+        //~^ unused_self
+
         fn unused_self_pin_mut_ref(self: Pin<&mut Self>) {}
+        //~^ unused_self
+
         fn unused_self_pin_nested(self: Pin<Arc<Self>>) {}
+        //~^ unused_self
+
         fn unused_self_box(self: Box<Self>) {}
+        //~^ unused_self
+
         fn unused_with_other_used_args(&self, x: u8, y: u8) -> u8 {
+            //~^ unused_self
+
             x + y
         }
         fn unused_self_class_method(&self) {
+            //~^ unused_self
+
             Self::static_method();
         }
 
@@ -59,6 +77,16 @@ mod unused_self_allow {
     impl D {
         // shouldn't trigger for public methods
         pub fn unused_self_move(self) {}
+    }
+
+    pub struct E;
+
+    impl E {
+        // shouldn't trigger if body contains todo!()
+        pub fn unused_self_todo(self) {
+            let x = 42;
+            todo!()
+        }
     }
 }
 

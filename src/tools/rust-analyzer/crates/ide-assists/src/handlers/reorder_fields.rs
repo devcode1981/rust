@@ -1,7 +1,7 @@
 use either::Either;
 use ide_db::FxHashMap;
 use itertools::Itertools;
-use syntax::{ast, ted, AstNode};
+use syntax::{ast, syntax_editor::SyntaxEditor, AstNode, SmolStr, SyntaxElement, ToSmolStr};
 
 use crate::{AssistContext, AssistId, AssistKind, Assists};
 
@@ -20,15 +20,19 @@ use crate::{AssistContext, AssistId, AssistKind, Assists};
 // const test: Foo = Foo {foo: 1, bar: 0}
 // ```
 pub(crate) fn reorder_fields(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
-    let record = ctx
-        .find_node_at_offset::<ast::RecordExpr>()
-        .map(Either::Left)
-        .or_else(|| ctx.find_node_at_offset::<ast::RecordPat>().map(Either::Right))?;
+    let path = ctx.find_node_at_offset::<ast::Path>()?;
+    let record =
+        path.syntax().parent().and_then(<Either<ast::RecordExpr, ast::RecordPat>>::cast)?;
 
-    let path = record.as_ref().either(|it| it.path(), |it| it.path())?;
+    let parent_node = match ctx.covering_element() {
+        SyntaxElement::Node(n) => n,
+        SyntaxElement::Token(t) => t.parent()?,
+    };
+
     let ranks = compute_fields_ranks(&path, ctx)?;
-    let get_rank_of_field =
-        |of: Option<_>| *ranks.get(&of.unwrap_or_default()).unwrap_or(&usize::MAX);
+    let get_rank_of_field = |of: Option<SmolStr>| {
+        *ranks.get(of.unwrap_or_default().trim_start_matches("r#")).unwrap_or(&usize::MAX)
+    };
 
     let field_list = match &record {
         Either::Left(it) => Either::Left(it.record_expr_field_list()?),
@@ -38,7 +42,7 @@ pub(crate) fn reorder_fields(acc: &mut Assists, ctx: &AssistContext<'_>) -> Opti
         Either::Left(it) => Either::Left((
             it.fields()
                 .sorted_unstable_by_key(|field| {
-                    get_rank_of_field(field.field_name().map(|it| it.to_string()))
+                    get_rank_of_field(field.field_name().map(|it| it.to_smolstr()))
                 })
                 .collect::<Vec<_>>(),
             it,
@@ -46,7 +50,7 @@ pub(crate) fn reorder_fields(acc: &mut Assists, ctx: &AssistContext<'_>) -> Opti
         Either::Right(it) => Either::Right((
             it.fields()
                 .sorted_unstable_by_key(|field| {
-                    get_rank_of_field(field.field_name().map(|it| it.to_string()))
+                    get_rank_of_field(field.field_name().map(|it| it.to_smolstr()))
                 })
                 .collect::<Vec<_>>(),
             it,
@@ -66,24 +70,31 @@ pub(crate) fn reorder_fields(acc: &mut Assists, ctx: &AssistContext<'_>) -> Opti
         AssistId("reorder_fields", AssistKind::RefactorRewrite),
         "Reorder record fields",
         target,
-        |builder| match fields {
-            Either::Left((sorted, field_list)) => {
-                replace(builder.make_mut(field_list).fields(), sorted)
+        |builder| {
+            let mut editor = builder.make_editor(&parent_node);
+
+            match fields {
+                Either::Left((sorted, field_list)) => {
+                    replace(&mut editor, field_list.fields(), sorted)
+                }
+                Either::Right((sorted, field_list)) => {
+                    replace(&mut editor, field_list.fields(), sorted)
+                }
             }
-            Either::Right((sorted, field_list)) => {
-                replace(builder.make_mut(field_list).fields(), sorted)
-            }
+
+            builder.add_file_edits(ctx.file_id(), editor);
         },
     )
 }
 
 fn replace<T: AstNode + PartialEq>(
+    editor: &mut SyntaxEditor,
     fields: impl Iterator<Item = T>,
     sorted_fields: impl IntoIterator<Item = T>,
 ) {
-    fields.zip(sorted_fields).for_each(|(field, sorted_field)| {
-        ted::replace(field.syntax(), sorted_field.syntax().clone_for_update())
-    });
+    fields
+        .zip(sorted_fields)
+        .for_each(|(field, sorted_field)| editor.replace(field.syntax(), sorted_field.syntax()));
 }
 
 fn compute_fields_ranks(
@@ -99,7 +110,7 @@ fn compute_fields_ranks(
         .fields(ctx.db())
         .into_iter()
         .enumerate()
-        .map(|(idx, field)| (field.name(ctx.db()).to_string(), idx))
+        .map(|(idx, field)| (field.name(ctx.db()).as_str().to_owned(), idx))
         .collect();
 
     Some(res)

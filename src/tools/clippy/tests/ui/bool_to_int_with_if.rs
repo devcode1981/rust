@@ -1,5 +1,4 @@
-// run-rustfix
-
+#![feature(let_chains)]
 #![warn(clippy::bool_to_int_with_if)]
 #![allow(unused, dead_code, clippy::unnecessary_operation, clippy::no_effect)]
 
@@ -13,31 +12,37 @@ fn main() {
     // Should lint
     // precedence
     if a {
+        //~^ bool_to_int_with_if
         1
     } else {
         0
     };
     if a {
+        //~^ bool_to_int_with_if
         0
     } else {
         1
     };
     if !a {
+        //~^ bool_to_int_with_if
         1
     } else {
         0
     };
     if a || b {
+        //~^ bool_to_int_with_if
         1
     } else {
         0
     };
     if cond(a, b) {
+        //~^ bool_to_int_with_if
         1
     } else {
         0
     };
     if x + y < 4 {
+        //~^ bool_to_int_with_if
         1
     } else {
         0
@@ -47,6 +52,7 @@ fn main() {
     if a {
         123
     } else if b {
+        //~^ bool_to_int_with_if
         1
     } else {
         0
@@ -56,6 +62,7 @@ fn main() {
     if a {
         123
     } else if b {
+        //~^ bool_to_int_with_if
         0
     } else {
         1
@@ -108,16 +115,45 @@ fn main() {
         123
     };
 
+    pub const SHOULD_NOT_LINT: usize = if true { 1 } else { 0 };
+
+    // https://github.com/rust-lang/rust-clippy/issues/10452
+    let should_not_lint = [(); if true { 1 } else { 0 }];
+
+    let should_not_lint = const { if true { 1 } else { 0 } };
+
     some_fn(a);
 }
 
 // Lint returns and type inference
 fn some_fn(a: bool) -> u8 {
     if a { 1 } else { 0 }
+    //~^ bool_to_int_with_if
 }
 
 fn side_effect() {}
 
 fn cond(a: bool, b: bool) -> bool {
     a || b
+}
+
+enum Enum {
+    A,
+    B,
+}
+
+fn if_let(a: Enum, b: Enum) {
+    if let Enum::A = a {
+        1
+    } else {
+        0
+    };
+
+    if let Enum::A = a
+        && let Enum::B = b
+    {
+        1
+    } else {
+        0
+    };
 }

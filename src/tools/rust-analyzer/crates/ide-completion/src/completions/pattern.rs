@@ -1,6 +1,7 @@
 //! Completes constants and paths in unqualified patterns.
 
 use hir::{db::DefDatabase, AssocItem, ScopeDef};
+use ide_db::syntax_helpers::suggest_name;
 use syntax::ast::Pat;
 
 use crate::{
@@ -14,25 +15,27 @@ pub(crate) fn complete_pattern(
     ctx: &CompletionContext<'_>,
     pattern_ctx: &PatternContext,
 ) {
+    let mut add_keyword = |kw, snippet| acc.add_keyword_snippet(ctx, kw, snippet);
+
     match pattern_ctx.parent_pat.as_ref() {
         Some(Pat::RangePat(_) | Pat::BoxPat(_)) => (),
         Some(Pat::RefPat(r)) => {
             if r.mut_token().is_none() {
-                acc.add_keyword(ctx, "mut");
+                add_keyword("mut", "mut $0");
             }
         }
         _ => {
             let tok = ctx.token.text_range().start();
             match (pattern_ctx.ref_token.as_ref(), pattern_ctx.mut_token.as_ref()) {
                 (None, None) => {
-                    acc.add_keyword(ctx, "ref");
-                    acc.add_keyword(ctx, "mut");
+                    add_keyword("ref", "ref $0");
+                    add_keyword("mut", "mut $0");
                 }
                 (None, Some(m)) if tok < m.text_range().start() => {
-                    acc.add_keyword(ctx, "ref");
+                    add_keyword("ref", "ref $0");
                 }
                 (Some(r), None) if tok > r.text_range().end() => {
-                    acc.add_keyword(ctx, "mut");
+                    add_keyword("mut", "mut $0");
                 }
                 _ => (),
             }
@@ -41,6 +44,19 @@ pub(crate) fn complete_pattern(
 
     if pattern_ctx.record_pat.is_some() {
         return;
+    }
+
+    // Suggest name only in let-stmt and fn param
+    if pattern_ctx.should_suggest_name {
+        let mut name_generator = suggest_name::NameGenerator::new();
+        if let Some(suggested) = ctx
+            .expected_type
+            .as_ref()
+            .map(|ty| ty.strip_references())
+            .and_then(|ty| name_generator.for_type(&ty, ctx.db, ctx.edition))
+        {
+            acc.suggest_name(ctx, &suggested);
+        }
     }
 
     let refutable = pattern_ctx.refutability == PatternRefutability::Refutable;
@@ -64,7 +80,7 @@ pub(crate) fn complete_pattern(
 
     // FIXME: ideally, we should look at the type we are matching against and
     // suggest variants + auto-imports
-    ctx.process_all_names(&mut |name, res| {
+    ctx.process_all_names(&mut |name, res, _| {
         let add_simple_path = match res {
             hir::ScopeDef::ModuleDef(def) => match def {
                 hir::ModuleDef::Adt(hir::Adt::Struct(strukt)) => {
@@ -127,7 +143,7 @@ pub(crate) fn complete_pattern_path(
                         };
 
                         if add_resolution {
-                            acc.add_path_resolution(ctx, path_ctx, name, def);
+                            acc.add_path_resolution(ctx, path_ctx, name, def, vec![]);
                         }
                     }
                 }
@@ -164,7 +180,7 @@ pub(crate) fn complete_pattern_path(
         Qualified::Absolute => acc.add_crate_roots(ctx, path_ctx),
         Qualified::No => {
             // this will only be hit if there are brackets or braces, otherwise this will be parsed as an ident pattern
-            ctx.process_all_names(&mut |name, res| {
+            ctx.process_all_names(&mut |name, res, doc_aliases| {
                 // FIXME: we should check what kind of pattern we are in and filter accordingly
                 let add_completion = match res {
                     ScopeDef::ModuleDef(hir::ModuleDef::Macro(mac)) => mac.is_fn_like(ctx.db),
@@ -175,7 +191,7 @@ pub(crate) fn complete_pattern_path(
                     _ => false,
                 };
                 if add_completion {
-                    acc.add_path_resolution(ctx, path_ctx, name, res);
+                    acc.add_path_resolution(ctx, path_ctx, name, res, doc_aliases);
                 }
             });
 

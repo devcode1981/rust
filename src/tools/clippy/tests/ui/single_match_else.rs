@@ -1,9 +1,9 @@
-// aux-build: proc_macro_with_span.rs
-#![warn(clippy::single_match_else)]
-#![allow(clippy::needless_return, clippy::no_effect, clippy::uninlined_format_args)]
+//@aux-build: proc_macros.rs
 
-extern crate proc_macro_with_span;
-use proc_macro_with_span::with_span;
+#![warn(clippy::single_match_else)]
+#![allow(unused, clippy::needless_return, clippy::no_effect, clippy::uninlined_format_args)]
+extern crate proc_macros;
+use proc_macros::with_span;
 
 enum ExprNode {
     ExprAddrOf,
@@ -21,6 +21,7 @@ fn unwrap_addr() -> Option<&'static ExprNode> {
             None
         },
     };
+    //~^^^^^^^ single_match_else
 
     // Don't lint
     with_span!(span match ExprNode::Butterflies {
@@ -86,6 +87,7 @@ fn main() {
             return
         },
     }
+    //~^^^^^^^ single_match_else
 
     // lint here
     match Some(1) {
@@ -95,16 +97,18 @@ fn main() {
             return;
         },
     }
+    //~^^^^^^^ single_match_else
 
     // lint here
     use std::convert::Infallible;
-    match Result::<i32, Infallible>::Ok(1) {
+    match Result::<i32, &Infallible>::Ok(1) {
         Ok(a) => println!("${:?}", a),
         Err(_) => {
             println!("else block");
             return;
         }
     }
+    //~^^^^^^^ single_match_else
 
     use std::borrow::Cow;
     match Cow::from("moo") {
@@ -114,4 +118,104 @@ fn main() {
             return;
         }
     }
+    //~^^^^^^^ single_match_else
+}
+
+fn issue_10808(bar: Option<i32>) {
+    match bar {
+        Some(v) => unsafe {
+            let r = &v as *const i32;
+            println!("{}", *r);
+        },
+        None => {
+            println!("None1");
+            println!("None2");
+        },
+    }
+    //~^^^^^^^^^^ single_match_else
+
+    match bar {
+        Some(v) => {
+            println!("Some");
+            println!("{v}");
+        },
+        None => unsafe {
+            let v = 0;
+            let r = &v as *const i32;
+            println!("{}", *r);
+        },
+    }
+    //~^^^^^^^^^^^ single_match_else
+
+    match bar {
+        Some(v) => unsafe {
+            let r = &v as *const i32;
+            println!("{}", *r);
+        },
+        None => unsafe {
+            let v = 0;
+            let r = &v as *const i32;
+            println!("{}", *r);
+        },
+    }
+    //~^^^^^^^^^^^ single_match_else
+
+    match bar {
+        #[rustfmt::skip]
+        Some(v) => {
+            unsafe {
+                let r = &v as *const i32;
+                println!("{}", *r);
+            }
+        },
+        None => {
+            println!("None");
+            println!("None");
+        },
+    }
+    //~^^^^^^^^^^^^^ single_match_else
+
+    match bar {
+        Some(v) => {
+            println!("Some");
+            println!("{v}");
+        },
+        #[rustfmt::skip]
+        None => {
+            unsafe {
+                let v = 0;
+                let r = &v as *const i32;
+                println!("{}", *r);
+            }
+        },
+    }
+
+    match bar {
+        #[rustfmt::skip]
+        Some(v) => {
+            unsafe {
+                let r = &v as *const i32;
+                println!("{}", *r);
+            }
+        },
+        #[rustfmt::skip]
+        None => {
+            unsafe {
+                let v = 0;
+                let r = &v as *const i32;
+                println!("{}", *r);
+            }
+        },
+    }
+}
+
+fn irrefutable_match() -> Option<&'static ExprNode> {
+    match ExprNode::Butterflies {
+        ExprNode::Butterflies => Some(&NODE),
+        _ => {
+            let x = 5;
+            None
+        },
+    }
+    //~^^^^^^^ single_match_else
 }

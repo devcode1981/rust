@@ -1,4 +1,7 @@
+//@ check-pass
+
 #![warn(clippy::all, clippy::pedantic)]
+#![allow(clippy::useless_vec)]
 
 #[derive(Debug, Copy, Clone)]
 enum Flavor {

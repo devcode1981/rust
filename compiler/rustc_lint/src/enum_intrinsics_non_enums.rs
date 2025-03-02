@@ -1,8 +1,12 @@
-use crate::{context::LintContext, LateContext, LateLintPass};
-use rustc_errors::fluent;
 use rustc_hir as hir;
-use rustc_middle::ty::{visit::TypeVisitable, Ty};
-use rustc_span::{symbol::sym, Span};
+use rustc_middle::ty::Ty;
+use rustc_middle::ty::visit::TypeVisitableExt;
+use rustc_session::{declare_lint, declare_lint_pass};
+use rustc_span::{Span, sym};
+
+use crate::context::LintContext;
+use crate::lints::{EnumIntrinsicsMemDiscriminate, EnumIntrinsicsMemVariant};
+use crate::{LateContext, LateLintPass};
 
 declare_lint! {
     /// The `enum_intrinsics_non_enums` lint detects calls to
@@ -39,7 +43,7 @@ declare_lint_pass!(EnumIntrinsicsNonEnums => [ENUM_INTRINSICS_NON_ENUMS]);
 /// Returns `true` if we know for sure that the given type is not an enum. Note that for cases where
 /// the type is generic, we can't be certain if it will be an enum so we have to assume that it is.
 fn is_non_enum(t: Ty<'_>) -> bool {
-    !t.is_enum() && !t.needs_subst()
+    !t.is_enum() && !t.has_param()
 }
 
 fn enforce_mem_discriminant(
@@ -48,26 +52,20 @@ fn enforce_mem_discriminant(
     expr_span: Span,
     args_span: Span,
 ) {
-    let ty_param = cx.typeck_results().node_substs(func_expr.hir_id).type_at(0);
+    let ty_param = cx.typeck_results().node_args(func_expr.hir_id).type_at(0);
     if is_non_enum(ty_param) {
-        cx.struct_span_lint(
+        cx.emit_span_lint(
             ENUM_INTRINSICS_NON_ENUMS,
             expr_span,
-            fluent::lint_enum_intrinsics_mem_discriminant,
-            |lint| lint.set_arg("ty_param", ty_param).span_note(args_span, fluent::note),
+            EnumIntrinsicsMemDiscriminate { ty_param, note: args_span },
         );
     }
 }
 
 fn enforce_mem_variant_count(cx: &LateContext<'_>, func_expr: &hir::Expr<'_>, span: Span) {
-    let ty_param = cx.typeck_results().node_substs(func_expr.hir_id).type_at(0);
+    let ty_param = cx.typeck_results().node_args(func_expr.hir_id).type_at(0);
     if is_non_enum(ty_param) {
-        cx.struct_span_lint(
-            ENUM_INTRINSICS_NON_ENUMS,
-            span,
-            fluent::lint_enum_intrinsics_mem_variant,
-            |lint| lint.set_arg("ty_param", ty_param).note(fluent::note),
-        );
+        cx.emit_span_lint(ENUM_INTRINSICS_NON_ENUMS, span, EnumIntrinsicsMemVariant { ty_param });
     }
 }
 

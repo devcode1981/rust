@@ -1,8 +1,7 @@
-use crate::symbol::{sym, Symbol};
 use std::fmt;
 use std::str::FromStr;
 
-use rustc_macros::HashStable_Generic;
+use rustc_macros::{Decodable, Encodable, HashStable_Generic};
 
 /// The edition of the compiler. (See [RFC 2052](https://github.com/rust-lang/rfcs/blob/master/text/2052-epochs.md).)
 #[derive(Clone, Copy, Hash, PartialEq, PartialOrd, Debug, Encodable, Decodable, Eq)]
@@ -34,7 +33,7 @@ pub const EDITION_NAME_LIST: &str = "2015|2018|2021|2024";
 
 pub const DEFAULT_EDITION: Edition = Edition::Edition2015;
 
-pub const LATEST_STABLE_EDITION: Edition = Edition::Edition2021;
+pub const LATEST_STABLE_EDITION: Edition = Edition::Edition2024;
 
 impl fmt::Display for Edition {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -44,13 +43,13 @@ impl fmt::Display for Edition {
             Edition::Edition2021 => "2021",
             Edition::Edition2024 => "2024",
         };
-        write!(f, "{}", s)
+        write!(f, "{s}")
     }
 }
 
 impl Edition {
-    pub fn lint_name(&self) -> &'static str {
-        match *self {
+    pub fn lint_name(self) -> &'static str {
+        match self {
             Edition::Edition2015 => "rust_2015_compatibility",
             Edition::Edition2018 => "rust_2018_compatibility",
             Edition::Edition2021 => "rust_2021_compatibility",
@@ -58,41 +57,33 @@ impl Edition {
         }
     }
 
-    pub fn feature_name(&self) -> Symbol {
-        match *self {
-            Edition::Edition2015 => sym::rust_2015_preview,
-            Edition::Edition2018 => sym::rust_2018_preview,
-            Edition::Edition2021 => sym::rust_2021_preview,
-            Edition::Edition2024 => sym::rust_2024_preview,
-        }
-    }
-
-    pub fn is_stable(&self) -> bool {
-        match *self {
+    pub fn is_stable(self) -> bool {
+        match self {
             Edition::Edition2015 => true,
             Edition::Edition2018 => true,
             Edition::Edition2021 => true,
-            Edition::Edition2024 => false,
+            Edition::Edition2024 => true,
         }
     }
 
-    pub fn rust_2015(&self) -> bool {
-        *self == Edition::Edition2015
+    /// Is this edition 2015?
+    pub fn is_rust_2015(self) -> bool {
+        self == Edition::Edition2015
     }
 
     /// Are we allowed to use features from the Rust 2018 edition?
-    pub fn rust_2018(&self) -> bool {
-        *self >= Edition::Edition2018
+    pub fn at_least_rust_2018(self) -> bool {
+        self >= Edition::Edition2018
     }
 
     /// Are we allowed to use features from the Rust 2021 edition?
-    pub fn rust_2021(&self) -> bool {
-        *self >= Edition::Edition2021
+    pub fn at_least_rust_2021(self) -> bool {
+        self >= Edition::Edition2021
     }
 
     /// Are we allowed to use features from the Rust 2024 edition?
-    pub fn rust_2024(&self) -> bool {
-        *self >= Edition::Edition2024
+    pub fn at_least_rust_2024(self) -> bool {
+        self >= Edition::Edition2024
     }
 }
 

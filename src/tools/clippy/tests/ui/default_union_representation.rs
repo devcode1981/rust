@@ -1,7 +1,9 @@
 #![feature(transparent_unions)]
 #![warn(clippy::default_union_representation)]
+#![allow(clippy::repr_packed_without_abi)]
 
 union NoAttribute {
+    //~^ default_union_representation
     a: i32,
     b: u32,
 }
@@ -14,6 +16,7 @@ union ReprC {
 
 #[repr(packed)]
 union ReprPacked {
+    //~^ default_union_representation
     a: i32,
     b: u32,
 }
@@ -32,6 +35,7 @@ union ReprCAlign {
 
 #[repr(align(32))]
 union ReprAlign {
+    //~^ default_union_representation
     a: i32,
     b: u32,
 }
@@ -52,6 +56,7 @@ union ZSTsAndField2 {
     f3: (),
 }
 union ZSTAndTwoFields {
+    //~^ default_union_representation
     f0: u32,
     f1: u64,
     f2: (),

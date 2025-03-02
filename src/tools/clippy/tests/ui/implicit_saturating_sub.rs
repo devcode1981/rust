@@ -1,4 +1,3 @@
-// run-rustfix
 #![allow(unused_assignments, unused_mut, clippy::assign_op_pattern)]
 #![warn(clippy::implicit_saturating_sub)]
 
@@ -26,6 +25,7 @@ fn main() {
 
     // Lint
     if u_8 > 0 {
+        //~^ implicit_saturating_sub
         u_8 = u_8 - 1;
     }
 
@@ -33,6 +33,7 @@ fn main() {
         10 => {
             // Lint
             if u_8 > 0 {
+                //~^ implicit_saturating_sub
                 u_8 -= 1;
             }
         },
@@ -47,6 +48,7 @@ fn main() {
 
     // Lint
     if u_16 > 0 {
+        //~^ implicit_saturating_sub
         u_16 -= 1;
     }
 
@@ -57,6 +59,7 @@ fn main() {
 
     // Lint
     if u_32 != 0 {
+        //~^ implicit_saturating_sub
         u_32 -= 1;
     }
 
@@ -78,16 +81,19 @@ fn main() {
 
     // Lint
     if u_64 > 0 {
+        //~^ implicit_saturating_sub
         u_64 -= 1;
     }
 
     // Lint
     if 0 < u_64 {
+        //~^ implicit_saturating_sub
         u_64 -= 1;
     }
 
     // Lint
     if 0 != u_64 {
+        //~^ implicit_saturating_sub
         u_64 -= 1;
     }
 
@@ -109,6 +115,7 @@ fn main() {
 
     // Lint
     if u_usize > 0 {
+        //~^ implicit_saturating_sub
         u_usize -= 1;
     }
 
@@ -121,21 +128,25 @@ fn main() {
 
     // Lint
     if i_8 > i8::MIN {
+        //~^ implicit_saturating_sub
         i_8 -= 1;
     }
 
     // Lint
     if i_8 > i8::MIN {
+        //~^ implicit_saturating_sub
         i_8 -= 1;
     }
 
     // Lint
     if i_8 != i8::MIN {
+        //~^ implicit_saturating_sub
         i_8 -= 1;
     }
 
     // Lint
     if i_8 != i8::MIN {
+        //~^ implicit_saturating_sub
         i_8 -= 1;
     }
 
@@ -146,21 +157,25 @@ fn main() {
 
     // Lint
     if i_16 > i16::MIN {
+        //~^ implicit_saturating_sub
         i_16 -= 1;
     }
 
     // Lint
     if i_16 > i16::MIN {
+        //~^ implicit_saturating_sub
         i_16 -= 1;
     }
 
     // Lint
     if i_16 != i16::MIN {
+        //~^ implicit_saturating_sub
         i_16 -= 1;
     }
 
     // Lint
     if i_16 != i16::MIN {
+        //~^ implicit_saturating_sub
         i_16 -= 1;
     }
 
@@ -171,21 +186,25 @@ fn main() {
 
     // Lint
     if i_32 > i32::MIN {
+        //~^ implicit_saturating_sub
         i_32 -= 1;
     }
 
     // Lint
     if i_32 > i32::MIN {
+        //~^ implicit_saturating_sub
         i_32 -= 1;
     }
 
     // Lint
     if i_32 != i32::MIN {
+        //~^ implicit_saturating_sub
         i_32 -= 1;
     }
 
     // Lint
     if i_32 != i32::MIN {
+        //~^ implicit_saturating_sub
         i_32 -= 1;
     }
 
@@ -196,16 +215,19 @@ fn main() {
 
     // Lint
     if i64::MIN < i_64 {
+        //~^ implicit_saturating_sub
         i_64 -= 1;
     }
 
     // Lint
     if i64::MIN != i_64 {
+        //~^ implicit_saturating_sub
         i_64 -= 1;
     }
 
     // Lint
     if i64::MIN < i_64 {
+        //~^ implicit_saturating_sub
         i_64 -= 1;
     }
 
@@ -231,18 +253,18 @@ fn main() {
     let mut m = Mock;
     let mut u_32 = 3000;
     let a = 200;
-    let mut _b = 8;
+    let mut b = 8;
 
     if m != 0 {
         m -= 1;
     }
 
     if a > 0 {
-        _b -= 1;
+        b -= 1;
     }
 
     if 0 > a {
-        _b -= 1;
+        b -= 1;
     }
 
     if u_32 > 0 {
@@ -260,5 +282,23 @@ fn main() {
         println!("brace yourself!");
     } else if u_32 > 0 {
         u_32 -= 1;
+    }
+
+    let result = if a < b {
+        println!("we shouldn't remove this");
+        0
+    } else {
+        a - b
+    };
+}
+
+fn regression_13524(a: usize, b: usize, c: bool) -> usize {
+    if c {
+        123
+    } else if a >= b {
+        //~^ implicit_saturating_sub
+        0
+    } else {
+        b - a
     }
 }

@@ -1,7 +1,8 @@
 error: usage of `contains_key` followed by `insert` on a `HashMap`
-  --> $DIR/entry_with_else.rs:16:5
+  --> tests/ui/entry_with_else.rs:14:5
    |
 LL | /     if !m.contains_key(&k) {
+LL | |
 LL | |         m.insert(k, v);
 LL | |     } else {
 LL | |         m.insert(k, v2);
@@ -9,10 +10,12 @@ LL | |     }
    | |_____^
    |
    = note: `-D clippy::map-entry` implied by `-D warnings`
-help: try this
+   = help: to override `-D warnings` add `#[allow(clippy::map_entry)]`
+help: try
    |
 LL ~     match m.entry(k) {
 LL +         std::collections::hash_map::Entry::Vacant(e) => {
+LL +
 LL +             e.insert(v);
 LL +         }
 LL +         std::collections::hash_map::Entry::Occupied(mut e) => {
@@ -22,19 +25,21 @@ LL +     }
    |
 
 error: usage of `contains_key` followed by `insert` on a `HashMap`
-  --> $DIR/entry_with_else.rs:22:5
+  --> tests/ui/entry_with_else.rs:21:5
    |
 LL | /     if m.contains_key(&k) {
+LL | |
 LL | |         m.insert(k, v);
 LL | |     } else {
 LL | |         m.insert(k, v2);
 LL | |     }
    | |_____^
    |
-help: try this
+help: try
    |
 LL ~     match m.entry(k) {
 LL +         std::collections::hash_map::Entry::Occupied(mut e) => {
+LL +
 LL +             e.insert(v);
 LL +         }
 LL +         std::collections::hash_map::Entry::Vacant(e) => {
@@ -44,18 +49,20 @@ LL +     }
    |
 
 error: usage of `contains_key` followed by `insert` on a `HashMap`
-  --> $DIR/entry_with_else.rs:28:5
+  --> tests/ui/entry_with_else.rs:28:5
    |
 LL | /     if !m.contains_key(&k) {
+LL | |
 LL | |         m.insert(k, v);
 LL | |     } else {
 LL | |         foo();
 LL | |     }
    | |_____^
    |
-help: try this
+help: try
    |
 LL ~     if let std::collections::hash_map::Entry::Vacant(e) = m.entry(k) {
+LL +
 LL +         e.insert(v);
 LL +     } else {
 LL +         foo();
@@ -63,38 +70,42 @@ LL +     }
    |
 
 error: usage of `contains_key` followed by `insert` on a `HashMap`
-  --> $DIR/entry_with_else.rs:34:5
+  --> tests/ui/entry_with_else.rs:35:5
    |
 LL | /     if !m.contains_key(&k) {
+LL | |
 LL | |         foo();
 LL | |     } else {
 LL | |         m.insert(k, v);
 LL | |     }
    | |_____^
    |
-help: try this
+help: try
    |
 LL ~     if let std::collections::hash_map::Entry::Occupied(mut e) = m.entry(k) {
 LL +         e.insert(v);
 LL +     } else {
+LL +
 LL +         foo();
 LL +     }
    |
 
 error: usage of `contains_key` followed by `insert` on a `HashMap`
-  --> $DIR/entry_with_else.rs:40:5
+  --> tests/ui/entry_with_else.rs:42:5
    |
 LL | /     if !m.contains_key(&k) {
+LL | |
 LL | |         m.insert(k, v);
 LL | |     } else {
 LL | |         m.insert(k, v2);
 LL | |     }
    | |_____^
    |
-help: try this
+help: try
    |
 LL ~     match m.entry(k) {
 LL +         std::collections::hash_map::Entry::Vacant(e) => {
+LL +
 LL +             e.insert(v);
 LL +         }
 LL +         std::collections::hash_map::Entry::Occupied(mut e) => {
@@ -104,19 +115,21 @@ LL +     }
    |
 
 error: usage of `contains_key` followed by `insert` on a `HashMap`
-  --> $DIR/entry_with_else.rs:46:5
+  --> tests/ui/entry_with_else.rs:49:5
    |
 LL | /     if m.contains_key(&k) {
+LL | |
 LL | |         if true { m.insert(k, v) } else { m.insert(k, v2) }
 LL | |     } else {
 LL | |         m.insert(k, v)
 LL | |     };
    | |_____^
    |
-help: try this
+help: try
    |
 LL ~     match m.entry(k) {
 LL +         std::collections::hash_map::Entry::Occupied(mut e) => {
+LL +
 LL +             if true { Some(e.insert(v)) } else { Some(e.insert(v2)) }
 LL +         }
 LL +         std::collections::hash_map::Entry::Vacant(e) => {
@@ -127,9 +140,10 @@ LL ~     };
    |
 
 error: usage of `contains_key` followed by `insert` on a `HashMap`
-  --> $DIR/entry_with_else.rs:52:5
+  --> tests/ui/entry_with_else.rs:56:5
    |
 LL | /     if m.contains_key(&k) {
+LL | |
 LL | |         foo();
 LL | |         m.insert(k, v)
 LL | |     } else {
@@ -137,9 +151,10 @@ LL | |         None
 LL | |     };
    | |_____^
    |
-help: try this
+help: try
    |
 LL ~     if let std::collections::hash_map::Entry::Occupied(mut e) = m.entry(k) {
+LL +
 LL +         foo();
 LL +         Some(e.insert(v))
 LL +     } else {

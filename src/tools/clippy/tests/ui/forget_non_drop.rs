@@ -11,6 +11,7 @@ fn main() {
     struct Foo;
     // Lint
     forget(Foo);
+    //~^ forget_non_drop
 
     struct Bar;
     impl Drop for Bar {
@@ -22,6 +23,8 @@ fn main() {
     struct Baz<T>(T);
     // Lint
     forget(Baz(Foo));
+    //~^ forget_non_drop
+
     // Don't lint
     forget(Baz(Bar));
 }

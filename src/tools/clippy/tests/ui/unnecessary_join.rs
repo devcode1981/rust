@@ -1,6 +1,5 @@
-// run-rustfix
 #![warn(clippy::unnecessary_join)]
-#![allow(clippy::uninlined_format_args)]
+#![allow(clippy::uninlined_format_args, clippy::useless_vec)]
 
 fn main() {
     // should be linted
@@ -9,6 +8,7 @@ fn main() {
         .iter()
         .map(|item| item.to_uppercase())
         .collect::<Vec<String>>()
+        //~^ unnecessary_join
         .join("");
     println!("{}", output);
 
@@ -18,6 +18,7 @@ fn main() {
         .iter()
         .map(|item| item.to_uppercase())
         .collect::<Vec<_>>()
+        //~^ unnecessary_join
         .join("");
     println!("{}", output);
 

@@ -52,7 +52,7 @@ rustdoc 1.17.0 (56124baa9 2017-04-24)
 binary: rustdoc
 commit-hash: hash
 commit-date: date
-host: host-triple
+host: host-tuple
 release: 1.17.0
 LLVM version: 3.9
 ```
@@ -100,7 +100,8 @@ mod private { // this item is private and will not be documented
 }
 ```
 
-`--document-private-items` documents all items, even if they're not public.
+`--document-private-items` includes all non-public items in the generated documentation except for `#[doc(hidden)]` items.  Private items will be shown with a 🔒 icon.
+
 
 ## `-L`/`--library-path`: where to look for dependencies
 
@@ -130,6 +131,20 @@ $ rustdoc src/lib.rs --cfg feature="foo"
 This flag accepts the same values as `rustc --cfg`, and uses it to configure
 compilation. The example above uses `feature`, but any of the `cfg` values
 are acceptable.
+
+## `--check-cfg`: check configuration flags
+
+This flag accepts the same values as `rustc --check-cfg`, and uses it to
+check configuration flags.
+
+Using this flag looks like this:
+
+```bash
+$ rustdoc src/lib.rs --check-cfg='cfg(my_cfg, values("foo", "bar"))'
+```
+
+The example above check every well known names and values (`target_os`, `doc`, `test`, ...)
+and check the values of `my_cfg`: `foo` and `bar`.
 
 ## `--extern`: specify a dependency's location
 
@@ -179,7 +194,7 @@ $ rustdoc src/lib.rs --test
 This flag will run your code examples as tests. For more, see [the chapter
 on documentation tests](write-documentation/documentation-tests.md).
 
-See also `--test-args`.
+See also `--test-args` and `--test-run-directory`.
 
 ## `--test-args`: pass options to test runner
 
@@ -190,6 +205,19 @@ $ rustdoc src/lib.rs --test --test-args ignored
 ```
 
 This flag will pass options to the test runner when running documentation tests.
+For more, see [the chapter on documentation tests](write-documentation/documentation-tests.md).
+
+See also `--test`.
+
+## `--test-run-directory`: run code examples in a specific directory
+
+Using this flag looks like this:
+
+```bash
+$ rustdoc src/lib.rs --test --test-run-directory=/path/to/working/directory
+```
+
+This flag will run your code examples in the specified working directory.
 For more, see [the chapter on documentation tests](write-documentation/documentation-tests.md).
 
 See also `--test`.
@@ -246,7 +274,7 @@ will be added.
 
 When rendering Rust files, this flag is ignored.
 
-## `--html-in-header`: include more HTML in <head>
+## `--html-in-header`: include more HTML in `<head>`
 
 Using this flag looks like this:
 
@@ -320,10 +348,7 @@ $ rustdoc src/lib.rs --extend-css extra.css
 ```
 
 With this flag, the contents of the files you pass are included at the bottom
-of Rustdoc's `theme.css` file.
-
-While this flag is stable, the contents of `theme.css` are not, so be careful!
-Updates may break your theme extensions.
+of the `theme.css` file.
 
 ## `--sysroot`: override the system root
 
@@ -392,6 +417,12 @@ $ rustdoc src/lib.rs --crate-version 1.3.37
 When `rustdoc` receives this flag, it will print an extra "Version (version)" into the sidebar of
 the crate root's docs. You can use this flag to differentiate between different versions of your
 library's documentation.
+
+## `-`: load source code from the standard input
+
+If you specify `-` as the INPUT on the command line, then `rustdoc` will read the
+source code from stdin (standard input stream) until the EOF, instead of the file
+system with an otherwise specified path.
 
 ## `@path`: load command-line flags from a path
 

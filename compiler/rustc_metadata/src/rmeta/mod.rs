@@ -1,67 +1,67 @@
-use crate::creader::CrateMetadataRef;
-use decoder::Metadata;
-use def_path_hash_map::DefPathHashMapRef;
-use rustc_data_structures::fx::FxHashMap;
-use table::TableBuilder;
+use std::marker::PhantomData;
+use std::num::NonZero;
 
-use rustc_ast as ast;
-use rustc_attr as attr;
+pub(crate) use decoder::{CrateMetadata, CrateNumMap, MetadataBlob, TargetModifiers};
+use decoder::{DecodeContext, Metadata};
+use def_path_hash_map::DefPathHashMapRef;
+use encoder::EncodeContext;
+pub use encoder::{EncodedMetadata, encode_metadata, rendered_const};
+use rustc_abi::{FieldIdx, ReprOptions, VariantIdx};
+use rustc_ast::expand::StrippedCfgItem;
+use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::svh::Svh;
-use rustc_data_structures::sync::MetadataRef;
-use rustc_hir as hir;
-use rustc_hir::def::{CtorKind, DefKind};
-use rustc_hir::def_id::{CrateNum, DefId, DefIndex, DefPathHash, StableCrateId};
+use rustc_hir::def::{CtorKind, DefKind, DocLinkResMap};
+use rustc_hir::def_id::{CrateNum, DefId, DefIdMap, DefIndex, DefPathHash, StableCrateId};
 use rustc_hir::definitions::DefKey;
-use rustc_hir::lang_items;
-use rustc_index::bit_set::{BitSet, FiniteBitSet};
-use rustc_index::vec::IndexVec;
+use rustc_hir::lang_items::LangItem;
+use rustc_index::IndexVec;
+use rustc_index::bit_set::DenseBitSet;
+use rustc_macros::{
+    Decodable, Encodable, MetadataDecodable, MetadataEncodable, TyDecodable, TyEncodable,
+};
 use rustc_middle::metadata::ModChild;
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrs;
+use rustc_middle::middle::debugger_visualizer::DebuggerVisualizerFile;
 use rustc_middle::middle::exported_symbols::{ExportedSymbol, SymbolExportInfo};
-use rustc_middle::middle::resolve_lifetime::ObjectLifetimeDefault;
-use rustc_middle::mir;
+use rustc_middle::middle::lib_features::FeatureStability;
+use rustc_middle::middle::resolve_bound_vars::ObjectLifetimeDefault;
 use rustc_middle::ty::fast_reject::SimplifiedType;
-use rustc_middle::ty::query::Providers;
-use rustc_middle::ty::{self, ReprOptions, Ty};
-use rustc_middle::ty::{DeducedParamAttrs, GeneratorDiagnosticData, ParameterizedOverTcx, TyCtxt};
+use rustc_middle::ty::{
+    self, DeducedParamAttrs, ParameterizedOverTcx, Ty, TyCtxt, UnusedGenericParams,
+};
+use rustc_middle::util::Providers;
+use rustc_middle::{mir, trivially_parameterized_over_tcx};
 use rustc_serialize::opaque::FileEncoder;
-use rustc_session::config::SymbolManglingVersion;
+use rustc_session::config::{SymbolManglingVersion, TargetModifier};
 use rustc_session::cstore::{CrateDepKind, ForeignModule, LinkagePreference, NativeLib};
 use rustc_span::edition::Edition;
-use rustc_span::hygiene::{ExpnIndex, MacroKind};
-use rustc_span::symbol::{Ident, Symbol};
-use rustc_span::{self, ExpnData, ExpnHash, ExpnId, Span};
-use rustc_target::spec::{PanicStrategy, TargetTriple};
+use rustc_span::hygiene::{ExpnIndex, MacroKind, SyntaxContextData};
+use rustc_span::{self, ExpnData, ExpnHash, ExpnId, Ident, Span, Symbol};
+use rustc_target::spec::{PanicStrategy, TargetTuple};
+use table::TableBuilder;
+use {rustc_ast as ast, rustc_attr_parsing as attr, rustc_hir as hir};
 
-use std::marker::PhantomData;
-use std::num::NonZeroUsize;
-
-pub use decoder::provide_extern;
-use decoder::DecodeContext;
-pub(crate) use decoder::{CrateMetadata, CrateNumMap, MetadataBlob};
-use encoder::EncodeContext;
-pub use encoder::{encode_metadata, EncodedMetadata};
-use rustc_span::hygiene::SyntaxContextData;
+use crate::creader::CrateMetadataRef;
 
 mod decoder;
 mod def_path_hash_map;
 mod encoder;
 mod table;
 
-pub(crate) fn rustc_version() -> String {
-    format!("rustc {}", option_env!("CFG_VERSION").unwrap_or("unknown version"))
+pub(crate) fn rustc_version(cfg_version: &'static str) -> String {
+    format!("rustc {cfg_version}")
 }
 
 /// Metadata encoding version.
 /// N.B., increment this if you change the format of metadata such that
 /// the rustc version can't be found to compare with `rustc_version()`.
-const METADATA_VERSION: u8 = 6;
+const METADATA_VERSION: u8 = 9;
 
 /// Metadata header which includes `METADATA_VERSION`.
 ///
-/// This header is followed by the position of the `CrateRoot`,
-/// which is encoded as a 32-bit big-endian unsigned integer,
-/// and further followed by the rustc version string.
+/// This header is followed by the length of the compressed data, then
+/// the position of the `CrateRoot`, which is encoded as a 64-bit little-endian
+/// unsigned integer, and further followed by the rustc version string.
 pub const METADATA_HEADER: &[u8] = &[b'r', b'u', b's', b't', 0, 0, 0, METADATA_VERSION];
 
 /// A value of type T referred to by its absolute position
@@ -81,7 +81,7 @@ pub const METADATA_HEADER: &[u8] = &[b'r', b'u', b's', b't', 0, 0, 0, METADATA_V
 /// order than they were encoded in.
 #[must_use]
 struct LazyValue<T> {
-    position: NonZeroUsize,
+    position: NonZero<usize>,
     _marker: PhantomData<fn() -> T>,
 }
 
@@ -90,7 +90,7 @@ impl<T: ParameterizedOverTcx> ParameterizedOverTcx for LazyValue<T> {
 }
 
 impl<T> LazyValue<T> {
-    fn from_position(position: NonZeroUsize) -> LazyValue<T> {
+    fn from_position(position: NonZero<usize>) -> LazyValue<T> {
         LazyValue { position, _marker: PhantomData }
     }
 }
@@ -106,7 +106,7 @@ impl<T> LazyValue<T> {
 /// the minimal distance the length of the sequence, i.e.
 /// it's assumed there's no 0-byte element in the sequence.
 struct LazyArray<T> {
-    position: NonZeroUsize,
+    position: NonZero<usize>,
     num_elems: usize,
     _marker: PhantomData<fn() -> T>,
 }
@@ -115,13 +115,15 @@ impl<T: ParameterizedOverTcx> ParameterizedOverTcx for LazyArray<T> {
     type Value<'tcx> = LazyArray<T::Value<'tcx>>;
 }
 
-impl<T> LazyArray<T> {
-    fn from_position_and_num_elems(position: NonZeroUsize, num_elems: usize) -> LazyArray<T> {
-        LazyArray { position, num_elems, _marker: PhantomData }
+impl<T> Default for LazyArray<T> {
+    fn default() -> LazyArray<T> {
+        LazyArray::from_position_and_num_elems(NonZero::new(1).unwrap(), 0)
     }
+}
 
-    fn empty() -> LazyArray<T> {
-        LazyArray::from_position_and_num_elems(NonZeroUsize::new(1).unwrap(), 0)
+impl<T> LazyArray<T> {
+    fn from_position_and_num_elems(position: NonZero<usize>, num_elems: usize) -> LazyArray<T> {
+        LazyArray { position, num_elems, _marker: PhantomData }
     }
 }
 
@@ -131,8 +133,12 @@ impl<T> LazyArray<T> {
 /// `LazyArray<T>`, but without requiring encoding or decoding all the values
 /// eagerly and in-order.
 struct LazyTable<I, T> {
-    position: NonZeroUsize,
-    encoded_size: usize,
+    position: NonZero<usize>,
+    /// The encoded size of the elements of a table is selected at runtime to drop
+    /// trailing zeroes. This is the number of bytes used for each table element.
+    width: usize,
+    /// How many elements are in the table.
+    len: usize,
     _marker: PhantomData<fn(I) -> T>,
 }
 
@@ -142,10 +148,11 @@ impl<I: 'static, T: ParameterizedOverTcx> ParameterizedOverTcx for LazyTable<I, 
 
 impl<I, T> LazyTable<I, T> {
     fn from_position_and_encoded_size(
-        position: NonZeroUsize,
-        encoded_size: usize,
+        position: NonZero<usize>,
+        width: usize,
+        len: usize,
     ) -> LazyTable<I, T> {
-        LazyTable { position, encoded_size, _marker: PhantomData }
+        LazyTable { position, width, len, _marker: PhantomData }
     }
 }
 
@@ -178,16 +185,16 @@ enum LazyState {
 
     /// Inside a metadata node, and before any `Lazy`s.
     /// The position is that of the node itself.
-    NodeStart(NonZeroUsize),
+    NodeStart(NonZero<usize>),
 
     /// Inside a metadata node, with a previous `Lazy`s.
     /// The position is where that previous `Lazy` would start.
-    Previous(NonZeroUsize),
+    Previous(NonZero<usize>),
 }
 
-type SyntaxContextTable = LazyTable<u32, LazyValue<SyntaxContextData>>;
-type ExpnDataTable = LazyTable<ExpnIndex, LazyValue<ExpnData>>;
-type ExpnHashTable = LazyTable<ExpnIndex, LazyValue<ExpnHash>>;
+type SyntaxContextTable = LazyTable<u32, Option<LazyValue<SyntaxContextData>>>;
+type ExpnDataTable = LazyTable<ExpnIndex, Option<LazyValue<ExpnData>>>;
+type ExpnHashTable = LazyTable<ExpnIndex, Option<LazyValue<ExpnHash>>>;
 
 #[derive(MetadataEncodable, MetadataDecodable)]
 pub(crate) struct ProcMacroData {
@@ -196,7 +203,27 @@ pub(crate) struct ProcMacroData {
     macros: LazyArray<DefIndex>,
 }
 
-/// Serialized metadata for a crate.
+/// Serialized crate metadata.
+///
+/// This contains just enough information to determine if we should load the `CrateRoot` or not.
+/// Prefer [`CrateRoot`] whenever possible to avoid ICEs when using `omit-git-hash` locally.
+/// See #76720 for more details.
+///
+/// If you do modify this struct, also bump the [`METADATA_VERSION`] constant.
+#[derive(MetadataEncodable, MetadataDecodable)]
+pub(crate) struct CrateHeader {
+    pub(crate) triple: TargetTuple,
+    pub(crate) hash: Svh,
+    pub(crate) name: Symbol,
+    /// Whether this is the header for a proc-macro crate.
+    ///
+    /// This is separate from [`ProcMacroData`] to avoid having to update [`METADATA_VERSION`] every
+    /// time ProcMacroData changes.
+    pub(crate) is_proc_macro_crate: bool,
+}
+
+/// Serialized `.rmeta` data for a crate.
+///
 /// When compiling a proc-macro crate, we encode many of
 /// the `LazyArray<T>` fields as `Lazy::empty()`. This serves two purposes:
 ///
@@ -214,35 +241,37 @@ pub(crate) struct ProcMacroData {
 /// to being unused.
 #[derive(MetadataEncodable, MetadataDecodable)]
 pub(crate) struct CrateRoot {
-    name: Symbol,
-    triple: TargetTriple,
+    /// A header used to detect if this is the right crate to load.
+    header: CrateHeader,
+
     extra_filename: String,
-    hash: Svh,
     stable_crate_id: StableCrateId,
     required_panic_strategy: Option<PanicStrategy>,
     panic_in_drop_strategy: PanicStrategy,
     edition: Edition,
     has_global_allocator: bool,
+    has_alloc_error_handler: bool,
     has_panic_handler: bool,
     has_default_lib_allocator: bool,
 
     crate_deps: LazyArray<CrateDep>,
     dylib_dependency_formats: LazyArray<Option<LinkagePreference>>,
-    lib_features: LazyArray<(Symbol, Option<Symbol>)>,
+    lib_features: LazyArray<(Symbol, FeatureStability)>,
     stability_implications: LazyArray<(Symbol, Symbol)>,
-    lang_items: LazyArray<(DefIndex, usize)>,
-    lang_items_missing: LazyArray<lang_items::LangItem>,
+    lang_items: LazyArray<(DefIndex, LangItem)>,
+    lang_items_missing: LazyArray<LangItem>,
+    stripped_cfg_items: LazyArray<StrippedCfgItem<DefIndex>>,
     diagnostic_items: LazyArray<(Symbol, DefIndex)>,
     native_libraries: LazyArray<NativeLib>,
     foreign_modules: LazyArray<ForeignModule>,
     traits: LazyArray<DefIndex>,
     impls: LazyArray<TraitImpls>,
     incoherent_impls: LazyArray<IncoherentImpls>,
-    interpret_alloc_index: LazyArray<u32>,
+    interpret_alloc_index: LazyArray<u64>,
     proc_macro_data: Option<ProcMacroData>,
 
     tables: LazyTables,
-    debugger_visualizers: LazyArray<rustc_span::DebuggerVisualizerFile>,
+    debugger_visualizers: LazyArray<DebuggerVisualizerFile>,
 
     exported_symbols: LazyArray<(ExportedSymbol<'static>, SymbolExportInfo)>,
 
@@ -252,7 +281,8 @@ pub(crate) struct CrateRoot {
 
     def_path_hash_map: LazyValue<DefPathHashMapRef<'static>>,
 
-    source_map: LazyTable<u32, LazyValue<rustc_span::SourceFile>>,
+    source_map: LazyTable<u32, Option<LazyValue<rustc_span::SourceFile>>>,
+    target_modifiers: LazyArray<TargetModifier>,
 
     compiler_builtins: bool,
     needs_allocator: bool,
@@ -261,6 +291,8 @@ pub(crate) struct CrateRoot {
     panic_runtime: bool,
     profiler_runtime: bool,
     symbol_mangling_version: SymbolManglingVersion,
+
+    specialization_enabled_in: bool,
 }
 
 /// On-disk representation of `DefId`.
@@ -272,9 +304,9 @@ pub(crate) struct RawDefId {
     index: u32,
 }
 
-impl Into<RawDefId> for DefId {
-    fn into(self) -> RawDefId {
-        RawDefId { krate: self.krate.as_u32(), index: self.index.as_u32() }
+impl From<DefId> for RawDefId {
+    fn from(val: DefId) -> Self {
+        RawDefId { krate: val.krate.as_u32(), index: val.index.as_u32() }
     }
 }
 
@@ -298,6 +330,7 @@ pub(crate) struct CrateDep {
     pub host_hash: Option<Svh>,
     pub kind: CrateDepKind,
     pub extra_filename: String,
+    pub is_private: bool,
 }
 
 #[derive(MetadataEncodable, MetadataDecodable)]
@@ -314,21 +347,27 @@ pub(crate) struct IncoherentImpls {
 
 /// Define `LazyTables` and `TableBuilders` at the same time.
 macro_rules! define_tables {
-    ($($name:ident: Table<$IDX:ty, $T:ty>),+ $(,)?) => {
+    (
+        - defaulted: $($name1:ident: Table<$IDX1:ty, $T1:ty>,)+
+        - optional: $($name2:ident: Table<$IDX2:ty, $T2:ty>,)+
+    ) => {
         #[derive(MetadataEncodable, MetadataDecodable)]
         pub(crate) struct LazyTables {
-            $($name: LazyTable<$IDX, $T>),+
+            $($name1: LazyTable<$IDX1, $T1>,)+
+            $($name2: LazyTable<$IDX2, Option<$T2>>,)+
         }
 
         #[derive(Default)]
         struct TableBuilders {
-            $($name: TableBuilder<$IDX, $T>),+
+            $($name1: TableBuilder<$IDX1, $T1>,)+
+            $($name2: TableBuilder<$IDX2, Option<$T2>>,)+
         }
 
         impl TableBuilders {
             fn encode(&self, buf: &mut FileEncoder) -> LazyTables {
                 LazyTables {
-                    $($name: self.$name.encode(buf)),+
+                    $($name1: self.$name1.encode(buf),)+
+                    $($name2: self.$name2.encode(buf),)+
                 }
             }
         }
@@ -336,95 +375,202 @@ macro_rules! define_tables {
 }
 
 define_tables! {
-    attributes: Table<DefIndex, LazyArray<ast::Attribute>>,
-    children: Table<DefIndex, LazyArray<DefIndex>>,
+- defaulted:
+    intrinsic: Table<DefIndex, Option<LazyValue<ty::IntrinsicDef>>>,
+    is_macro_rules: Table<DefIndex, bool>,
+    type_alias_is_lazy: Table<DefIndex, bool>,
+    attr_flags: Table<DefIndex, AttrFlags>,
+    // The u64 is the crate-local part of the DefPathHash. All hashes in this crate have the same
+    // StableCrateId, so we omit encoding those into the table.
+    //
+    // Note also that this table is fully populated (no gaps) as every DefIndex should have a
+    // corresponding DefPathHash.
+    def_path_hashes: Table<DefIndex, u64>,
+    explicit_item_bounds: Table<DefIndex, LazyArray<(ty::Clause<'static>, Span)>>,
+    explicit_item_self_bounds: Table<DefIndex, LazyArray<(ty::Clause<'static>, Span)>>,
+    inferred_outlives_of: Table<DefIndex, LazyArray<(ty::Clause<'static>, Span)>>,
+    explicit_super_predicates_of: Table<DefIndex, LazyArray<(ty::Clause<'static>, Span)>>,
+    explicit_implied_predicates_of: Table<DefIndex, LazyArray<(ty::Clause<'static>, Span)>>,
+    explicit_implied_const_bounds: Table<DefIndex, LazyArray<(ty::PolyTraitRef<'static>, Span)>>,
+    inherent_impls: Table<DefIndex, LazyArray<DefIndex>>,
+    associated_types_for_impl_traits_in_associated_fn: Table<DefIndex, LazyArray<DefId>>,
+    opt_rpitit_info: Table<DefIndex, Option<LazyValue<ty::ImplTraitInTraitData>>>,
+    // Reexported names are not associated with individual `DefId`s,
+    // e.g. a glob import can introduce a lot of names, all with the same `DefId`.
+    // That's why the encoded list needs to contain `ModChild` structures describing all the names
+    // individually instead of `DefId`s.
+    module_children_reexports: Table<DefIndex, LazyArray<ModChild>>,
+    cross_crate_inlinable: Table<DefIndex, bool>,
 
-    opt_def_kind: Table<DefIndex, DefKind>,
+- optional:
+    attributes: Table<DefIndex, LazyArray<hir::Attribute>>,
+    // For non-reexported names in a module every name is associated with a separate `DefId`,
+    // so we can take their names, visibilities etc from other encoded tables.
+    module_children_non_reexports: Table<DefIndex, LazyArray<DefIndex>>,
+    associated_item_or_field_def_ids: Table<DefIndex, LazyArray<DefIndex>>,
+    def_kind: Table<DefIndex, DefKind>,
     visibility: Table<DefIndex, LazyValue<ty::Visibility<DefIndex>>>,
+    safety: Table<DefIndex, hir::Safety>,
     def_span: Table<DefIndex, LazyValue<Span>>,
     def_ident_span: Table<DefIndex, LazyValue<Span>>,
     lookup_stability: Table<DefIndex, LazyValue<attr::Stability>>,
     lookup_const_stability: Table<DefIndex, LazyValue<attr::ConstStability>>,
     lookup_default_body_stability: Table<DefIndex, LazyValue<attr::DefaultBodyStability>>,
     lookup_deprecation_entry: Table<DefIndex, LazyValue<attr::Deprecation>>,
-    // As an optimization, a missing entry indicates an empty `&[]`.
-    explicit_item_bounds: Table<DefIndex, LazyArray<(ty::Predicate<'static>, Span)>>,
     explicit_predicates_of: Table<DefIndex, LazyValue<ty::GenericPredicates<'static>>>,
     generics_of: Table<DefIndex, LazyValue<ty::Generics>>,
-    // As an optimization, a missing entry indicates an empty `&[]`.
-    inferred_outlives_of: Table<DefIndex, LazyArray<(ty::Predicate<'static>, Span)>>,
-    super_predicates_of: Table<DefIndex, LazyValue<ty::GenericPredicates<'static>>>,
-    type_of: Table<DefIndex, LazyValue<Ty<'static>>>,
+    type_of: Table<DefIndex, LazyValue<ty::EarlyBinder<'static, Ty<'static>>>>,
     variances_of: Table<DefIndex, LazyArray<ty::Variance>>,
-    fn_sig: Table<DefIndex, LazyValue<ty::PolyFnSig<'static>>>,
+    fn_sig: Table<DefIndex, LazyValue<ty::EarlyBinder<'static, ty::PolyFnSig<'static>>>>,
     codegen_fn_attrs: Table<DefIndex, LazyValue<CodegenFnAttrs>>,
-    impl_trait_ref: Table<DefIndex, LazyValue<ty::TraitRef<'static>>>,
-    const_param_default: Table<DefIndex, LazyValue<rustc_middle::ty::Const<'static>>>,
+    impl_trait_header: Table<DefIndex, LazyValue<ty::ImplTraitHeader<'static>>>,
+    const_param_default: Table<DefIndex, LazyValue<ty::EarlyBinder<'static, rustc_middle::ty::Const<'static>>>>,
     object_lifetime_default: Table<DefIndex, LazyValue<ObjectLifetimeDefault>>,
     optimized_mir: Table<DefIndex, LazyValue<mir::Body<'static>>>,
     mir_for_ctfe: Table<DefIndex, LazyValue<mir::Body<'static>>>,
+    closure_saved_names_of_captured_variables: Table<DefIndex, LazyValue<IndexVec<FieldIdx, Symbol>>>,
+    mir_coroutine_witnesses: Table<DefIndex, LazyValue<mir::CoroutineLayout<'static>>>,
     promoted_mir: Table<DefIndex, LazyValue<IndexVec<mir::Promoted, mir::Body<'static>>>>,
-    // FIXME(compiler-errors): Why isn't this a LazyArray?
-    thir_abstract_const: Table<DefIndex, LazyValue<&'static [ty::abstract_const::Node<'static>]>>,
+    thir_abstract_const: Table<DefIndex, LazyValue<ty::EarlyBinder<'static, ty::Const<'static>>>>,
     impl_parent: Table<DefIndex, RawDefId>,
-    impl_polarity: Table<DefIndex, ty::ImplPolarity>,
     constness: Table<DefIndex, hir::Constness>,
-    is_intrinsic: Table<DefIndex, ()>,
-    impl_defaultness: Table<DefIndex, hir::Defaultness>,
+    const_conditions: Table<DefIndex, LazyValue<ty::ConstConditions<'static>>>,
+    defaultness: Table<DefIndex, hir::Defaultness>,
     // FIXME(eddyb) perhaps compute this on the fly if cheap enough?
     coerce_unsized_info: Table<DefIndex, LazyValue<ty::adjustment::CoerceUnsizedInfo>>,
     mir_const_qualif: Table<DefIndex, LazyValue<mir::ConstQualifs>>,
     rendered_const: Table<DefIndex, LazyValue<String>>,
-    asyncness: Table<DefIndex, hir::IsAsync>,
+    rendered_precise_capturing_args: Table<DefIndex, LazyArray<Symbol>>,
+    asyncness: Table<DefIndex, ty::Asyncness>,
     fn_arg_names: Table<DefIndex, LazyArray<Ident>>,
-    generator_kind: Table<DefIndex, LazyValue<hir::GeneratorKind>>,
+    coroutine_kind: Table<DefIndex, hir::CoroutineKind>,
+    coroutine_for_closure: Table<DefIndex, RawDefId>,
+    coroutine_by_move_body_def_id: Table<DefIndex, RawDefId>,
+    eval_static_initializer: Table<DefIndex, LazyValue<mir::interpret::ConstAllocation<'static>>>,
     trait_def: Table<DefIndex, LazyValue<ty::TraitDef>>,
-
     trait_item_def_id: Table<DefIndex, RawDefId>,
-    inherent_impls: Table<DefIndex, LazyArray<DefIndex>>,
     expn_that_defined: Table<DefIndex, LazyValue<ExpnId>>,
-    unused_generic_params: Table<DefIndex, LazyValue<FiniteBitSet<u32>>>,
-    params_in_repr: Table<DefIndex, LazyValue<BitSet<u32>>>,
+    default_fields: Table<DefIndex, LazyValue<DefId>>,
+    params_in_repr: Table<DefIndex, LazyValue<DenseBitSet<u32>>>,
     repr_options: Table<DefIndex, LazyValue<ReprOptions>>,
     // `def_keys` and `def_path_hashes` represent a lazy version of a
     // `DefPathTable`. This allows us to avoid deserializing an entire
     // `DefPathTable` up front, since we may only ever use a few
     // definitions from any given crate.
     def_keys: Table<DefIndex, LazyValue<DefKey>>,
-    def_path_hashes: Table<DefIndex, DefPathHash>,
     proc_macro_quoted_spans: Table<usize, LazyValue<Span>>,
-    generator_diagnostic_data: Table<DefIndex, LazyValue<GeneratorDiagnosticData<'static>>>,
-    may_have_doc_links: Table<DefIndex, ()>,
     variant_data: Table<DefIndex, LazyValue<VariantData>>,
     assoc_container: Table<DefIndex, ty::AssocItemContainer>,
-    // Slot is full when macro is macro_rules.
-    macro_rules: Table<DefIndex, ()>,
-    macro_definition: Table<DefIndex, LazyValue<ast::MacArgs>>,
+    macro_definition: Table<DefIndex, LazyValue<ast::DelimArgs>>,
     proc_macro: Table<DefIndex, MacroKind>,
-    module_reexports: Table<DefIndex, LazyArray<ModChild>>,
     deduced_param_attrs: Table<DefIndex, LazyArray<DeducedParamAttrs>>,
-
-    trait_impl_trait_tys: Table<DefIndex, LazyValue<FxHashMap<DefId, Ty<'static>>>>,
+    trait_impl_trait_tys: Table<DefIndex, LazyValue<DefIdMap<ty::EarlyBinder<'static, Ty<'static>>>>>,
+    doc_link_resolutions: Table<DefIndex, LazyValue<DocLinkResMap>>,
+    doc_link_traits_in_scope: Table<DefIndex, LazyArray<DefId>>,
+    assumed_wf_types_for_rpitit: Table<DefIndex, LazyArray<(Ty<'static>, Span)>>,
+    opaque_ty_origin: Table<DefIndex, LazyValue<hir::OpaqueTyOrigin<DefId>>>,
 }
 
 #[derive(TyEncodable, TyDecodable)]
 struct VariantData {
-    ctor_kind: CtorKind,
+    idx: VariantIdx,
     discr: ty::VariantDiscr,
     /// If this is unit or tuple-variant/struct, then this is the index of the ctor id.
-    ctor: Option<DefIndex>,
+    ctor: Option<(CtorKind, DefIndex)>,
     is_non_exhaustive: bool,
 }
 
-#[derive(TyEncodable, TyDecodable)]
-struct GeneratorData<'tcx> {
-    layout: mir::GeneratorLayout<'tcx>,
+bitflags::bitflags! {
+    #[derive(Default)]
+    pub struct AttrFlags: u8 {
+        const IS_DOC_HIDDEN = 1 << 0;
+    }
 }
 
-// Tags used for encoding Spans:
-const TAG_VALID_SPAN_LOCAL: u8 = 0;
-const TAG_VALID_SPAN_FOREIGN: u8 = 1;
-const TAG_PARTIAL_SPAN: u8 = 2;
+/// A span tag byte encodes a bunch of data, so that we can cut out a few extra bytes from span
+/// encodings (which are very common, for example, libcore has ~650,000 unique spans and over 1.1
+/// million references to prior-written spans).
+///
+/// The byte format is split into several parts:
+///
+/// [ a a a a a c d d ]
+///
+/// `a` bits represent the span length. We have 5 bits, so we can store lengths up to 30 inline, with
+/// an all-1s pattern representing that the length is stored separately.
+///
+/// `c` represents whether the span context is zero (and then it is not stored as a separate varint)
+/// for direct span encodings, and whether the offset is absolute or relative otherwise (zero for
+/// absolute).
+///
+/// d bits represent the kind of span we are storing (local, foreign, partial, indirect).
+#[derive(Encodable, Decodable, Copy, Clone)]
+struct SpanTag(u8);
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum SpanKind {
+    Local = 0b00,
+    Foreign = 0b01,
+    Partial = 0b10,
+    // Indicates the actual span contents are elsewhere.
+    // If this is the kind, then the span context bit represents whether it is a relative or
+    // absolute offset.
+    Indirect = 0b11,
+}
+
+impl SpanTag {
+    fn new(kind: SpanKind, context: rustc_span::SyntaxContext, length: usize) -> SpanTag {
+        let mut data = 0u8;
+        data |= kind as u8;
+        if context.is_root() {
+            data |= 0b100;
+        }
+        let all_1s_len = (0xffu8 << 3) >> 3;
+        // strictly less than - all 1s pattern is a sentinel for storage being out of band.
+        if length < all_1s_len as usize {
+            data |= (length as u8) << 3;
+        } else {
+            data |= all_1s_len << 3;
+        }
+
+        SpanTag(data)
+    }
+
+    fn indirect(relative: bool, length_bytes: u8) -> SpanTag {
+        let mut tag = SpanTag(SpanKind::Indirect as u8);
+        if relative {
+            tag.0 |= 0b100;
+        }
+        assert!(length_bytes <= 8);
+        tag.0 |= length_bytes << 3;
+        tag
+    }
+
+    fn kind(self) -> SpanKind {
+        let masked = self.0 & 0b11;
+        match masked {
+            0b00 => SpanKind::Local,
+            0b01 => SpanKind::Foreign,
+            0b10 => SpanKind::Partial,
+            0b11 => SpanKind::Indirect,
+            _ => unreachable!(),
+        }
+    }
+
+    fn is_relative_offset(self) -> bool {
+        debug_assert_eq!(self.kind(), SpanKind::Indirect);
+        self.0 & 0b100 != 0
+    }
+
+    fn context(self) -> Option<rustc_span::SyntaxContext> {
+        if self.0 & 0b100 != 0 { Some(rustc_span::SyntaxContext::root()) } else { None }
+    }
+
+    fn length(self) -> Option<rustc_span::BytePos> {
+        let all_1s_len = (0xffu8 << 3) >> 3;
+        let len = self.0 >> 3;
+        if len != all_1s_len { Some(rustc_span::BytePos(u32::from(len))) } else { None }
+    }
+}
 
 // Tags for encoding Symbol's
 const SYMBOL_STR: u8 = 0;
@@ -441,6 +587,8 @@ trivially_parameterized_over_tcx! {
     RawDefId,
     TraitImpls,
     IncoherentImpls,
+    CrateHeader,
     CrateRoot,
     CrateDep,
+    AttrFlags,
 }

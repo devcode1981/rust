@@ -1,4 +1,3 @@
-// run-rustfix
 #![warn(clippy::empty_drop)]
 #![allow(unused)]
 
@@ -6,6 +5,7 @@
 struct Foo;
 
 impl Drop for Foo {
+    //~^ empty_drop
     fn drop(&mut self) {}
 }
 
@@ -22,6 +22,7 @@ impl Drop for Bar {
 struct Baz;
 
 impl Drop for Baz {
+    //~^ empty_drop
     fn drop(&mut self) {
         {}
     }

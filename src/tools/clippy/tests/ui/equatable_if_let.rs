@@ -1,11 +1,15 @@
-// run-rustfix
-// aux-build:macro_rules.rs
+//@aux-build:proc_macros.rs
 
-#![allow(unused_variables, dead_code, clippy::derive_partial_eq_without_eq)]
+#![allow(
+    unused_variables,
+    dead_code,
+    clippy::derive_partial_eq_without_eq,
+    clippy::needless_if
+)]
 #![warn(clippy::equatable_if_let)]
 
-#[macro_use]
-extern crate macro_rules;
+extern crate proc_macros;
+use proc_macros::{external, inline_macros};
 
 use std::cmp::Ordering;
 
@@ -19,6 +23,11 @@ enum Enum {
 
 #[derive(PartialEq)]
 struct Struct {
+    a: i32,
+    b: bool,
+}
+
+struct NoPartialEqStruct {
     a: i32,
     b: bool,
 }
@@ -39,6 +48,7 @@ impl PartialEq for NotStructuralEq {
     }
 }
 
+#[inline_macros]
 fn main() {
     let a = 2;
     let b = 3;
@@ -47,17 +57,26 @@ fn main() {
     let e = Enum::UnitVariant;
     let f = NotPartialEq::A;
     let g = NotStructuralEq::A;
+    let h = NoPartialEqStruct { a: 2, b: false };
 
     // true
 
     if let 2 = a {}
+    //~^ equatable_if_let
     if let Ordering::Greater = a.cmp(&b) {}
+    //~^ equatable_if_let
     if let Some(2) = c {}
+    //~^ equatable_if_let
     if let Struct { a: 2, b: false } = d {}
+    //~^ equatable_if_let
     if let Enum::TupleVariant(32, 64) = e {}
+    //~^ equatable_if_let
     if let Enum::RecordVariant { a: 64, b: 32 } = e {}
+    //~^ equatable_if_let
     if let Enum::UnitVariant = e {}
+    //~^ equatable_if_let
     if let (Enum::UnitVariant, &Struct { a: 2, b: false }) = (e, &d) {}
+    //~^ equatable_if_let
 
     // false
 
@@ -67,18 +86,20 @@ fn main() {
     if let Struct { a, b: false } = d {}
     if let Struct { a: 2, b: x } = d {}
     if let NotPartialEq::A = f {}
+    //~^ equatable_if_let
     if let NotStructuralEq::A = g {}
+    //~^ equatable_if_let
     if let Some(NotPartialEq::A) = Some(f) {}
+    //~^ equatable_if_let
     if let Some(NotStructuralEq::A) = Some(g) {}
+    //~^ equatable_if_let
+    if let NoPartialEqStruct { a: 2, b: false } = h {}
+    //~^ equatable_if_let
 
-    macro_rules! m1 {
-        (x) => {
-            "abc"
-        };
-    }
-    if let m1!(x) = "abc" {
+    if let inline!("abc") = "abc" {
+        //~^ equatable_if_let
         println!("OK");
     }
 
-    equatable_if_let!(a);
+    external!({ if let 2 = $a {} });
 }

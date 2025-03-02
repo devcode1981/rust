@@ -1,18 +1,22 @@
 #![warn(clippy::manual_flatten)]
 #![allow(clippy::useless_vec, clippy::uninlined_format_args)]
-
+//@no-rustfix
 fn main() {
     // Test for loop over implicitly adjusted `Iterator` with `if let` expression
     let x = vec![Some(1), Some(2), Some(3)];
     for n in x {
+        //~^ manual_flatten
+
         if let Some(y) = n {
             println!("{}", y);
         }
     }
 
-    // Test for loop over implicitly implicitly adjusted `Iterator` with `if let` statement
+    // Test for loop over implicitly adjusted `Iterator` with `if let` statement
     let y: Vec<Result<i32, i32>> = vec![];
     for n in y.clone() {
+        //~^ manual_flatten
+
         if let Ok(n) = n {
             println!("{}", n);
         };
@@ -20,6 +24,8 @@ fn main() {
 
     // Test for loop over by reference
     for n in &y {
+        //~^ manual_flatten
+
         if let Ok(n) = n {
             println!("{}", n);
         }
@@ -28,6 +34,8 @@ fn main() {
     // Test for loop over an implicit reference
     let z = &y;
     for n in z {
+        //~^ manual_flatten
+
         if let Ok(n) = n {
             println!("{}", n);
         }
@@ -37,6 +45,8 @@ fn main() {
     let z = vec![Some(1), Some(2), Some(3)];
     let z = z.iter();
     for n in z {
+        //~^ manual_flatten
+
         if let Some(m) = n {
             println!("{}", m);
         }
@@ -70,6 +80,8 @@ fn main() {
 
     let vec_of_ref = vec![&Some(1)];
     for n in &vec_of_ref {
+        //~^ manual_flatten
+
         if let Some(n) = n {
             println!("{:?}", n);
         }
@@ -77,6 +89,8 @@ fn main() {
 
     let vec_of_ref = &vec_of_ref;
     for n in vec_of_ref {
+        //~^ manual_flatten
+
         if let Some(n) = n {
             println!("{:?}", n);
         }
@@ -84,6 +98,8 @@ fn main() {
 
     let slice_of_ref = &[&Some(1)];
     for n in slice_of_ref {
+        //~^ manual_flatten
+
         if let Some(n) = n {
             println!("{:?}", n);
         }
@@ -114,6 +130,8 @@ fn main() {
 fn run_unformatted_tests() {
     // Skip rustfmt here on purpose so the suggestion does not fit in one line
     for n in vec![
+    //~^ manual_flatten
+
         Some(1),
         Some(2),
         Some(3)

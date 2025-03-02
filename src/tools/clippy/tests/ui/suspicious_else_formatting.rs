@@ -1,7 +1,12 @@
-// aux-build:proc_macro_suspicious_else_formatting.rs
+//@aux-build:proc_macro_suspicious_else_formatting.rs
 
 #![warn(clippy::suspicious_else_formatting)]
-#![allow(clippy::if_same_then_else, clippy::let_unit_value)]
+#![allow(
+    clippy::if_same_then_else,
+    clippy::let_unit_value,
+    clippy::needless_if,
+    clippy::needless_else
+)]
 
 extern crate proc_macro_suspicious_else_formatting;
 use proc_macro_suspicious_else_formatting::DeriveBadSpan;
@@ -15,10 +20,12 @@ fn main() {
     // weird `else` formatting:
     if foo() {
     } {
+    //~^ suspicious_else_formatting
     }
 
     if foo() {
     } if foo() {
+    //~^ suspicious_else_formatting
     }
 
     let _ = { // if as the last expression
@@ -26,6 +33,7 @@ fn main() {
 
         if foo() {
         } if foo() {
+        //~^ suspicious_else_formatting
         }
         else {
         }
@@ -34,6 +42,7 @@ fn main() {
     let _ = { // if in the middle of a block
         if foo() {
         } if foo() {
+        //~^ suspicious_else_formatting
         }
         else {
         }
@@ -45,6 +54,7 @@ fn main() {
     } else
     {
     }
+    //~^^^ suspicious_else_formatting
 
     // This is fine, though weird. Allman style braces on the else.
     if foo() {
@@ -57,12 +67,14 @@ fn main() {
     } else
     if foo() { // the span of the above error should continue here
     }
+    //~^^^ suspicious_else_formatting
 
     if foo() {
     }
     else
     if foo() { // the span of the above error should continue here
     }
+    //~^^^^ suspicious_else_formatting
 
     // those are ok:
     if foo() {
@@ -90,8 +102,8 @@ fn main() {
 
     else
     {
-
     }
+    //~^^^^^ suspicious_else_formatting
 
     if foo() {
     }
@@ -100,6 +112,7 @@ fn main() {
     {
 
     }
+    //~^^^^^^ suspicious_else_formatting
 
     // #3864 - Allman style braces
     if foo()
@@ -108,6 +121,41 @@ fn main() {
     else
     {
     }
+
+    //#10273 This is fine. Don't warn
+    if foo() {
+    } else
+    /* whelp */
+    {
+    }
+
+    // #12497 Don't trigger lint as rustfmt wants it
+    if true {
+        println!("true");
+    }
+    /*else if false {
+}*/
+    else {
+        println!("false");
+    }
+
+    if true {
+        println!("true");
+    } // else if false {}
+    else {
+        println!("false");
+    }
+
+    if true {
+        println!("true");
+    } /* if true {
+        println!("true");
+}
+    */
+    else {
+        println!("false");
+    }
+
 }
 
 // #7650 - Don't lint. Proc-macro using bad spans for `if` expressions.

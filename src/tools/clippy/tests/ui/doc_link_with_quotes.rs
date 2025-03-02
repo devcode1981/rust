@@ -5,7 +5,14 @@ fn main() {
 }
 
 /// Calls ['bar'] uselessly
+//~^ doc_link_with_quotes
 pub fn foo() {
+    bar()
+}
+
+/// Calls ["bar"] uselessly
+//~^ doc_link_with_quotes
+pub fn foo2() {
     bar()
 }
 

@@ -3,7 +3,7 @@
 You may need following tooltips to catch up with common operations.
 
 - [Common tools for writing lints](#common-tools-for-writing-lints)
-  - [Retrieving the type of an expression](#retrieving-the-type-of-an-expression)
+  - [Retrieving the type of expression](#retrieving-the-type-of-expression)
   - [Checking if an expr is calling a specific method](#checking-if-an-expr-is-calling-a-specific-method)
   - [Checking for a specific type](#checking-for-a-specific-type)
   - [Checking if a type implements a specific trait](#checking-if-a-type-implements-a-specific-trait)
@@ -16,7 +16,7 @@ Useful Rustc dev guide links:
 - [Type checking](https://rustc-dev-guide.rust-lang.org/type-checking.html)
 - [Ty module](https://rustc-dev-guide.rust-lang.org/ty.html)
 
-## Retrieving the type of an expression
+## Retrieving the type of expression
 
 Sometimes you may want to retrieve the type `Ty` of an expression `Expr`, for
 example to answer following questions:
@@ -37,7 +37,7 @@ impl LateLintPass<'_> for MyStructLint {
         // Get type of `expr`
         let ty = cx.typeck_results().expr_ty(expr);
         // Match its kind to enter its type
-        match ty.kind {
+        match ty.kind() {
             ty::Adt(adt_def, _) if adt_def.is_struct() => println!("Our `expr` is a struct!"),
             _ => ()
         }
@@ -45,7 +45,7 @@ impl LateLintPass<'_> for MyStructLint {
 }
 ```
 
-Similarly in [`TypeckResults`][TypeckResults] methods, you have the
+Similarly, in [`TypeckResults`][TypeckResults] methods, you have the
 [`pat_ty()`][pat_ty] method to retrieve a type from a pattern.
 
 Two noticeable items here:
@@ -68,7 +68,7 @@ impl<'tcx> LateLintPass<'tcx> for MyStructLint {
         // Check our expr is calling a method
         if let hir::ExprKind::MethodCall(path, _, _self_arg, ..) = &expr.kind
             // Check the name of this method is `some_method`
-            && path.ident.name == sym!(some_method)
+            && path.ident.name.as_str() == "some_method"
             // Optionally, check the type of the self argument.
             // - See "Checking for a specific type"
         {
@@ -167,7 +167,7 @@ impl<'tcx> LateLintPass<'tcx> for MyTypeImpl {
         // Check if item is a method/function
         if let ImplItemKind::Fn(ref signature, _) = impl_item.kind
             // Check the method is named `some_method`
-            && impl_item.ident.name == sym!(some_method)
+            && impl_item.ident.name.as_str() == "some_method"
             // We can also check it has a parameter `self`
             && signature.decl.implicit_self.has_implicit_self()
             // We can go further and even check if its return type is `String`
@@ -192,7 +192,7 @@ functions to deal with macros:
 - `span.from_expansion()`: detects if a span is from macro expansion or
   desugaring. Checking this is a common first step in a lint.
 
-   ```rust
+   ```rust,ignore
    if expr.span.from_expansion() {
        // just forget it
        return;
@@ -203,11 +203,11 @@ functions to deal with macros:
   if so, which macro call expanded it. It is sometimes useful to check if the
   context of two spans are equal.
 
-  ```rust
+  ```rust,ignore
   // expands to `1 + 0`, but don't lint
   1 + mac!()
   ```
-  ```rust
+  ```rust,ignore
   if left.span.ctxt() != right.span.ctxt() {
       // the coder most likely cannot modify this expression
       return;
@@ -218,7 +218,7 @@ functions to deal with macros:
   > context. And so just using `span.from_expansion()` is often good enough.
 
 
-- `in_external_macro(span)`: detect if the given span is from a macro defined in
+- `span.in_external_macro(sm)`: detect if the given span is from a macro defined in
   a foreign crate. If you want the lint to work with macro-generated code, this
   is the next line of defense to avoid macros not defined in the current crate.
   It doesn't make sense to lint code that the coder can't change.
@@ -227,15 +227,13 @@ functions to deal with macros:
   crates
 
   ```rust
-  use rustc_middle::lint::in_external_macro;
-
   use a_crate_with_macros::foo;
 
   // `foo` is defined in `a_crate_with_macros`
   foo!("bar");
 
   // if we lint the `match` of `foo` call and test its span
-  assert_eq!(in_external_macro(cx.sess(), match_span), true);
+  assert_eq!(match_span.in_external_macro(cx.sess().source_map()), true);
   ```
 
 - `span.ctxt()`: the span's context represents whether it is from expansion, and
@@ -246,7 +244,7 @@ functions to deal with macros:
   `macro_rules!` with `a == $b`, `$b` is expanded to some expression with a
   different context from `a`.
 
-   ```rust
+   ```rust,ignore
    macro_rules! m {
        ($a:expr, $b:expr) => {
            if $a.is_some() {
@@ -265,10 +263,10 @@ functions to deal with macros:
    ```
 
 [Ty]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_middle/ty/struct.Ty.html
-[TyKind]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_middle/ty/enum.TyKind.html
+[TyKind]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_type_ir/ty_kind/enum.TyKind.html
 [TypeckResults]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_middle/ty/struct.TypeckResults.html
 [expr_ty]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_middle/ty/struct.TypeckResults.html#method.expr_ty
 [LateContext]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_lint/struct.LateContext.html
 [TyCtxt]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_middle/ty/context/struct.TyCtxt.html
-[pat_ty]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_middle/ty/context/struct.TypeckResults.html#method.pat_ty
+[pat_ty]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_middle/ty/struct.TypeckResults.html#method.pat_ty
 [paths]: https://doc.rust-lang.org/nightly/nightly-rustc/clippy_utils/paths/index.html

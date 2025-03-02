@@ -1,18 +1,15 @@
-use crate::ich;
+use std::sync::Arc;
 
 use rustc_ast as ast;
-use rustc_data_structures::sorted_map::SortedMap;
 use rustc_data_structures::stable_hasher::{HashStable, HashingControls, StableHasher};
-use rustc_data_structures::sync::Lrc;
-use rustc_hir as hir;
 use rustc_hir::def_id::{DefId, LocalDefId};
-use rustc_hir::definitions::{DefPathHash, Definitions};
-use rustc_index::vec::IndexVec;
-use rustc_session::cstore::CrateStore;
+use rustc_hir::definitions::DefPathHash;
 use rustc_session::Session;
+use rustc_session::cstore::Untracked;
 use rustc_span::source_map::SourceMap;
-use rustc_span::symbol::Symbol;
-use rustc_span::{BytePos, CachingSourceMapView, SourceFile, Span, SpanData, DUMMY_SP};
+use rustc_span::{BytePos, CachingSourceMapView, DUMMY_SP, SourceFile, Span, SpanData, Symbol};
+
+use crate::ich;
 
 /// This is the context state available during incr. comp. hashing. It contains
 /// enough information to transform `DefId`s and `HirId`s into stable `DefPath`s (i.e.,
@@ -20,100 +17,29 @@ use rustc_span::{BytePos, CachingSourceMapView, SourceFile, Span, SpanData, DUMM
 /// things (e.g., each `DefId`/`DefPath` is only hashed once).
 #[derive(Clone)]
 pub struct StableHashingContext<'a> {
-    definitions: &'a Definitions,
-    cstore: &'a dyn CrateStore,
-    source_span: &'a IndexVec<LocalDefId, Span>,
+    untracked: &'a Untracked,
     // The value of `-Z incremental-ignore-spans`.
     // This field should only be used by `unstable_opts_incremental_ignore_span`
     incremental_ignore_spans: bool,
-    pub(super) body_resolver: BodyResolver<'a>,
     // Very often, we are hashing something that does not need the
     // `CachingSourceMapView`, so we initialize it lazily.
     raw_source_map: &'a SourceMap,
     caching_source_map: Option<CachingSourceMapView<'a>>,
-    pub(super) hashing_controls: HashingControls,
-}
-
-/// The `BodyResolver` allows mapping a `BodyId` to the corresponding `hir::Body`.
-/// We could also just store a plain reference to the `hir::Crate` but we want
-/// to avoid that the crate is used to get untracked access to all of the HIR.
-#[derive(Clone, Copy)]
-pub(super) enum BodyResolver<'tcx> {
-    Forbidden,
-    Ignore,
-    Traverse {
-        owner: hir::OwnerId,
-        bodies: &'tcx SortedMap<hir::ItemLocalId, &'tcx hir::Body<'tcx>>,
-    },
+    hashing_controls: HashingControls,
 }
 
 impl<'a> StableHashingContext<'a> {
     #[inline]
-    fn new_with_or_without_spans(
-        sess: &'a Session,
-        definitions: &'a Definitions,
-        cstore: &'a dyn CrateStore,
-        source_span: &'a IndexVec<LocalDefId, Span>,
-        always_ignore_spans: bool,
-    ) -> Self {
-        let hash_spans_initial =
-            !always_ignore_spans && !sess.opts.unstable_opts.incremental_ignore_spans;
+    pub fn new(sess: &'a Session, untracked: &'a Untracked) -> Self {
+        let hash_spans_initial = !sess.opts.unstable_opts.incremental_ignore_spans;
 
         StableHashingContext {
-            body_resolver: BodyResolver::Forbidden,
-            definitions,
-            cstore,
-            source_span,
+            untracked,
             incremental_ignore_spans: sess.opts.unstable_opts.incremental_ignore_spans,
             caching_source_map: None,
             raw_source_map: sess.source_map(),
             hashing_controls: HashingControls { hash_spans: hash_spans_initial },
         }
-    }
-
-    #[inline]
-    pub fn new(
-        sess: &'a Session,
-        definitions: &'a Definitions,
-        cstore: &'a dyn CrateStore,
-        source_span: &'a IndexVec<LocalDefId, Span>,
-    ) -> Self {
-        Self::new_with_or_without_spans(
-            sess,
-            definitions,
-            cstore,
-            source_span,
-            /*always_ignore_spans=*/ false,
-        )
-    }
-
-    #[inline]
-    pub fn ignore_spans(
-        sess: &'a Session,
-        definitions: &'a Definitions,
-        cstore: &'a dyn CrateStore,
-        source_span: &'a IndexVec<LocalDefId, Span>,
-    ) -> Self {
-        let always_ignore_spans = true;
-        Self::new_with_or_without_spans(sess, definitions, cstore, source_span, always_ignore_spans)
-    }
-
-    #[inline]
-    pub fn without_hir_bodies(&mut self, f: impl FnOnce(&mut StableHashingContext<'_>)) {
-        f(&mut StableHashingContext { body_resolver: BodyResolver::Ignore, ..self.clone() });
-    }
-
-    #[inline]
-    pub fn with_hir_bodies(
-        &mut self,
-        owner: hir::OwnerId,
-        bodies: &SortedMap<hir::ItemLocalId, &hir::Body<'_>>,
-        f: impl FnOnce(&mut StableHashingContext<'_>),
-    ) {
-        f(&mut StableHashingContext {
-            body_resolver: BodyResolver::Traverse { owner, bodies },
-            ..self.clone()
-        });
     }
 
     #[inline]
@@ -129,13 +55,13 @@ impl<'a> StableHashingContext<'a> {
         if let Some(def_id) = def_id.as_local() {
             self.local_def_path_hash(def_id)
         } else {
-            self.cstore.def_path_hash(def_id)
+            self.untracked.cstore.read().def_path_hash(def_id)
         }
     }
 
     #[inline]
     pub fn local_def_path_hash(&self, def_id: LocalDefId) -> DefPathHash {
-        self.definitions.def_path_hash(def_id)
+        self.untracked.definitions.read().def_path_hash(def_id)
     }
 
     #[inline]
@@ -185,14 +111,14 @@ impl<'a> rustc_span::HashStableContext for StableHashingContext<'a> {
 
     #[inline]
     fn def_span(&self, def_id: LocalDefId) -> Span {
-        *self.source_span.get(def_id).unwrap_or(&DUMMY_SP)
+        self.untracked.source_span.get(def_id).unwrap_or(DUMMY_SP)
     }
 
     #[inline]
     fn span_data_to_lines_and_cols(
         &mut self,
         span: &SpanData,
-    ) -> Option<(Lrc<SourceFile>, usize, BytePos, usize, BytePos)> {
+    ) -> Option<(Arc<SourceFile>, usize, BytePos, usize, BytePos)> {
         self.source_map().span_data_to_lines_and_cols(span)
     }
 
@@ -202,10 +128,5 @@ impl<'a> rustc_span::HashStableContext for StableHashingContext<'a> {
     }
 }
 
-impl<'a> rustc_data_structures::intern::InternedHashingContext for StableHashingContext<'a> {
-    fn with_def_path_and_no_spans(&mut self, f: impl FnOnce(&mut Self)) {
-        self.while_hashing_spans(false, f);
-    }
-}
-
 impl<'a> rustc_session::HashStableContext for StableHashingContext<'a> {}
+impl<'a> rustc_attr_data_structures::HashStableContext for StableHashingContext<'a> {}

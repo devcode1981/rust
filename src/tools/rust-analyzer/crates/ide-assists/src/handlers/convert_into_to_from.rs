@@ -1,5 +1,5 @@
 use ide_db::{famous_defs::FamousDefs, helpers::mod_path_to_ast, traits::resolve_target_trait};
-use syntax::ast::{self, AstNode, HasName};
+use syntax::ast::{self, AstNode, HasGenericArgs, HasName};
 
 use crate::{AssistContext, AssistId, AssistKind, Assists};
 
@@ -43,14 +43,18 @@ pub(crate) fn convert_into_to_from(acc: &mut Assists, ctx: &AssistContext<'_>) -
         return None;
     }
 
+    let cfg = ctx.config.import_path_config();
+
     let src_type_path = {
         let src_type_path = src_type.syntax().descendants().find_map(ast::Path::cast)?;
         let src_type_def = match ctx.sema.resolve_path(&src_type_path) {
             Some(hir::PathResolution::Def(module_def)) => module_def,
             _ => return None,
         };
-
-        mod_path_to_ast(&module.find_use_path(ctx.db(), src_type_def, ctx.config.prefer_no_std)?)
+        mod_path_to_ast(
+            &module.find_path(ctx.db(), src_type_def, cfg)?,
+            module.krate().edition(ctx.db()),
+        )
     };
 
     let dest_type = match &ast_trait {
@@ -86,9 +90,9 @@ pub(crate) fn convert_into_to_from(acc: &mut Assists, ctx: &AssistContext<'_>) -
         impl_.syntax().text_range(),
         |builder| {
             builder.replace(src_type.syntax().text_range(), dest_type.to_string());
-            builder.replace(ast_trait.syntax().text_range(), format!("From<{}>", src_type));
+            builder.replace(ast_trait.syntax().text_range(), format!("From<{src_type}>"));
             builder.replace(into_fn_return.syntax().text_range(), "-> Self");
-            builder.replace(into_fn_params.syntax().text_range(), format!("(val: {})", src_type));
+            builder.replace(into_fn_params.syntax().text_range(), format!("(val: {src_type})"));
             builder.replace(into_fn_name.syntax().text_range(), "from");
 
             for s in selfs {

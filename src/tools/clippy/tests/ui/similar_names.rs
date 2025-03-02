@@ -3,6 +3,7 @@
     unused,
     clippy::println_empty_string,
     clippy::empty_loop,
+    clippy::never_loop,
     clippy::diverging_sub_expression,
     clippy::let_unit_value
 )]
@@ -16,10 +17,9 @@ fn main() {
     let specter: i32;
     let spectre: i32;
 
+    // ok; first letter is different enough
     let apple: i32;
-
     let bpple: i32;
-
     let cpple: i32;
 
     let a_bar: i32;
@@ -45,10 +45,12 @@ fn main() {
 
     let blubx: i32;
     let bluby: i32;
+    //~^ similar_names
 
     let cake: i32;
     let cakes: i32;
     let coke: i32;
+    //~^ similar_names
 
     match 5 {
         cheese @ 1 => {},
@@ -67,10 +69,12 @@ fn main() {
     let xyz1abc: i32;
     let xyz2abc: i32;
     let xyzeabc: i32;
+    //~^ similar_names
 
     let parser: i32;
     let parsed: i32;
     let parsee: i32;
+    //~^ similar_names
 
     let setter: i32;
     let getter: i32;
@@ -92,6 +96,7 @@ fn foo() {
     let Foo {
         apple: spring,
         bpple: sprang,
+        //~^ similar_names
     } = unimplemented!();
 }
 

@@ -28,10 +28,14 @@ struct Counter2 {
 
 impl Data2 {
     fn iter(&self) -> Counter2 {
+        //~^ iter_not_returning_iterator
+
         todo!()
     }
 
     fn iter_mut(&self) -> Counter2 {
+        //~^ iter_not_returning_iterator
+
         todo!()
     }
 }
@@ -48,6 +52,7 @@ impl Iterator for Counter {
 trait Iter {
     type I;
     fn iter(&self) -> Self::I;
+    //~^ iter_not_returning_iterator
 }
 
 impl Iter for () {
