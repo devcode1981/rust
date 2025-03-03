@@ -1,73 +1,51 @@
 #!/usr/bin/env bash
 set -e
 
-./y.rs build --no-unstable-features
+# CG_CLIF_FORCE_GNU_AS will force usage of as instead of the LLVM backend of rustc as
+# the LLVM backend isn't compiled in here.
+export CG_CLIF_FORCE_GNU_AS=1
+
+# Compiletest expects all standard library paths to start with /rustc/FAKE_PREFIX.
+# CG_CLIF_STDLIB_REMAP_PATH_PREFIX will cause cg_clif's build system to pass
+# --remap-path-prefix to handle this.
+CG_CLIF_STDLIB_REMAP_PATH_PREFIX=/rustc/FAKE_PREFIX ./y.sh build
 
 echo "[SETUP] Rust fork"
-git clone https://github.com/rust-lang/rust.git || true
+git clone --quiet https://github.com/rust-lang/rust.git --filter=tree:0 || true
 pushd rust
 git fetch
-git checkout -- .
-git checkout "$(rustc -V | cut -d' ' -f3 | tr -d '(')"
+git checkout --no-progress -- .
+git checkout --no-progress "$(rustc -V | cut -d' ' -f3 | tr -d '(')"
 
-git am ../patches/*-sysroot-*.patch
+git submodule update --quiet --init src/tools/cargo library/backtrace library/stdarch
 
-git apply - <<EOF
-diff --git a/library/alloc/Cargo.toml b/library/alloc/Cargo.toml
-index d95b5b7f17f..00b6f0e3635 100644
---- a/library/alloc/Cargo.toml
-+++ b/library/alloc/Cargo.toml
-@@ -8,7 +8,7 @@ edition = "2018"
-
- [dependencies]
- core = { path = "../core" }
--compiler_builtins = { version = "0.1.40", features = ['rustc-dep-of-std'] }
-+compiler_builtins = { version = "0.1.66", features = ['rustc-dep-of-std', 'no-asm'] }
-
- [dev-dependencies]
- rand = "0.7"
- rand_xorshift = "0.2"
-diff --git a/src/tools/compiletest/src/runtest.rs b/src/tools/compiletest/src/runtest.rs
-index 8431aa7b818..a3ff7e68ce5 100644
---- a/src/tools/compiletest/src/runtest.rs
-+++ b/src/tools/compiletest/src/runtest.rs
-@@ -3489,12 +3489,7 @@ fn normalize_output(&self, output: &str, custom_rules: &[(String, String)]) -> S
-         let compiler_src_dir = base_dir.join("compiler");
-         normalize_path(&compiler_src_dir, "$(echo '$COMPILER_DIR')");
-
--        if let Some(virtual_rust_source_base_dir) =
--            option_env!("CFG_VIRTUAL_RUST_SOURCE_BASE_DIR").map(PathBuf::from)
--        {
--            normalize_path(&virtual_rust_source_base_dir.join("library"), "$(echo '$SRC_DIR')");
--            normalize_path(&virtual_rust_source_base_dir.join("compiler"), "$(echo '$COMPILER_DIR')");
--        }
-+        normalize_path(&Path::new("$(cd ../build_sysroot/sysroot_src/library; pwd)"), "$(echo '$SRC_DIR')");
-
-         // Paths into the build directory
-         let test_build_dir = &self.config.build_base;
-EOF
+git -c user.name=Dummy -c user.email=dummy@example.com -c commit.gpgSign=false \
+    am ../patches/*-stdlib-*.patch
 
 cat > config.toml <<EOF
-changelog-seen = 2
+change-id = 999999
 
 [llvm]
-ninja = false
+download-ci-llvm = true
 
 [build]
-rustc = "$(pwd)/../build/rustc-clif"
+rustc = "$(pwd)/../dist/bin/rustc-clif"
 cargo = "$(rustup which cargo)"
 full-bootstrap = true
 local-rebuild = true
 
 [rust]
+download-rustc = false
 codegen-backends = ["cranelift"]
 deny-warnings = false
 verbose-tests = false
+# The cg_clif sysroot doesn't contain llvm tools and unless llvm_tools is
+# disabled bootstrap will crash trying to copy llvm tools for the bootstrap
+# compiler.
+llvm-tools = false
+
 EOF
 popd
-
-# FIXME remove once inline asm is fully supported
-export RUSTFLAGS="$RUSTFLAGS --cfg=rustix_use_libc"
 
 # Allow the testsuite to use llvm tools
 host_triple=$(rustc -vV | grep host | cut -d: -f2 | tr -d " ")

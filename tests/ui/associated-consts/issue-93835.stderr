@@ -1,0 +1,57 @@
+error: path separator must be a double colon
+  --> $DIR/issue-93835.rs:4:25
+   |
+LL |     type_ascribe!(p, a<p:p<e=6>>);
+   |                         ^
+   |
+   = note: if you meant to annotate an expression with a type, the type ascription syntax has been removed, see issue #101728 <https://github.com/rust-lang/rust/issues/101728>
+help: use a double colon instead
+   |
+LL |     type_ascribe!(p, a<p::p<e=6>>);
+   |                          +
+
+error[E0425]: cannot find value `p` in this scope
+  --> $DIR/issue-93835.rs:4:19
+   |
+LL |     type_ascribe!(p, a<p:p<e=6>>);
+   |                   ^ not found in this scope
+
+error[E0412]: cannot find type `a` in this scope
+  --> $DIR/issue-93835.rs:4:22
+   |
+LL |     type_ascribe!(p, a<p:p<e=6>>);
+   |                      ^ not found in this scope
+
+error[E0658]: associated const equality is incomplete
+  --> $DIR/issue-93835.rs:4:28
+   |
+LL |     type_ascribe!(p, a<p:p<e=6>>);
+   |                            ^^^
+   |
+   = note: see issue #92827 <https://github.com/rust-lang/rust/issues/92827> for more information
+   = help: add `#![feature(associated_const_equality)]` to the crate attributes to enable
+   = note: this compiler was built on YYYY-MM-DD; consider upgrading it if it is out of date
+
+error[E0658]: associated const equality is incomplete
+  --> $DIR/issue-93835.rs:4:28
+   |
+LL |     type_ascribe!(p, a<p:p<e=6>>);
+   |                            ^^^
+   |
+   = note: see issue #92827 <https://github.com/rust-lang/rust/issues/92827> for more information
+   = help: add `#![feature(associated_const_equality)]` to the crate attributes to enable
+   = note: this compiler was built on YYYY-MM-DD; consider upgrading it if it is out of date
+   = note: duplicate diagnostic emitted due to `-Z deduplicate-diagnostics=no`
+
+error[E0433]: failed to resolve: use of unresolved module or unlinked crate `p`
+  --> $DIR/issue-93835.rs:4:24
+   |
+LL |     type_ascribe!(p, a<p:p<e=6>>);
+   |                        ^ use of unresolved module or unlinked crate `p`
+   |
+   = help: you might be missing a crate named `p`
+
+error: aborting due to 6 previous errors
+
+Some errors have detailed explanations: E0412, E0425, E0433, E0658.
+For more information about an error, try `rustc --explain E0412`.

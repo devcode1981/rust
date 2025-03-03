@@ -1,5 +1,6 @@
 #![warn(clippy::derive_ord_xor_partial_ord)]
 #![allow(clippy::unnecessary_wraps)]
+#![allow(clippy::non_canonical_partial_ord_impl)]
 
 use std::cmp::Ordering;
 
@@ -19,6 +20,8 @@ impl PartialOrd<u64> for DeriveBoth {
 }
 
 #[derive(Ord, PartialEq, Eq)]
+//~^ derive_ord_xor_partial_ord
+
 struct DeriveOrd;
 
 impl PartialOrd for DeriveOrd {
@@ -28,6 +31,8 @@ impl PartialOrd for DeriveOrd {
 }
 
 #[derive(Ord, PartialEq, Eq)]
+//~^ derive_ord_xor_partial_ord
+
 struct DeriveOrdWithExplicitTypeVariable;
 
 impl PartialOrd<DeriveOrdWithExplicitTypeVariable> for DeriveOrdWithExplicitTypeVariable {
@@ -40,6 +45,8 @@ impl PartialOrd<DeriveOrdWithExplicitTypeVariable> for DeriveOrdWithExplicitType
 struct DerivePartialOrd;
 
 impl std::cmp::Ord for DerivePartialOrd {
+    //~^ derive_ord_xor_partial_ord
+
     fn cmp(&self, other: &Self) -> Ordering {
         Ordering::Less
     }
@@ -60,6 +67,8 @@ mod use_ord {
     struct DerivePartialOrdInUseOrd;
 
     impl Ord for DerivePartialOrdInUseOrd {
+        //~^ derive_ord_xor_partial_ord
+
         fn cmp(&self, other: &Self) -> Ordering {
             Ordering::Less
         }

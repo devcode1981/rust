@@ -1,11 +1,8 @@
-use expect_test::{expect, Expect};
+use expect_test::expect;
 
-use crate::tests::completion_list;
+use crate::tests::check;
 
-fn check(ra_fixture: &str, expect: Expect) {
-    let actual = completion_list(ra_fixture);
-    expect.assert_eq(&actual);
-}
+use super::check_edit;
 
 #[test]
 fn without_default_impl() {
@@ -40,6 +37,66 @@ fn foo(s: Struct) {
 "#,
         expect![[r#"
             fd bar u32
+            kw mut
+            kw ref
+        "#]],
+    );
+}
+
+#[test]
+fn record_pattern_field_enum() {
+    check(
+        r#"
+//- minicore:result
+enum Baz { Foo, Bar }
+
+fn foo(baz: Baz) {
+    match baz {
+        Baz::Foo => (),
+        $0
+    }
+}
+"#,
+        expect![[r#"
+            en Baz
+            en Result
+            md core
+            ev Err
+            ev Ok
+            bn Baz::Bar Baz::Bar$0
+            bn Baz::Foo Baz::Foo$0
+            bn Err(…)    Err($1)$0
+            bn Ok(…)      Ok($1)$0
+            kw mut
+            kw ref
+        "#]],
+    );
+
+    check(
+        r#"
+//- minicore:result
+enum Baz { Foo, Bar }
+
+fn foo(baz: Baz) {
+    use Baz::*;
+    match baz {
+        Foo => (),
+        $0
+    }
+}
+ "#,
+        expect![[r#"
+            en Baz
+            en Result
+            md core
+            ev Bar
+            ev Err
+            ev Foo
+            ev Ok
+            bn Bar        Bar$0
+            bn Err(…) Err($1)$0
+            bn Foo        Foo$0
+            bn Ok(…)   Ok($1)$0
             kw mut
             kw ref
         "#]],
@@ -122,16 +179,18 @@ fn main() {
 "#,
         expect![[r#"
             fd ..Default::default()
-            fn main()               fn()
-            lc foo                  Foo
-            lc thing                i32
+            fn main()                          fn()
+            lc foo                              Foo
+            lc thing                            i32
             md core
-            st Foo
-            st Foo {…}              Foo { foo1: u32, foo2: u32 }
+            st Foo                              Foo
+            st Foo {…} Foo { foo1: u32, foo2: u32 }
             tt Default
-            bt u32
+            bt u32                              u32
             kw crate::
             kw self::
+            ex Foo::default()
+            ex foo
         "#]],
     );
     check(
@@ -174,8 +233,8 @@ fn main() {
 "#,
         expect![[r#"
             fd ..Default::default()
-            fd foo1                 u32
-            fd foo2                 u32
+            fd foo1             u32
+            fd foo2             u32
         "#]],
     );
 }
@@ -238,4 +297,49 @@ fn foo() {
         "#,
         expect![[r#""#]],
     )
+}
+
+#[test]
+fn add_space_after_vis_kw() {
+    check_edit(
+        "pub(crate)",
+        r"
+pub(crate) struct S {
+    $0
+}
+",
+        r#"
+pub(crate) struct S {
+    pub(crate) $0
+}
+"#,
+    );
+
+    check_edit(
+        "pub",
+        r"
+pub struct S {
+    $0
+}
+",
+        r#"
+pub struct S {
+    pub $0
+}
+"#,
+    );
+
+    check_edit(
+        "pub(super)",
+        r"
+pub(super) struct S {
+    $0
+}
+",
+        r#"
+pub(super) struct S {
+    pub(super) $0
+}
+"#,
+    );
 }

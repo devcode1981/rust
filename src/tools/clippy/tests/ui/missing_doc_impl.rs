@@ -1,4 +1,4 @@
-// aux-build: proc_macro_with_span.rs
+//@aux-build: proc_macros.rs
 
 #![warn(clippy::missing_docs_in_private_items)]
 #![allow(dead_code)]
@@ -7,17 +7,21 @@
 //! Some garbage docs for the crate here
 #![doc = "More garbage"]
 
-extern crate proc_macro_with_span;
-use proc_macro_with_span::with_span;
+extern crate proc_macros;
+use proc_macros::with_span;
 
 struct Foo {
+    //~^ missing_docs_in_private_items
     a: isize,
+    //~^ missing_docs_in_private_items
     b: isize,
+    //~^ missing_docs_in_private_items
 }
 
 pub struct PubFoo {
     pub a: isize,
     b: isize,
+    //~^ missing_docs_in_private_items
 }
 
 #[allow(clippy::missing_docs_in_private_items)]
@@ -65,9 +69,11 @@ pub trait E: Sized {
 
 impl Foo {
     pub fn new() -> Self {
+        //~^ missing_docs_in_private_items
         Foo { a: 0, b: 0 }
     }
     fn bar() {}
+    //~^ missing_docs_in_private_items
 }
 
 impl PubFoo {
@@ -76,6 +82,7 @@ impl PubFoo {
     pub fn foo1() {}
     #[must_use = "yep"]
     fn foo2() -> u32 {
+        //~^ missing_docs_in_private_items
         1
     }
     #[allow(clippy::missing_docs_in_private_items)]

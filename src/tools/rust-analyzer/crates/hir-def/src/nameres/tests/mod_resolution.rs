@@ -80,18 +80,18 @@ pub trait Iterator;
             prelude: t
 
             crate::iter
-            Iterator: t
+            Iterator: ti
             traits: t
 
             crate::iter::traits
-            Iterator: t
+            Iterator: ti
             iterator: t
 
             crate::iter::traits::iterator
             Iterator: t
 
             crate::prelude
-            Iterator: t
+            Iterator: ti
         "#]],
     );
 }
@@ -109,7 +109,7 @@ pub struct Bar;
 "#,
         expect![[r#"
             crate
-            Bar: t v
+            Bar: ti vi
             foo: t
 
             crate::foo
@@ -139,19 +139,56 @@ pub struct Baz;
 "#,
         expect![[r#"
             crate
-            Bar: t v
+            Bar: ti vi
             r#async: t
 
             crate::r#async
             Bar: t v
-            foo: t
             r#async: t
-
-            crate::r#async::foo
-            Foo: t v
+            foo: t
 
             crate::r#async::r#async
             Baz: t v
+
+            crate::r#async::foo
+            Foo: t v
+        "#]],
+    );
+}
+
+#[test]
+fn module_resolution_works_for_inline_raw_modules() {
+    check(
+        r#"
+//- /lib.rs
+mod r#async {
+    pub mod a;
+    pub mod r#async;
+}
+use self::r#async::a::Foo;
+use self::r#async::r#async::Bar;
+
+//- /async/a.rs
+pub struct Foo;
+
+//- /async/async.rs
+pub struct Bar;
+"#,
+        expect![[r#"
+            crate
+            Bar: ti vi
+            Foo: ti vi
+            r#async: t
+
+            crate::r#async
+            a: t
+            r#async: t
+
+            crate::r#async::a
+            Foo: t v
+
+            crate::r#async::r#async
+            Bar: t v
         "#]],
     );
 }
@@ -170,7 +207,7 @@ pub struct Bar;
 "#,
         expect![[r#"
             crate
-            Bar: t v
+            Bar: ti vi
             foo: t
 
             crate::foo
@@ -199,7 +236,7 @@ pub struct Baz;
             foo: t
 
             crate::foo
-            Baz: t v
+            Baz: ti vi
             bar: t
 
             crate::foo::bar
@@ -228,7 +265,7 @@ pub struct Baz;
             foo: t
 
             crate::foo
-            Baz: t v
+            Baz: ti vi
             bar: t
 
             crate::foo::bar
@@ -255,7 +292,7 @@ use super::Baz;
             foo: t
 
             crate::foo
-            Baz: t v
+            Baz: ti vi
         "#]],
     );
 }
@@ -580,7 +617,7 @@ fn module_resolution_decl_inside_inline_module_in_crate_root() {
 //- /main.rs
 mod foo {
     #[path = "baz.rs"]
-    mod bar;
+    pub mod bar;
 }
 use self::foo::bar::Baz;
 
@@ -589,7 +626,7 @@ pub struct Baz;
 "#,
         expect![[r#"
             crate
-            Baz: t v
+            Baz: ti vi
             foo: t
 
             crate::foo
@@ -623,7 +660,7 @@ pub struct Baz;
             foo: t
 
             crate::foo
-            Baz: t v
+            Baz: ti vi
             bar: t
 
             crate::foo::bar
@@ -657,7 +694,7 @@ pub struct Baz;
             foo: t
 
             crate::foo
-            Baz: t v
+            Baz: ti vi
             bar: t
 
             crate::foo::bar
@@ -691,7 +728,7 @@ pub struct Baz;
             foo: t
 
             crate::foo
-            Baz: t v
+            Baz: ti vi
             bar: t
 
             crate::foo::bar
@@ -831,7 +868,7 @@ pub mod hash { pub trait Hash {} }
 "#,
         expect![[r#"
             crate
-            Hash: t
+            Hash: ti
             core: t
 
             crate::core
@@ -850,7 +887,7 @@ mod module;
 //- /module.rs
 #![cfg(NEVER)]
 
-struct AlsoShoulntAppear;
+struct AlsoShouldNotAppear;
         "#,
         expect![[r#"
             crate

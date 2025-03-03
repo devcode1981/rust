@@ -6,6 +6,8 @@ pub struct Bar;
 
 pub trait Whatever {
     fn what(&self) -> Self;
+    //~^ return_self_not_must_use
+
     // There should be no warning here! (returns a reference)
     fn what2(&self) -> &Self;
 }
@@ -16,9 +18,13 @@ impl Bar {
         Self
     }
     pub fn foo(&self) -> Self {
+        //~^ return_self_not_must_use
+
         Self
     }
     pub fn bar(self) -> Self {
+        //~^ return_self_not_must_use
+
         self
     }
     // There should be no warning here! (private method)

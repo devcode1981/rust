@@ -1,5 +1,6 @@
 #![warn(clippy::match_on_vec_items)]
-
+#![allow(clippy::redundant_at_rest_pattern, clippy::useless_vec)]
+//@no-rustfix
 fn match_with_wildcard() {
     let arr = vec![0, 1, 2, 3];
     let range = 1..3;
@@ -7,6 +8,7 @@ fn match_with_wildcard() {
 
     // Lint, may panic
     match arr[idx] {
+        //~^ match_on_vec_items
         0 => println!("0"),
         1 => println!("1"),
         _ => {},
@@ -14,6 +16,7 @@ fn match_with_wildcard() {
 
     // Lint, may panic
     match arr[range] {
+        //~^ match_on_vec_items
         [0, 1] => println!("0 1"),
         [1, 2] => println!("1 2"),
         _ => {},
@@ -27,6 +30,7 @@ fn match_without_wildcard() {
 
     // Lint, may panic
     match arr[idx] {
+        //~^ match_on_vec_items
         0 => println!("0"),
         1 => println!("1"),
         num => {},
@@ -34,6 +38,7 @@ fn match_without_wildcard() {
 
     // Lint, may panic
     match arr[range] {
+        //~^ match_on_vec_items
         [0, 1] => println!("0 1"),
         [1, 2] => println!("1 2"),
         [ref sub @ ..] => {},
@@ -47,6 +52,7 @@ fn match_wildcard_and_action() {
 
     // Lint, may panic
     match arr[idx] {
+        //~^ match_on_vec_items
         0 => println!("0"),
         1 => println!("1"),
         _ => println!("Hello, World!"),
@@ -54,6 +60,7 @@ fn match_wildcard_and_action() {
 
     // Lint, may panic
     match arr[range] {
+        //~^ match_on_vec_items
         [0, 1] => println!("0 1"),
         [1, 2] => println!("1 2"),
         _ => println!("Hello, World!"),
@@ -67,6 +74,7 @@ fn match_vec_ref() {
 
     // Lint, may panic
     match arr[idx] {
+        //~^ match_on_vec_items
         0 => println!("0"),
         1 => println!("1"),
         _ => {},
@@ -74,6 +82,7 @@ fn match_vec_ref() {
 
     // Lint, may panic
     match arr[range] {
+        //~^ match_on_vec_items
         [0, 1] => println!("0 1"),
         [1, 2] => println!("1 2"),
         _ => {},

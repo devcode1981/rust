@@ -1,9 +1,11 @@
 #![warn(clippy::while_let_loop)]
 #![allow(clippy::uninlined_format_args)]
-
+//@no-rustfix
 fn main() {
     let y = Some(true);
     loop {
+        //~^ while_let_loop
+
         if let Some(_x) = y {
             let _v = 1;
         } else {
@@ -21,6 +23,8 @@ fn main() {
     }
 
     loop {
+        //~^ while_let_loop
+
         match y {
             Some(_x) => true,
             None => break,
@@ -28,6 +32,8 @@ fn main() {
     }
 
     loop {
+        //~^ while_let_loop
+
         let x = match y {
             Some(x) => x,
             None => break,
@@ -37,6 +43,8 @@ fn main() {
     }
 
     loop {
+        //~^ while_let_loop
+
         let x = match y {
             Some(x) => x,
             None => break,
@@ -67,6 +75,8 @@ fn main() {
 
     // #675, this used to have a wrong suggestion
     loop {
+        //~^ while_let_loop
+
         let (e, l) = match "".split_whitespace().next() {
             Some(word) => (word.is_empty(), word.len()),
             None => break,

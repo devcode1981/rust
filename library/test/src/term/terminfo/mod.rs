@@ -1,19 +1,16 @@
 //! Terminfo database interface.
 
 use std::collections::HashMap;
-use std::env;
-use std::error;
-use std::fmt;
 use std::fs::File;
-use std::io::{self, prelude::*, BufReader};
+use std::io::prelude::*;
 use std::path::Path;
+use std::{env, error, fmt, io};
 
-use super::color;
-use super::Terminal;
-
-use parm::{expand, Param, Variables};
+use parm::{Param, Variables, expand};
 use parser::compiled::{msys_terminfo, parse};
 use searcher::get_dbpath_for_term;
+
+use super::{Terminal, color};
 
 /// A parsed terminfo database entry.
 #[allow(unused)]
@@ -93,7 +90,7 @@ impl TermInfo {
 
         get_dbpath_for_term(name)
             .ok_or_else(|| {
-                Error::IoError(io::Error::new(io::ErrorKind::NotFound, "terminfo file not found"))
+                Error::IoError(io::const_error!(io::ErrorKind::NotFound, "terminfo file not found"))
             })
             .and_then(|p| TermInfo::from_path(&(*p)))
     }
@@ -104,8 +101,7 @@ impl TermInfo {
     }
     // Keep the metadata small
     fn _from_path(path: &Path) -> Result<TermInfo, Error> {
-        let file = File::open(path).map_err(Error::IoError)?;
-        let mut reader = BufReader::new(file);
+        let mut reader = File::open_buffered(path).map_err(Error::IoError)?;
         parse(&mut reader, false).map_err(Error::MalformedTerminfo)
     }
 }
@@ -149,7 +145,7 @@ impl<T: Write + Send> Terminal for TerminfoTerminal<T> {
         // are there any terminals that have color/attrs and not sgr0?
         // Try falling back to sgr, then op
         let cmd = match ["sgr0", "sgr", "op"].iter().find_map(|cap| self.ti.strings.get(*cap)) {
-            Some(op) => match expand(&op, &[], &mut Variables::new()) {
+            Some(op) => match expand(op, &[], &mut Variables::new()) {
                 Ok(cmd) => cmd,
                 Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e)),
             },
@@ -180,12 +176,12 @@ impl<T: Write + Send> TerminfoTerminal<T> {
     }
 
     fn dim_if_necessary(&self, color: color::Color) -> color::Color {
-        if color >= self.num_colors && color >= 8 && color < 16 { color - 8 } else { color }
+        if color >= self.num_colors && (8..16).contains(&color) { color - 8 } else { color }
     }
 
     fn apply_cap(&mut self, cmd: &str, params: &[Param]) -> io::Result<bool> {
         match self.ti.strings.get(cmd) {
-            Some(cmd) => match expand(&cmd, params, &mut Variables::new()) {
+            Some(cmd) => match expand(cmd, params, &mut Variables::new()) {
                 Ok(s) => self.out.write_all(&s).and(Ok(true)),
                 Err(e) => Err(io::Error::new(io::ErrorKind::InvalidData, e)),
             },

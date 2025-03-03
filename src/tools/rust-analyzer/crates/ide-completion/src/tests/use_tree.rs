@@ -1,11 +1,33 @@
 //! Completion tests for use trees.
-use expect_test::{expect, Expect};
+use expect_test::expect;
 
-use crate::tests::completion_list;
+use crate::tests::check;
 
-fn check(ra_fixture: &str, expect: Expect) {
-    let actual = completion_list(ra_fixture);
-    expect.assert_eq(&actual)
+#[test]
+fn use_tree_completion() {
+    check(
+        r#"
+struct implThing;
+
+use crate::{impl$0};
+"#,
+        expect![[r#"
+            st implThing implThing
+            kw self
+        "#]],
+    );
+
+    check(
+        r#"
+struct implThing;
+
+use crate::{impl$0;
+"#,
+        expect![[r#"
+            st implThing implThing
+            kw self
+        "#]],
+    );
 }
 
 #[test]
@@ -65,7 +87,7 @@ use self::{foo::*, bar$0};
 "#,
         expect![[r#"
             md foo
-            st S
+            st S S
         "#]],
     );
 }
@@ -82,7 +104,7 @@ mod foo {
 use foo::{bar::$0}
 "#,
         expect![[r#"
-            st FooBar
+            st FooBar FooBar
         "#]],
     );
     check(
@@ -115,7 +137,7 @@ mod foo {
 use foo::{bar::{baz::$0}}
 "#,
         expect![[r#"
-            st FooBarBaz
+            st FooBarBaz FooBarBaz
         "#]],
     );
     check(
@@ -152,7 +174,7 @@ struct Bar;
 "#,
         expect![[r#"
             ma foo macro_rules! foo_
-            st Foo
+            st Foo               Foo
         "#]],
     );
 }
@@ -176,8 +198,8 @@ impl Foo {
 "#,
         expect![[r#"
             ev RecordVariant RecordVariant
-            ev TupleVariant  TupleVariant
-            ev UnitVariant   UnitVariant
+            ev TupleVariant   TupleVariant
+            ev UnitVariant     UnitVariant
         "#]],
     );
 }
@@ -193,7 +215,7 @@ struct Bar;
 "#,
         expect![[r#"
             md foo
-            st Bar
+            st Bar Bar
         "#]],
     );
 }
@@ -212,7 +234,7 @@ struct Bar;
         expect![[r#"
             md bar
             md foo
-            st Bar
+            st Bar Bar
         "#]],
     );
 }
@@ -230,7 +252,7 @@ mod a {
 }
 "#,
         expect![[r#"
-            ct A
+            ct A usize
             md b
             kw super::
         "#]],
@@ -248,7 +270,7 @@ struct Bar;
 "#,
         expect![[r#"
             md foo
-            st Bar
+            st Bar Bar
         "#]],
     );
 }
@@ -265,7 +287,7 @@ pub mod foo {}
 "#,
         expect![[r#"
             md foo
-            st Foo
+            st Foo Foo
         "#]],
     );
 }
@@ -379,6 +401,70 @@ use self::foo::impl$0
 "#,
         expect![[r#"
             fn bar fn(u32)
+        "#]],
+    );
+}
+
+#[test]
+fn use_tree_no_unstable_items_on_stable() {
+    check(
+        r#"
+//- /lib.rs crate:main deps:std
+use std::$0
+//- /std.rs crate:std
+#[unstable]
+pub mod simd {}
+#[unstable]
+pub struct S;
+#[unstable]
+pub fn foo() {}
+#[unstable]
+#[macro_export]
+marco_rules! m { () => {} }
+"#,
+        expect![""],
+    );
+}
+
+#[test]
+fn use_tree_unstable_items_on_nightly() {
+    check(
+        r#"
+//- toolchain:nightly
+//- /lib.rs crate:main deps:std
+use std::$0
+//- /std.rs crate:std
+#[unstable]
+pub mod simd {}
+#[unstable]
+pub struct S;
+#[unstable]
+pub fn foo() {}
+#[unstable]
+#[macro_export]
+marco_rules! m { () => {} }
+"#,
+        expect![[r#"
+            fn foo fn()
+            md simd
+            st S      S
+        "#]],
+    );
+}
+
+#[test]
+fn use_tree_doc_hidden() {
+    check(
+        r#"
+//- /foo.rs crate:foo
+#[doc(hidden)] pub struct Hidden;
+pub struct Visible;
+
+//- /lib.rs crate:lib deps:foo
+use foo::$0;
+    "#,
+        expect![[r#"
+            st Visible Visible
         "#]],
     );
 }

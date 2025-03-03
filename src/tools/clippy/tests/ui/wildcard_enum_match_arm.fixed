@@ -1,5 +1,4 @@
-// run-rustfix
-// aux-build:non-exhaustive-enum.rs
+//@aux-build:non-exhaustive-enum.rs
 #![deny(clippy::wildcard_enum_match_arm)]
 #![allow(dead_code, unreachable_code, unused_variables)]
 #![allow(
@@ -38,14 +37,17 @@ fn main() {
     match color {
         Color::Red => println!("Red"),
         Color::Green | Color::Blue | Color::Rgb(..) | Color::Cyan => eprintln!("Not red"),
+        //~^ wildcard_enum_match_arm
     };
     match color {
         Color::Red => println!("Red"),
         _not_red @ Color::Green | _not_red @ Color::Blue | _not_red @ Color::Rgb(..) | _not_red @ Color::Cyan => eprintln!("Not red"),
+        //~^ wildcard_enum_match_arm
     };
     let _str = match color {
         Color::Red => "Red".to_owned(),
         not_red @ Color::Green | not_red @ Color::Blue | not_red @ Color::Rgb(..) | not_red @ Color::Cyan => format!("{:?}", not_red),
+        //~^ wildcard_enum_match_arm
     };
     match color {
         Color::Red => {},
@@ -62,6 +64,7 @@ fn main() {
     match color {
         Color::Rgb(r, _, _) if r > 0 => "Some red",
         Color::Red | Color::Green | Color::Blue | Color::Rgb(..) | Color::Cyan => "No red",
+        //~^ wildcard_enum_match_arm
     };
     match color {
         Color::Red | Color::Green | Color::Blue | Color::Cyan => {},
@@ -79,6 +82,7 @@ fn main() {
     match error_kind {
         ErrorKind::NotFound => {},
         ErrorKind::PermissionDenied | _ => {},
+        //~^ wildcard_enum_match_arm
     }
     match error_kind {
         ErrorKind::NotFound => {},
@@ -96,7 +100,8 @@ fn main() {
         }
         match Enum::A {
             Enum::A => (),
-            Enum::B | _ => (),
+            Enum::B | Enum::__Private => (),
+            //~^ wildcard_enum_match_arm
         }
     }
 }

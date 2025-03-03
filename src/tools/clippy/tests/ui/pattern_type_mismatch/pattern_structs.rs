@@ -11,8 +11,13 @@ fn struct_types() {
 
     // not ok
     let Struct { .. } = ref_value;
+    //~^ pattern_type_mismatch
+
     if let &Struct { ref_inner: Some(_) } = ref_value {}
+    //~^ pattern_type_mismatch
+
     if let Struct { ref_inner: Some(_) } = *ref_value {}
+    //~^ pattern_type_mismatch
 
     // ok
     let &Struct { .. } = ref_value;
@@ -30,10 +35,19 @@ fn struct_enum_variants() {
 
     // not ok
     if let StructEnum::Var { .. } = ref_value {}
+    //~^ pattern_type_mismatch
+
     if let StructEnum::Var { inner_ref: Some(_) } = ref_value {}
+    //~^ pattern_type_mismatch
+
     if let &StructEnum::Var { inner_ref: Some(_) } = ref_value {}
+    //~^ pattern_type_mismatch
+
     if let StructEnum::Var { inner_ref: Some(_) } = *ref_value {}
+    //~^ pattern_type_mismatch
+
     if let StructEnum::Empty = ref_value {}
+    //~^ pattern_type_mismatch
 
     // ok
     if let &StructEnum::Var { .. } = ref_value {}

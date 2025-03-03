@@ -1,12 +1,13 @@
-use rustc_errors::{IntoDiagnosticArg, MultiSpan};
+use rustc_errors::MultiSpan;
+use rustc_errors::codes::*;
 use rustc_macros::{Diagnostic, LintDiagnostic, Subdiagnostic};
-use rustc_middle::ty::Ty;
+use rustc_middle::ty::{GenericArg, Ty};
 use rustc_span::Span;
 
 use crate::diagnostics::RegionName;
 
 #[derive(Diagnostic)]
-#[diag(borrowck_move_unsized, code = "E0161")]
+#[diag(borrowck_move_unsized, code = E0161)]
 pub(crate) struct MoveUnsized<'tcx> {
     pub ty: Ty<'tcx>,
     #[primary_span]
@@ -49,13 +50,13 @@ pub(crate) struct GenericDoesNotLiveLongEnough {
 #[derive(LintDiagnostic)]
 #[diag(borrowck_var_does_not_need_mut)]
 pub(crate) struct VarNeedNotMut {
-    #[suggestion_short(applicability = "machine-applicable", code = "")]
+    #[suggestion(style = "short", applicability = "machine-applicable", code = "")]
     pub span: Span,
 }
 #[derive(Diagnostic)]
 #[diag(borrowck_var_cannot_escape_closure)]
 #[note]
-#[note(cannot_escape)]
+#[note(borrowck_cannot_escape)]
 pub(crate) struct FnMutError {
     #[primary_span]
     pub span: Span,
@@ -128,18 +129,6 @@ pub(crate) enum LifetimeReturnCategoryErr<'a> {
     },
 }
 
-impl IntoDiagnosticArg for &RegionName {
-    fn into_diagnostic_arg(self) -> rustc_errors::DiagnosticArgValue<'static> {
-        format!("{}", self).into_diagnostic_arg()
-    }
-}
-
-impl IntoDiagnosticArg for RegionName {
-    fn into_diagnostic_arg(self) -> rustc_errors::DiagnosticArgValue<'static> {
-        format!("{}", self).into_diagnostic_arg()
-    }
-}
-
 #[derive(Subdiagnostic)]
 pub(crate) enum RequireStaticErr {
     #[note(borrowck_used_impl_require_static)]
@@ -147,4 +136,354 @@ pub(crate) enum RequireStaticErr {
         #[primary_span]
         multi_span: MultiSpan,
     },
+}
+
+#[derive(Subdiagnostic)]
+pub(crate) enum CaptureVarPathUseCause {
+    #[label(borrowck_borrow_due_to_use_coroutine)]
+    BorrowInCoroutine {
+        #[primary_span]
+        path_span: Span,
+    },
+    #[label(borrowck_use_due_to_use_coroutine)]
+    UseInCoroutine {
+        #[primary_span]
+        path_span: Span,
+    },
+    #[label(borrowck_assign_due_to_use_coroutine)]
+    AssignInCoroutine {
+        #[primary_span]
+        path_span: Span,
+    },
+    #[label(borrowck_assign_part_due_to_use_coroutine)]
+    AssignPartInCoroutine {
+        #[primary_span]
+        path_span: Span,
+    },
+    #[label(borrowck_borrow_due_to_use_closure)]
+    BorrowInClosure {
+        #[primary_span]
+        path_span: Span,
+    },
+    #[label(borrowck_use_due_to_use_closure)]
+    UseInClosure {
+        #[primary_span]
+        path_span: Span,
+    },
+    #[label(borrowck_assign_due_to_use_closure)]
+    AssignInClosure {
+        #[primary_span]
+        path_span: Span,
+    },
+    #[label(borrowck_assign_part_due_to_use_closure)]
+    AssignPartInClosure {
+        #[primary_span]
+        path_span: Span,
+    },
+}
+
+#[derive(Subdiagnostic)]
+pub(crate) enum CaptureVarKind {
+    #[label(borrowck_capture_immute)]
+    Immut {
+        #[primary_span]
+        kind_span: Span,
+    },
+    #[label(borrowck_capture_mut)]
+    Mut {
+        #[primary_span]
+        kind_span: Span,
+    },
+    #[label(borrowck_capture_move)]
+    Move {
+        #[primary_span]
+        kind_span: Span,
+    },
+}
+
+#[derive(Subdiagnostic)]
+pub(crate) enum CaptureVarCause {
+    #[label(borrowck_var_borrow_by_use_place_in_coroutine)]
+    BorrowUsePlaceCoroutine {
+        is_single_var: bool,
+        place: String,
+        #[primary_span]
+        var_span: Span,
+    },
+    #[label(borrowck_var_borrow_by_use_place_in_closure)]
+    BorrowUsePlaceClosure {
+        is_single_var: bool,
+        place: String,
+        #[primary_span]
+        var_span: Span,
+    },
+    #[label(borrowck_var_borrow_by_use_in_coroutine)]
+    BorrowUseInCoroutine {
+        #[primary_span]
+        var_span: Span,
+    },
+    #[label(borrowck_var_borrow_by_use_in_closure)]
+    BorrowUseInClosure {
+        #[primary_span]
+        var_span: Span,
+    },
+    #[label(borrowck_var_move_by_use_in_coroutine)]
+    MoveUseInCoroutine {
+        #[primary_span]
+        var_span: Span,
+    },
+    #[label(borrowck_var_move_by_use_in_closure)]
+    MoveUseInClosure {
+        #[primary_span]
+        var_span: Span,
+    },
+    #[label(borrowck_var_first_borrow_by_use_place_in_coroutine)]
+    FirstBorrowUsePlaceCoroutine {
+        place: String,
+        #[primary_span]
+        var_span: Span,
+    },
+    #[label(borrowck_var_first_borrow_by_use_place_in_closure)]
+    FirstBorrowUsePlaceClosure {
+        place: String,
+        #[primary_span]
+        var_span: Span,
+    },
+    #[label(borrowck_var_second_borrow_by_use_place_in_coroutine)]
+    SecondBorrowUsePlaceCoroutine {
+        place: String,
+        #[primary_span]
+        var_span: Span,
+    },
+    #[label(borrowck_var_second_borrow_by_use_place_in_closure)]
+    SecondBorrowUsePlaceClosure {
+        place: String,
+        #[primary_span]
+        var_span: Span,
+    },
+    #[label(borrowck_var_mutable_borrow_by_use_place_in_closure)]
+    MutableBorrowUsePlaceClosure {
+        place: String,
+        #[primary_span]
+        var_span: Span,
+    },
+    #[label(borrowck_partial_var_move_by_use_in_coroutine)]
+    PartialMoveUseInCoroutine {
+        #[primary_span]
+        var_span: Span,
+        is_partial: bool,
+    },
+    #[label(borrowck_partial_var_move_by_use_in_closure)]
+    PartialMoveUseInClosure {
+        #[primary_span]
+        var_span: Span,
+        is_partial: bool,
+    },
+}
+
+#[derive(Diagnostic)]
+#[diag(borrowck_cannot_move_when_borrowed, code = E0505)]
+pub(crate) struct MoveBorrow<'a> {
+    pub place: &'a str,
+    pub borrow_place: &'a str,
+    pub value_place: &'a str,
+    #[primary_span]
+    #[label(borrowck_move_label)]
+    pub span: Span,
+    #[label]
+    pub borrow_span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag(borrowck_opaque_type_non_generic_param, code = E0792)]
+pub(crate) struct NonGenericOpaqueTypeParam<'a, 'tcx> {
+    pub ty: GenericArg<'tcx>,
+    pub kind: &'a str,
+    #[primary_span]
+    pub span: Span,
+    #[label]
+    pub param_span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag(borrowck_opaque_type_lifetime_mismatch)]
+pub(crate) struct LifetimeMismatchOpaqueParam<'tcx> {
+    pub arg: GenericArg<'tcx>,
+    pub prev: GenericArg<'tcx>,
+    #[primary_span]
+    #[label]
+    #[note]
+    pub span: Span,
+    #[label(borrowck_prev_lifetime_label)]
+    pub prev_span: Span,
+}
+
+#[derive(Subdiagnostic)]
+pub(crate) enum CaptureReasonLabel<'a> {
+    #[label(borrowck_moved_due_to_call)]
+    Call {
+        #[primary_span]
+        fn_call_span: Span,
+        place_name: &'a str,
+        is_partial: bool,
+        is_loop_message: bool,
+    },
+    #[label(borrowck_moved_due_to_usage_in_operator)]
+    OperatorUse {
+        #[primary_span]
+        fn_call_span: Span,
+        place_name: &'a str,
+        is_partial: bool,
+        is_loop_message: bool,
+    },
+    #[label(borrowck_moved_due_to_implicit_into_iter_call)]
+    ImplicitCall {
+        #[primary_span]
+        fn_call_span: Span,
+        place_name: &'a str,
+        is_partial: bool,
+        is_loop_message: bool,
+    },
+    #[label(borrowck_moved_due_to_method_call)]
+    MethodCall {
+        #[primary_span]
+        fn_call_span: Span,
+        place_name: &'a str,
+        is_partial: bool,
+        is_loop_message: bool,
+    },
+    #[label(borrowck_moved_due_to_await)]
+    Await {
+        #[primary_span]
+        fn_call_span: Span,
+        place_name: &'a str,
+        is_partial: bool,
+        is_loop_message: bool,
+    },
+    #[label(borrowck_value_moved_here)]
+    MovedHere {
+        #[primary_span]
+        move_span: Span,
+        is_partial: bool,
+        is_move_msg: bool,
+        is_loop_message: bool,
+    },
+    #[label(borrowck_consider_borrow_type_contents)]
+    BorrowContent {
+        #[primary_span]
+        var_span: Span,
+    },
+}
+
+#[derive(Subdiagnostic)]
+pub(crate) enum CaptureReasonNote {
+    #[note(borrowck_moved_a_fn_once_in_call)]
+    FnOnceMoveInCall {
+        #[primary_span]
+        var_span: Span,
+    },
+    #[note(borrowck_calling_operator_moves)]
+    UnOpMoveByOperator {
+        #[primary_span]
+        span: Span,
+    },
+    #[note(borrowck_calling_operator_moves_lhs)]
+    LhsMoveByOperator {
+        #[primary_span]
+        span: Span,
+    },
+    #[note(borrowck_func_take_self_moved_place)]
+    FuncTakeSelf {
+        func: String,
+        place_name: String,
+        #[primary_span]
+        span: Span,
+    },
+}
+
+#[derive(Subdiagnostic)]
+pub(crate) enum CaptureReasonSuggest<'tcx> {
+    #[suggestion(
+        borrowck_suggest_iterate_over_slice,
+        applicability = "maybe-incorrect",
+        code = "&",
+        style = "verbose"
+    )]
+    IterateSlice {
+        ty: Ty<'tcx>,
+        #[primary_span]
+        span: Span,
+    },
+    #[suggestion(
+        borrowck_suggest_create_fresh_reborrow,
+        applicability = "maybe-incorrect",
+        code = ".as_mut()",
+        style = "verbose"
+    )]
+    FreshReborrow {
+        #[primary_span]
+        span: Span,
+    },
+}
+
+#[derive(Subdiagnostic)]
+pub(crate) enum CaptureArgLabel {
+    #[label(borrowck_value_capture_here)]
+    Capture {
+        is_within: bool,
+        #[primary_span]
+        args_span: Span,
+    },
+    #[label(borrowck_move_out_place_here)]
+    MoveOutPlace {
+        place: String,
+        #[primary_span]
+        args_span: Span,
+    },
+}
+
+#[derive(Subdiagnostic)]
+pub(crate) enum OnClosureNote<'a> {
+    #[note(borrowck_closure_invoked_twice)]
+    InvokedTwice {
+        place_name: &'a str,
+        #[primary_span]
+        span: Span,
+    },
+    #[note(borrowck_closure_moved_twice)]
+    MovedTwice {
+        place_name: &'a str,
+        #[primary_span]
+        span: Span,
+    },
+}
+
+#[derive(Subdiagnostic)]
+pub(crate) enum TypeNoCopy<'a, 'tcx> {
+    #[label(borrowck_ty_no_impl_copy)]
+    Label {
+        is_partial_move: bool,
+        ty: Ty<'tcx>,
+        place: &'a str,
+        #[primary_span]
+        span: Span,
+    },
+    #[note(borrowck_ty_no_impl_copy)]
+    Note { is_partial_move: bool, ty: Ty<'tcx>, place: &'a str },
+}
+
+#[derive(Diagnostic)]
+#[diag(borrowck_simd_intrinsic_arg_const)]
+pub(crate) struct SimdIntrinsicArgConst {
+    #[primary_span]
+    pub span: Span,
+    pub arg: usize,
+    pub intrinsic: String,
+}
+
+#[derive(LintDiagnostic)]
+#[diag(borrowck_tail_expr_drop_order)]
+pub(crate) struct TailExprDropOrder {
+    #[label]
+    pub borrowed: Span,
 }

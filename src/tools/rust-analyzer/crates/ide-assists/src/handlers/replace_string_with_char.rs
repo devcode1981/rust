@@ -25,20 +25,20 @@ use crate::{AssistContext, AssistId, AssistKind, Assists};
 // ```
 pub(crate) fn replace_string_with_char(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
     let token = ctx.find_token_syntax_at_offset(STRING).and_then(ast::String::cast)?;
-    let value = token.value()?;
+    let value = token.value().ok()?;
     let target = token.syntax().text_range();
 
     if value.chars().take(2).count() != 1 {
         return None;
     }
-    let quote_offets = token.quote_offsets()?;
+    let quote_offsets = token.quote_offsets()?;
 
     acc.add(
         AssistId("replace_string_with_char", AssistKind::RefactorRewrite),
         "Replace string with char",
         target,
         |edit| {
-            let (left, right) = quote_offets.quotes;
+            let (left, right) = quote_offsets.quotes;
             edit.replace(left, '\'');
             edit.replace(right, '\'');
             if value == "'" {

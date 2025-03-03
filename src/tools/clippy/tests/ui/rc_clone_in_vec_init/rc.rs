@@ -1,4 +1,6 @@
+//@no-rustfix: overlapping suggestions
 #![warn(clippy::rc_clone_in_vec_init)]
+#![allow(clippy::useless_vec)]
 use std::rc::Rc;
 use std::sync::Mutex;
 
@@ -6,6 +8,7 @@ fn main() {}
 
 fn should_warn_simple_case() {
     let v = vec![Rc::new("x".to_string()); 2];
+    //~^ rc_clone_in_vec_init
 }
 
 fn should_warn_simple_case_with_big_indentation() {
@@ -14,12 +17,16 @@ fn should_warn_simple_case_with_big_indentation() {
         dbg!(k);
         if true {
             let v = vec![Rc::new("x".to_string()); 2];
+            //~^ rc_clone_in_vec_init
         }
     }
 }
 
 fn should_warn_complex_case() {
     let v = vec![
+    //~^ rc_clone_in_vec_init
+
+
         std::rc::Rc::new(Mutex::new({
             let x = 1;
             dbg!(x);
@@ -29,6 +36,9 @@ fn should_warn_complex_case() {
     ];
 
     let v1 = vec![
+    //~^ rc_clone_in_vec_init
+
+
         Rc::new(Mutex::new({
             let x = 1;
             dbg!(x);

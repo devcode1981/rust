@@ -9,6 +9,7 @@ fn main() {
     let unwanted = &tracked_fds - &new_fds;
 
     let foo = &5 - &6;
+    //~^ op_ref
 
     let bar = String::new();
     let bar = "foo" == &bar;
@@ -54,6 +55,7 @@ fn main() {
     let x = Y(1);
     let y = Y(2);
     let z = x & &y;
+    //~^ op_ref
 }
 
 #[derive(Clone, Copy)]
@@ -87,7 +89,11 @@ impl Mul<A> for A {
         let two = 2;
         let three = 3;
         let _ = one * &self;
+        //~^ op_ref
+
         let _ = two + &three;
+        //~^ op_ref
+
         // Removing the reference would lead to unconditional recursion
         self * &rhs
     }

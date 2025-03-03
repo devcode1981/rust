@@ -1,13 +1,13 @@
 #![allow(dead_code)]
 
 // We use packed structs to get around alignment restrictions
-#[repr(packed)]
+#[repr(C, packed)]
 struct Data {
     pad: u8,
     ptr: &'static i32,
 }
 
-// But we need to gurantee some alignment
+// But we need to guarantee some alignment
 struct Wrapper {
     align: u64,
     data: Data,

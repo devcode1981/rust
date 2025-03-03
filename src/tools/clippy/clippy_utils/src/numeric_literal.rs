@@ -1,4 +1,4 @@
-use rustc_ast::ast::{Lit, LitFloatType, LitIntType, LitKind};
+use rustc_ast::ast::{LitFloatType, LitIntType, LitKind};
 use std::iter;
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
@@ -46,10 +46,6 @@ pub struct NumericLiteral<'a> {
 }
 
 impl<'a> NumericLiteral<'a> {
-    pub fn from_lit(src: &'a str, lit: &Lit) -> Option<NumericLiteral<'a>> {
-        NumericLiteral::from_lit_kind(src, &lit.kind)
-    }
-
     pub fn from_lit_kind(src: &'a str, lit_kind: &LitKind) -> Option<NumericLiteral<'a>> {
         let unsigned_src = src.strip_prefix('-').map_or(src, |s| s);
         if lit_kind.is_numeric()
@@ -57,7 +53,7 @@ impl<'a> NumericLiteral<'a> {
                 .trim_start()
                 .chars()
                 .next()
-                .map_or(false, |c| c.is_ascii_digit())
+                .is_some_and(|c| c.is_ascii_digit())
         {
             let (unsuffixed, suffix) = split_suffix(src, lit_kind);
             let float = matches!(lit_kind, LitKind::Float(..));
@@ -129,7 +125,7 @@ impl<'a> NumericLiteral<'a> {
                             integer = &digits[..exp_start];
                         } else {
                             fraction = Some(&digits[integer.len() + 1..exp_start]);
-                        };
+                        }
                         exponent = Some((&digits[exp_start..=i], &digits[i + 1..]));
                         break;
                     },
@@ -165,9 +161,11 @@ impl<'a> NumericLiteral<'a> {
         }
 
         if let Some((separator, exponent)) = self.exponent {
-            if exponent != "0" {
+            if !exponent.is_empty() && exponent != "0" {
                 output.push_str(separator);
                 Self::group_digits(&mut output, exponent, group_size, true, false);
+            } else if exponent == "0" && self.fraction.is_none() && self.suffix.is_none() {
+                output.push_str(".0");
             }
         }
 
@@ -190,7 +188,7 @@ impl<'a> NumericLiteral<'a> {
         // The exponent may have a sign, output it early, otherwise it will be
         // treated as a digit
         if digits.clone().next() == Some('-') {
-            let _ = digits.next();
+            let _: Option<char> = digits.next();
             output.push('-');
         }
 

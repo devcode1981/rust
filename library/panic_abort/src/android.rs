@@ -1,6 +1,6 @@
 use alloc::string::String;
 use core::mem::transmute;
-use core::panic::BoxMeUp;
+use core::panic::PanicPayload;
 use core::ptr::copy_nonoverlapping;
 
 const ANDROID_SET_ABORT_MESSAGE: &[u8] = b"android_set_abort_message\0";
@@ -15,15 +15,16 @@ type SetAbortMessageType = unsafe extern "C" fn(*const libc::c_char) -> ();
 //
 // Weakly resolve the symbol for android_set_abort_message. This function is only available
 // for API >= 21.
-pub(crate) unsafe fn android_set_abort_message(payload: *mut &mut dyn BoxMeUp) {
-    let func_addr =
+pub(crate) unsafe fn android_set_abort_message(payload: &mut dyn PanicPayload) {
+    let func_addr = unsafe {
         libc::dlsym(libc::RTLD_DEFAULT, ANDROID_SET_ABORT_MESSAGE.as_ptr() as *const libc::c_char)
-            as usize;
+            as usize
+    };
     if func_addr == 0 {
         return;
     }
 
-    let payload = (*payload).get();
+    let payload = payload.get();
     let msg = match payload.downcast_ref::<&'static str>() {
         Some(msg) => msg.as_bytes(),
         None => match payload.downcast_ref::<String>() {
@@ -37,13 +38,14 @@ pub(crate) unsafe fn android_set_abort_message(payload: *mut &mut dyn BoxMeUp) {
 
     // Allocate a new buffer to append the null byte.
     let size = msg.len() + 1usize;
-    let buf = libc::malloc(size) as *mut libc::c_char;
+    let buf = unsafe { libc::malloc(size) as *mut libc::c_char };
     if buf.is_null() {
         return; // allocation failure
     }
-    copy_nonoverlapping(msg.as_ptr(), buf as *mut u8, msg.len());
-    buf.add(msg.len()).write(0);
-
-    let func = transmute::<usize, SetAbortMessageType>(func_addr);
-    func(buf);
+    unsafe {
+        copy_nonoverlapping(msg.as_ptr(), buf as *mut u8, msg.len());
+        buf.add(msg.len()).write(0);
+        let func = transmute::<usize, SetAbortMessageType>(func_addr);
+        func(buf);
+    }
 }

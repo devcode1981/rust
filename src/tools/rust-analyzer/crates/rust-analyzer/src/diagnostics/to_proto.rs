@@ -1,15 +1,15 @@
 //! This module provides the functionality needed to convert diagnostics from
 //! `cargo check` json format to the LSP diagnostic format.
-use std::collections::HashMap;
 
-use flycheck::{Applicability, DiagnosticLevel, DiagnosticSpan};
+use crate::flycheck::{Applicability, DiagnosticLevel, DiagnosticSpan};
 use itertools::Itertools;
+use rustc_hash::FxHashMap;
 use stdx::format_to;
 use vfs::{AbsPath, AbsPathBuf};
 
 use crate::{
-    global_state::GlobalStateSnapshot, line_index::OffsetEncoding, lsp_ext,
-    to_proto::url_from_abs_path,
+    global_state::GlobalStateSnapshot, line_index::PositionEncoding,
+    lsp::to_proto::url_from_abs_path, lsp_ext,
 };
 
 use super::{DiagnosticsMapConfig, Fix};
@@ -17,8 +17,8 @@ use super::{DiagnosticsMapConfig, Fix};
 /// Determines the LSP severity from a diagnostic
 fn diagnostic_severity(
     config: &DiagnosticsMapConfig,
-    level: flycheck::DiagnosticLevel,
-    code: Option<flycheck::DiagnosticCode>,
+    level: crate::flycheck::DiagnosticLevel,
+    code: Option<crate::flycheck::DiagnosticCode>,
 ) -> Option<lsp_types::DiagnosticSeverity> {
     let res = match level {
         DiagnosticLevel::Ice => lsp_types::DiagnosticSeverity::ERROR,
@@ -66,49 +66,51 @@ fn location(
     let uri = url_from_abs_path(&file_name);
 
     let range = {
-        let offset_encoding = snap.config.offset_encoding();
+        let position_encoding = snap.config.negotiated_encoding();
         lsp_types::Range::new(
-            position(&offset_encoding, span, span.line_start, span.column_start),
-            position(&offset_encoding, span, span.line_end, span.column_end),
+            position(
+                &position_encoding,
+                span,
+                span.line_start,
+                span.column_start.saturating_sub(1),
+            ),
+            position(&position_encoding, span, span.line_end, span.column_end.saturating_sub(1)),
         )
     };
     lsp_types::Location::new(uri, range)
 }
 
 fn position(
-    offset_encoding: &OffsetEncoding,
+    position_encoding: &PositionEncoding,
     span: &DiagnosticSpan,
-    line_offset: usize,
-    column_offset: usize,
+    line_number: usize,
+    column_offset_utf32: usize,
 ) -> lsp_types::Position {
-    let line_index = line_offset - span.line_start;
+    let line_index = line_number - span.line_start;
 
-    let mut true_column_offset = column_offset;
-    if let Some(line) = span.text.get(line_index) {
-        if line.text.chars().count() == line.text.len() {
-            // all one byte utf-8 char
-            return lsp_types::Position {
-                line: (line_offset as u32).saturating_sub(1),
-                character: (column_offset as u32).saturating_sub(1),
-            };
-        }
-        let mut char_offset = 0;
-        let len_func = match offset_encoding {
-            OffsetEncoding::Utf8 => char::len_utf8,
-            OffsetEncoding::Utf16 => char::len_utf16,
-        };
-        for c in line.text.chars() {
-            char_offset += 1;
-            if char_offset > column_offset {
-                break;
+    let column_offset_encoded = match span.text.get(line_index) {
+        // Fast path.
+        Some(line) if line.text.is_ascii() => column_offset_utf32,
+        Some(line) => {
+            let line_prefix_len = line
+                .text
+                .char_indices()
+                .take(column_offset_utf32)
+                .last()
+                .map(|(pos, c)| pos + c.len_utf8())
+                .unwrap_or(0);
+            let line_prefix = &line.text[..line_prefix_len];
+            match position_encoding {
+                PositionEncoding::Utf8 => line_prefix.len(),
+                PositionEncoding::Wide(enc) => enc.measure(line_prefix),
             }
-            true_column_offset += len_func(c) - 1;
         }
-    }
+        None => column_offset_utf32,
+    };
 
     lsp_types::Position {
-        line: (line_offset as u32).saturating_sub(1),
-        character: (true_column_offset as u32).saturating_sub(1),
+        line: (line_number as u32).saturating_sub(1),
+        character: column_offset_encoded as u32,
     }
 }
 
@@ -161,14 +163,14 @@ fn resolve_path(
         .iter()
         .find_map(|(from, to)| file_name.strip_prefix(from).map(|file_name| (to, file_name)))
     {
-        Some((to, file_name)) => workspace_root.join(format!("{}{}", to, file_name)),
+        Some((to, file_name)) => workspace_root.join(format!("{to}{file_name}")),
         None => workspace_root.join(file_name),
     }
 }
 
 struct SubDiagnostic {
     related: lsp_types::DiagnosticRelatedInformation,
-    suggested_fix: Option<Fix>,
+    suggested_fix: Option<Box<Fix>>,
 }
 
 enum MappedRustChildDiagnostic {
@@ -179,7 +181,7 @@ enum MappedRustChildDiagnostic {
 fn map_rust_child_diagnostic(
     config: &DiagnosticsMapConfig,
     workspace_root: &AbsPath,
-    rd: &flycheck::Diagnostic,
+    rd: &crate::flycheck::Diagnostic,
     snap: &GlobalStateSnapshot,
 ) -> MappedRustChildDiagnostic {
     let spans: Vec<&DiagnosticSpan> = rd.spans.iter().filter(|s| s.is_primary).collect();
@@ -189,8 +191,9 @@ fn map_rust_child_diagnostic(
         return MappedRustChildDiagnostic::MessageLine(rd.message.clone());
     }
 
-    let mut edit_map: HashMap<lsp_types::Url, Vec<lsp_types::TextEdit>> = HashMap::new();
+    let mut edit_map: FxHashMap<lsp_types::Url, Vec<lsp_types::TextEdit>> = FxHashMap::default();
     let mut suggested_replacements = Vec::new();
+    let mut is_preferred = true;
     for &span in &spans {
         if let Some(suggested_replacement) = &span.suggested_replacement {
             if !suggested_replacement.is_empty() {
@@ -209,6 +212,8 @@ fn map_rust_child_diagnostic(
             ) {
                 edit_map.entry(location.uri).or_default().push(edit);
             }
+            is_preferred &=
+                matches!(span.suggestion_applicability, Some(Applicability::MachineApplicable));
         }
     }
 
@@ -218,7 +223,7 @@ fn map_rust_child_diagnostic(
     if !suggested_replacements.is_empty() {
         message.push_str(": ");
         let suggestions =
-            suggested_replacements.iter().map(|suggestion| format!("`{}`", suggestion)).join(", ");
+            suggested_replacements.iter().map(|suggestion| format!("`{suggestion}`")).join(", ");
         message.push_str(&suggestions);
     }
 
@@ -236,7 +241,7 @@ fn map_rust_child_diagnostic(
                 location: location(config, workspace_root, spans[0], snap),
                 message: message.clone(),
             },
-            suggested_fix: Some(Fix {
+            suggested_fix: Some(Box::new(Fix {
                 ranges: spans
                     .iter()
                     .map(|&span| location(config, workspace_root, span, snap).range)
@@ -251,11 +256,11 @@ fn map_rust_child_diagnostic(
                         document_changes: None,
                         change_annotations: None,
                     }),
-                    is_preferred: Some(true),
+                    is_preferred: Some(is_preferred),
                     data: None,
                     command: None,
                 },
-            }),
+            })),
         })
     }
 }
@@ -264,7 +269,7 @@ fn map_rust_child_diagnostic(
 pub(crate) struct MappedRustDiagnostic {
     pub(crate) url: lsp_types::Url,
     pub(crate) diagnostic: lsp_types::Diagnostic,
-    pub(crate) fix: Option<Fix>,
+    pub(crate) fix: Option<Box<Fix>>,
 }
 
 /// Converts a Rust root diagnostic to LSP form
@@ -279,7 +284,7 @@ pub(crate) struct MappedRustDiagnostic {
 /// If the diagnostic has no primary span this will return `None`
 pub(crate) fn map_rust_diagnostic_to_lsp(
     config: &DiagnosticsMapConfig,
-    rd: &flycheck::Diagnostic,
+    rd: &crate::flycheck::Diagnostic,
     workspace_root: &AbsPath,
     snap: &GlobalStateSnapshot,
 ) -> Vec<MappedRustDiagnostic> {
@@ -292,6 +297,13 @@ pub(crate) fn map_rust_diagnostic_to_lsp(
 
     let mut source = String::from("rustc");
     let mut code = rd.code.as_ref().map(|c| c.code.clone());
+
+    if let Some(code_val) = &code {
+        if config.check_ignore.contains(code_val) {
+            return Vec::new();
+        }
+    }
+
     if let Some(code_val) = &code {
         // See if this is an RFC #2103 scoped lint (e.g. from Clippy)
         let scoped_code: Vec<&str> = code_val.split("::").collect();
@@ -359,14 +371,15 @@ pub(crate) fn map_rust_diagnostic_to_lsp(
         .iter()
         .flat_map(|primary_span| {
             let primary_location = primary_location(config, workspace_root, primary_span, snap);
-
-            let mut message = message.clone();
-            if needs_primary_span_label {
-                if let Some(primary_span_label) = &primary_span.label {
-                    format_to!(message, "\n{}", primary_span_label);
+            let message = {
+                let mut message = message.clone();
+                if needs_primary_span_label {
+                    if let Some(primary_span_label) = &primary_span.label {
+                        format_to!(message, "\n{}", primary_span_label);
+                    }
                 }
-            }
-
+                message
+            };
             // Each primary diagnostic span may result in multiple LSP diagnostics.
             let mut diagnostics = Vec::new();
 
@@ -395,16 +408,16 @@ pub(crate) fn map_rust_diagnostic_to_lsp(
                 related_info_macro_calls.push(lsp_types::DiagnosticRelatedInformation {
                     location: secondary_location.clone(),
                     message: if is_in_macro_call {
-                        "Error originated from macro call here".to_string()
+                        "Error originated from macro call here".to_owned()
                     } else {
-                        "Actual error occurred here".to_string()
+                        "Actual error occurred here".to_owned()
                     },
                 });
                 // For the additional in-macro diagnostic we add the inverse message pointing to the error location in code.
                 let information_for_additional_diagnostic =
                     vec![lsp_types::DiagnosticRelatedInformation {
                         location: primary_location.clone(),
-                        message: "Exact error occurred here".to_string(),
+                        message: "Exact error occurred here".to_owned(),
                     }];
 
                 let diagnostic = lsp_types::Diagnostic {
@@ -417,7 +430,7 @@ pub(crate) fn map_rust_diagnostic_to_lsp(
                     message: message.clone(),
                     related_information: Some(information_for_additional_diagnostic),
                     tags: if tags.is_empty() { None } else { Some(tags.clone()) },
-                    data: None,
+                    data: Some(serde_json::json!({ "rendered": rd.rendered })),
                 };
                 diagnostics.push(MappedRustDiagnostic {
                     url: secondary_location.uri,
@@ -449,7 +462,7 @@ pub(crate) fn map_rust_diagnostic_to_lsp(
                         }
                     },
                     tags: if tags.is_empty() { None } else { Some(tags.clone()) },
-                    data: None,
+                    data: Some(serde_json::json!({ "rendered": rd.rendered })),
                 },
                 fix: None,
             });
@@ -459,7 +472,7 @@ pub(crate) fn map_rust_diagnostic_to_lsp(
             // `related_information`, which just produces hard-to-read links, at least in VS Code.
             let back_ref = lsp_types::DiagnosticRelatedInformation {
                 location: primary_location,
-                message: "original diagnostic".to_string(),
+                message: "original diagnostic".to_owned(),
             };
             for sub in &subdiagnostics {
                 diagnostics.push(MappedRustDiagnostic {
@@ -487,12 +500,12 @@ pub(crate) fn map_rust_diagnostic_to_lsp(
 fn rustc_code_description(code: Option<&str>) -> Option<lsp_types::CodeDescription> {
     code.filter(|code| {
         let mut chars = code.chars();
-        chars.next().map_or(false, |c| c == 'E')
+        chars.next() == Some('E')
             && chars.by_ref().take(4).all(|c| c.is_ascii_digit())
             && chars.next().is_none()
     })
     .and_then(|code| {
-        lsp_types::Url::parse(&format!("https://doc.rust-lang.org/error-index.html#{}", code))
+        lsp_types::Url::parse(&format!("https://doc.rust-lang.org/error-index.html#{code}"))
             .ok()
             .map(|href| lsp_types::CodeDescription { href })
     })
@@ -501,8 +514,7 @@ fn rustc_code_description(code: Option<&str>) -> Option<lsp_types::CodeDescripti
 fn clippy_code_description(code: Option<&str>) -> Option<lsp_types::CodeDescription> {
     code.and_then(|code| {
         lsp_types::Url::parse(&format!(
-            "https://rust-lang.github.io/rust-clippy/master/index.html#{}",
-            code
+            "https://rust-lang.github.io/rust-clippy/master/index.html#{code}"
         ))
         .ok()
         .map(|href| lsp_types::CodeDescription { href })
@@ -512,29 +524,35 @@ fn clippy_code_description(code: Option<&str>) -> Option<lsp_types::CodeDescript
 #[cfg(test)]
 #[cfg(not(windows))]
 mod tests {
-    use std::path::Path;
-
     use crate::{config::Config, global_state::GlobalState};
 
     use super::*;
 
     use expect_test::{expect_file, ExpectFile};
     use lsp_types::ClientCapabilities;
+    use paths::Utf8Path;
 
     fn check(diagnostics_json: &str, expect: ExpectFile) {
         check_with_config(DiagnosticsMapConfig::default(), diagnostics_json, expect)
     }
 
     fn check_with_config(config: DiagnosticsMapConfig, diagnostics_json: &str, expect: ExpectFile) {
-        let diagnostic: flycheck::Diagnostic = serde_json::from_str(diagnostics_json).unwrap();
-        let workspace_root: &AbsPath = Path::new("/test/").try_into().unwrap();
+        let diagnostic: crate::flycheck::Diagnostic =
+            serde_json::from_str(diagnostics_json).unwrap();
+        let workspace_root: &AbsPath = Utf8Path::new("/test/").try_into().unwrap();
         let (sender, _) = crossbeam_channel::unbounded();
         let state = GlobalState::new(
             sender,
-            Config::new(workspace_root.to_path_buf(), ClientCapabilities::default()),
+            Config::new(
+                workspace_root.to_path_buf(),
+                ClientCapabilities::default(),
+                Vec::new(),
+                None,
+            ),
         );
         let snap = state.snapshot();
-        let actual = map_rust_diagnostic_to_lsp(&config, &diagnostic, workspace_root, &snap);
+        let mut actual = map_rust_diagnostic_to_lsp(&config, &diagnostic, workspace_root, &snap);
+        actual.iter_mut().for_each(|diag| diag.diagnostic.data = None);
         expect.assert_debug_eq(&actual)
     }
 
@@ -672,7 +690,7 @@ mod tests {
     fn rustc_unused_variable_as_info() {
         check_with_config(
             DiagnosticsMapConfig {
-                warnings_as_info: vec!["unused_variables".to_string()],
+                warnings_as_info: vec!["unused_variables".to_owned()],
                 ..DiagnosticsMapConfig::default()
             },
             r##"{
@@ -756,7 +774,7 @@ mod tests {
     fn rustc_unused_variable_as_hint() {
         check_with_config(
             DiagnosticsMapConfig {
-                warnings_as_hint: vec!["unused_variables".to_string()],
+                warnings_as_hint: vec!["unused_variables".to_owned()],
                 ..DiagnosticsMapConfig::default()
             },
             r##"{

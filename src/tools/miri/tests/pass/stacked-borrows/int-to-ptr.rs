@@ -1,5 +1,4 @@
 //@compile-flags: -Zmiri-permissive-provenance
-#![feature(strict_provenance)]
 use std::ptr;
 
 // Just to make sure that casting a ref to raw, to int and back to raw
@@ -17,29 +16,29 @@ fn example(variant: bool) {
     unsafe {
         fn not_so_innocent(x: &mut u32) -> usize {
             let x_raw4 = x as *mut u32;
-            x_raw4.expose_addr()
+            x_raw4.expose_provenance()
         }
 
         let mut c = 42u32;
 
         let x_unique1 = &mut c;
-        // [..., Unique(1)]
+        // stack: [..., Unique(1)]
 
         let x_raw2 = x_unique1 as *mut u32;
-        let x_raw2_addr = x_raw2.expose_addr();
-        // [..., Unique(1), SharedRW(2)]
+        let x_raw2_addr = x_raw2.expose_provenance();
+        // stack: [..., Unique(1), SharedRW(2)]
 
         let x_unique3 = &mut *x_raw2;
-        // [.., Unique(1), SharedRW(2), Unique(3)]
+        // stack: [.., Unique(1), SharedRW(2), Unique(3)]
 
         assert_eq!(not_so_innocent(x_unique3), x_raw2_addr);
-        // [.., Unique(1), SharedRW(2), Unique(3), ..., SharedRW(4)]
+        // stack: [.., Unique(1), SharedRW(2), Unique(3), ..., SharedRW(4)]
 
         // Do an int2ptr cast. This can pick tag 2 or 4 (the two previously exposed tags).
         // 4 is the "obvious" choice (topmost tag, what we used to do with untagged pointers).
         // And indeed if `variant == true` it is the only possible choice.
         // But if `variant == false` then 2 is the only possible choice!
-        let x_wildcard = ptr::from_exposed_addr_mut::<i32>(x_raw2_addr);
+        let x_wildcard = ptr::with_exposed_provenance_mut::<i32>(x_raw2_addr);
 
         if variant {
             // If we picked 2, this will invalidate 3.

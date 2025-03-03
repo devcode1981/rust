@@ -1,7 +1,7 @@
 //! Tools to work with expressions present in format string literals for the `format_args!` family of macros.
 //! Primarily meant for assists and completions.
 
-/// Enum for represenging extraced format string args.
+/// Enum for representing extracted format string args.
 /// Can either be extracted expressions (which includes identifiers),
 /// or placeholders `{}`.
 #[derive(Debug, PartialEq, Eq)]
@@ -11,15 +11,12 @@ pub enum Arg {
     Expr(String),
 }
 
-/**
- Add placeholders like `$1` and `$2` in place of [`Arg::Placeholder`],
- and unwraps the [`Arg::Ident`] and [`Arg::Expr`] enums.
- ```rust
- # use ide_db::syntax_helpers::format_string_exprs::*;
- assert_eq!(with_placeholders(vec![Arg::Ident("ident".to_owned()), Arg::Placeholder, Arg::Expr("expr + 2".to_owned())]), vec!["ident".to_owned(), "$1".to_owned(), "expr + 2".to_owned()])
- ```
-*/
-
+/// Add placeholders like `$1` and `$2` in place of [`Arg::Placeholder`],
+/// and unwraps the [`Arg::Ident`] and [`Arg::Expr`] enums.
+/// ```rust
+/// # use ide_db::syntax_helpers::format_string_exprs::*;
+/// assert_eq!(with_placeholders(vec![Arg::Ident("ident".to_owned()), Arg::Placeholder, Arg::Expr("expr + 2".to_owned())]), vec!["ident".to_owned(), "$1".to_owned(), "expr + 2".to_owned()])
+/// ```
 pub fn with_placeholders(args: Vec<Arg>) -> Vec<String> {
     let mut placeholder_id = 1;
     args.into_iter()
@@ -34,18 +31,16 @@ pub fn with_placeholders(args: Vec<Arg>) -> Vec<String> {
         .collect()
 }
 
-/**
- Parser for a format-like string. It is more allowing in terms of string contents,
- as we expect variable placeholders to be filled with expressions.
-
- Built for completions and assists, and escapes `\` and `$` in output.
- (See the comments on `get_receiver_text()` for detail.)
- Splits a format string that may contain expressions
- like
- ```rust
- assert_eq!(parse("{ident} {} {expr + 42} ").unwrap(), ("{} {} {}", vec![Arg::Ident("ident"), Arg::Placeholder, Arg::Expr("expr + 42")]));
- ```
-*/
+// FIXME Remove this, we have this information in the HIR now
+/// Parser for a format-like string. It is more allowing in terms of string contents,
+/// as we expect variable placeholders to be filled with expressions.
+///
+/// Splits a format string that may contain expressions
+/// like
+/// ```rust
+/// # use ide_db::syntax_helpers::format_string_exprs::*;
+/// assert_eq!(parse_format_exprs("{ident} {} {expr + 42} ").unwrap(), ("{ident} {} {} ".to_owned(), vec![Arg::Placeholder, Arg::Expr("expr + 42".to_owned())]));
+/// ```
 pub fn parse_format_exprs(input: &str) -> Result<(String, Vec<Arg>), ()> {
     #[derive(Debug, Clone, Copy, PartialEq)]
     enum State {
@@ -79,9 +74,6 @@ pub fn parse_format_exprs(input: &str) -> Result<(String, Vec<Arg>), ()> {
                 state = State::MaybeIncorrect;
             }
             (State::NotArg, _) => {
-                if matches!(chr, '\\' | '$') {
-                    output.push('\\');
-                }
                 output.push(chr);
             }
             (State::MaybeIncorrect, '}') => {
@@ -104,10 +96,12 @@ pub fn parse_format_exprs(input: &str) -> Result<(String, Vec<Arg>), ()> {
                 extracted_expressions.push(Arg::Placeholder);
                 state = State::NotArg;
             }
+            (State::MaybeArg, ':') => {
+                output.push(chr);
+                extracted_expressions.push(Arg::Placeholder);
+                state = State::FormatOpts;
+            }
             (State::MaybeArg, _) => {
-                if matches!(chr, '\\' | '$') {
-                    current_expr.push('\\');
-                }
                 current_expr.push(chr);
 
                 // While Rust uses the unicode sets of XID_start and XID_continue for Identifiers
@@ -118,44 +112,41 @@ pub fn parse_format_exprs(input: &str) -> Result<(String, Vec<Arg>), ()> {
                     state = State::Expr;
                 }
             }
-            (State::Ident | State::Expr, '}') => {
-                if inexpr_open_count == 0 {
-                    output.push(chr);
-
-                    if matches!(state, State::Expr) {
-                        extracted_expressions.push(Arg::Expr(current_expr.trim().into()));
-                    } else {
-                        extracted_expressions.push(Arg::Ident(current_expr.trim().into()));
-                    }
-
-                    current_expr = String::new();
-                    state = State::NotArg;
-                } else {
-                    // We're closing one brace met before inside of the expression.
-                    current_expr.push(chr);
-                    inexpr_open_count -= 1;
-                }
-            }
             (State::Ident | State::Expr, ':') if matches!(chars.peek(), Some(':')) => {
                 // path separator
                 state = State::Expr;
                 current_expr.push_str("::");
                 chars.next();
             }
-            (State::Ident | State::Expr, ':') => {
+            (State::Ident | State::Expr, ':' | '}') => {
                 if inexpr_open_count == 0 {
-                    // We're outside of braces, thus assume that it's a specifier, like "{Some(value):?}"
-                    output.push(chr);
+                    let trimmed = current_expr.trim();
 
-                    if matches!(state, State::Expr) {
-                        extracted_expressions.push(Arg::Expr(current_expr.trim().into()));
-                    } else {
-                        extracted_expressions.push(Arg::Ident(current_expr.trim().into()));
+                    // if the expression consists of a single number, like "0" or "12", it can refer to
+                    // format args in the order they are specified.
+                    // see: https://doc.rust-lang.org/std/fmt/#positional-parameters
+                    if trimmed.chars().fold(true, |only_num, c| c.is_ascii_digit() && only_num) {
+                        output.push_str(trimmed);
+                    } else if matches!(state, State::Expr) {
+                        extracted_expressions.push(Arg::Expr(trimmed.into()));
+                    } else if matches!(state, State::Ident) {
+                        output.push_str(trimmed);
                     }
 
-                    current_expr = String::new();
-                    state = State::FormatOpts;
-                } else {
+                    output.push(chr);
+                    current_expr.clear();
+                    state = if chr == ':' {
+                        State::FormatOpts
+                    } else if chr == '}' {
+                        State::NotArg
+                    } else {
+                        unreachable!()
+                    };
+                } else if chr == '}' {
+                    // We're closing one brace met before inside of the expression.
+                    current_expr.push(chr);
+                    inexpr_open_count -= 1;
+                } else if chr == ':' {
                     // We're inside of braced expression, assume that it's a struct field name/value delimiter.
                     current_expr.push(chr);
                 }
@@ -170,9 +161,6 @@ pub fn parse_format_exprs(input: &str) -> Result<(String, Vec<Arg>), ()> {
                     state = State::Expr;
                 }
 
-                if matches!(chr, '\\' | '$') {
-                    current_expr.push('\\');
-                }
                 current_expr.push(chr);
             }
             (State::FormatOpts, '}') => {
@@ -180,9 +168,6 @@ pub fn parse_format_exprs(input: &str) -> Result<(String, Vec<Arg>), ()> {
                 state = State::NotArg;
             }
             (State::FormatOpts, _) => {
-                if matches!(chr, '\\' | '$') {
-                    output.push('\\');
-                }
                 output.push(chr);
             }
         }
@@ -201,9 +186,9 @@ mod tests {
     use expect_test::{expect, Expect};
 
     fn check(input: &str, expect: &Expect) {
-        let (output, exprs) = parse_format_exprs(input).unwrap_or(("-".to_string(), vec![]));
+        let (output, exprs) = parse_format_exprs(input).unwrap_or(("-".to_owned(), vec![]));
         let outcome_repr = if !exprs.is_empty() {
-            format!("{}; {}", output, with_placeholders(exprs).join(", "))
+            format!("{output}; {}", with_placeholders(exprs).join(", "))
         } else {
             output
         };
@@ -215,17 +200,21 @@ mod tests {
     fn format_str_parser() {
         let test_vector = &[
             ("no expressions", expect![["no expressions"]]),
-            (r"no expressions with \$0$1", expect![r"no expressions with \\\$0\$1"]),
-            ("{expr} is {2 + 2}", expect![["{} is {}; expr, 2 + 2"]]),
-            ("{expr:?}", expect![["{:?}; expr"]]),
-            ("{expr:1$}", expect![[r"{:1\$}; expr"]]),
-            ("{$0}", expect![[r"{}; \$0"]]),
+            (r"no expressions with \$0$1", expect![r"no expressions with \$0$1"]),
+            ("{expr} is {2 + 2}", expect![["{expr} is {}; 2 + 2"]]),
+            ("{expr:?}", expect![["{expr:?}"]]),
+            ("{expr:1$}", expect![[r"{expr:1$}"]]),
+            ("{:1$}", expect![[r"{:1$}; $1"]]),
+            ("{:>padding$}", expect![[r"{:>padding$}; $1"]]),
+            ("{}, {}, {0}", expect![[r"{}, {}, {0}; $1, $2"]]),
+            ("{}, {}, {0:b}", expect![[r"{}, {}, {0:b}; $1, $2"]]),
+            ("{$0}", expect![[r"{}; $0"]]),
             ("{malformed", expect![["-"]]),
             ("malformed}", expect![["-"]]),
             ("{{correct", expect![["{{correct"]]),
             ("correct}}", expect![["correct}}"]]),
-            ("{correct}}}", expect![["{}}}; correct"]]),
-            ("{correct}}}}}", expect![["{}}}}}; correct"]]),
+            ("{correct}}}", expect![["{correct}}}"]]),
+            ("{correct}}}}}", expect![["{correct}}}}}"]]),
             ("{incorrect}}", expect![["-"]]),
             ("placeholders {} {}", expect![["placeholders {} {}; $1, $2"]]),
             ("mixed {} {2 + 2} {}", expect![["mixed {} {} {}; $1, 2 + 2, $2"]]),
@@ -233,7 +222,7 @@ mod tests {
                 "{SomeStruct { val_a: 0, val_b: 1 }}",
                 expect![["{}; SomeStruct { val_a: 0, val_b: 1 }"]],
             ),
-            ("{expr:?} is {2.32f64:.5}", expect![["{:?} is {:.5}; expr, 2.32f64"]]),
+            ("{expr:?} is {2.32f64:.5}", expect![["{expr:?} is {:.5}; 2.32f64"]]),
             (
                 "{SomeStruct { val_a: 0, val_b: 1 }:?}",
                 expect![["{:?}; SomeStruct { val_a: 0, val_b: 1 }"]],
@@ -256,8 +245,6 @@ mod tests {
                 .unwrap()
                 .1,
             vec![
-                Arg::Ident("_ident".to_owned()),
-                Arg::Ident("r#raw_ident".to_owned()),
                 Arg::Expr("expr.obj".to_owned()),
                 Arg::Expr("name {thing: 42}".to_owned()),
                 Arg::Placeholder

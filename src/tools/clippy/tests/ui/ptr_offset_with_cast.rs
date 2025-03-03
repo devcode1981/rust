@@ -1,5 +1,4 @@
-// run-rustfix
-#![allow(clippy::unnecessary_cast)]
+#![allow(clippy::unnecessary_cast, clippy::useless_vec)]
 
 fn main() {
     let vec = vec![b'a', b'b', b'c'];
@@ -11,10 +10,12 @@ fn main() {
 
     unsafe {
         let _ = ptr.offset(offset_usize as isize);
+        //~^ ptr_offset_with_cast
         let _ = ptr.offset(offset_isize as isize);
         let _ = ptr.offset(offset_u8 as isize);
 
         let _ = ptr.wrapping_offset(offset_usize as isize);
+        //~^ ptr_offset_with_cast
         let _ = ptr.wrapping_offset(offset_isize as isize);
         let _ = ptr.wrapping_offset(offset_u8 as isize);
     }

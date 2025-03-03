@@ -1,20 +1,26 @@
-// run-rustfix
 #![feature(never_type)]
-#![allow(unused_mut, unused_tuple_struct_fields, clippy::redundant_allocation)]
+#![allow(
+    unused_mut,
+    clippy::redundant_allocation,
+    clippy::needless_pass_by_ref_mut,
+    static_mut_refs
+)]
 #![warn(clippy::must_use_candidate)]
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub struct MyAtomic(AtomicBool);
 pub struct MyPure;
 
 #[must_use] pub fn pure(i: u8) -> u8 {
+    //~^ must_use_candidate
     i
 }
 
 impl MyPure {
     #[must_use] pub fn inherent_pure(&self) -> u8 {
+        //~^ must_use_candidate
         0
     }
 }
@@ -46,6 +52,7 @@ pub fn with_callback<F: Fn(u32) -> bool>(f: &F) -> bool {
 }
 
 #[must_use] pub fn with_marker(_d: std::marker::PhantomData<&mut u32>) -> bool {
+    //~^ must_use_candidate
     true
 }
 
@@ -58,6 +65,7 @@ pub fn atomics(b: &AtomicBool) -> bool {
 }
 
 #[must_use] pub fn rcd(_x: Rc<u32>) -> bool {
+    //~^ must_use_candidate
     true
 }
 
@@ -66,6 +74,7 @@ pub fn rcmut(_x: Rc<&mut u32>) -> bool {
 }
 
 #[must_use] pub fn arcd(_x: Arc<u32>) -> bool {
+    //~^ must_use_candidate
     false
 }
 
@@ -84,7 +93,7 @@ pub unsafe fn mutates_static() -> usize {
 }
 
 #[no_mangle]
-pub fn unmangled(i: bool) -> bool {
+pub extern "C" fn unmangled(i: bool) -> bool {
     !i
 }
 

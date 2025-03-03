@@ -1,20 +1,24 @@
-use rustc_index::vec::Idx;
+use std::cmp::Ordering;
+use std::fmt::Debug;
+use std::ops::{Index, Shr};
+
+use rustc_index::Idx;
+use rustc_span::{DUMMY_SP, Span, SpanData};
 use smallvec::SmallVec;
-use std::{cmp::Ordering, fmt::Debug, ops::Index};
+
+use super::data_race::NaReadType;
 
 /// A vector clock index, this is associated with a thread id
 /// but in some cases one vector index may be shared with
-/// multiple thread ids if it safe to do so.
+/// multiple thread ids if it's safe to do so.
 #[derive(Clone, Copy, Debug, PartialOrd, Ord, PartialEq, Eq, Hash)]
-pub struct VectorIdx(u32);
+pub(super) struct VectorIdx(u32);
 
 impl VectorIdx {
     #[inline(always)]
-    pub fn to_u32(self) -> u32 {
+    fn to_u32(self) -> u32 {
         self.0
     }
-
-    pub const MAX_INDEX: VectorIdx = VectorIdx(u32::MAX);
 }
 
 impl Idx for VectorIdx {
@@ -40,9 +44,80 @@ impl From<u32> for VectorIdx {
 /// clock vectors larger than this will be stored on the heap
 const SMALL_VECTOR: usize = 4;
 
-/// The type of the time-stamps recorded in the data-race detector
-/// set to a type of unsigned integer
-pub type VTimestamp = u32;
+/// The time-stamps recorded in the data-race detector consist of both
+/// a 32-bit unsigned integer which is the actual timestamp, and a `Span`
+/// so that diagnostics can report what code was responsible for an operation.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct VTimestamp {
+    /// The lowest bit indicates read type, the rest is the time.
+    /// `1` indicates a retag read, `0` a regular read.
+    time_and_read_type: u32,
+    pub span: Span,
+}
+
+impl VTimestamp {
+    pub const ZERO: VTimestamp = VTimestamp::new(0, NaReadType::Read, DUMMY_SP);
+
+    #[inline]
+    const fn encode_time_and_read_type(time: u32, read_type: NaReadType) -> u32 {
+        let read_type_bit = match read_type {
+            NaReadType::Read => 0,
+            NaReadType::Retag => 1,
+        };
+        // Put the `read_type` in the lowest bit and `time` in the rest
+        read_type_bit | time.checked_mul(2).expect("Vector clock overflow")
+    }
+
+    #[inline]
+    const fn new(time: u32, read_type: NaReadType, span: Span) -> Self {
+        Self { time_and_read_type: Self::encode_time_and_read_type(time, read_type), span }
+    }
+
+    #[inline]
+    fn time(&self) -> u32 {
+        self.time_and_read_type.shr(1)
+    }
+
+    #[inline]
+    fn set_time(&mut self, time: u32) {
+        self.time_and_read_type = Self::encode_time_and_read_type(time, self.read_type());
+    }
+
+    #[inline]
+    pub(super) fn read_type(&self) -> NaReadType {
+        if self.time_and_read_type & 1 == 0 { NaReadType::Read } else { NaReadType::Retag }
+    }
+
+    #[inline]
+    pub(super) fn set_read_type(&mut self, read_type: NaReadType) {
+        self.time_and_read_type = Self::encode_time_and_read_type(self.time(), read_type);
+    }
+
+    #[inline]
+    pub(super) fn span_data(&self) -> SpanData {
+        self.span.data()
+    }
+}
+
+impl PartialEq for VTimestamp {
+    fn eq(&self, other: &Self) -> bool {
+        self.time() == other.time()
+    }
+}
+
+impl Eq for VTimestamp {}
+
+impl PartialOrd for VTimestamp {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for VTimestamp {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.time().cmp(&other.time())
+    }
+}
 
 /// A vector clock for detecting data-races, this is conceptually
 /// a map from a vector index (and thus a thread id) to a timestamp.
@@ -54,32 +129,44 @@ pub type VTimestamp = u32;
 /// also this means that there is only one unique valid length
 /// for each set of vector clock values and hence the PartialEq
 /// and Eq derivations are correct.
+///
+/// This means we cannot represent a clock where the last entry is a timestamp-0 read that occurs
+/// because of a retag. That's fine, all it does is risk wrong diagnostics in a extreme corner case.
 #[derive(PartialEq, Eq, Default, Debug)]
 pub struct VClock(SmallVec<[VTimestamp; SMALL_VECTOR]>);
 
 impl VClock {
     /// Create a new vector-clock containing all zeros except
     /// for a value at the given index
-    pub fn new_with_index(index: VectorIdx, timestamp: VTimestamp) -> VClock {
+    pub(super) fn new_with_index(index: VectorIdx, timestamp: VTimestamp) -> VClock {
+        if timestamp.time() == 0 {
+            return VClock::default();
+        }
         let len = index.index() + 1;
-        let mut vec = smallvec::smallvec![0; len];
+        let mut vec = smallvec::smallvec![VTimestamp::ZERO; len];
         vec[index.index()] = timestamp;
         VClock(vec)
     }
 
     /// Load the internal timestamp slice in the vector clock
     #[inline]
-    pub fn as_slice(&self) -> &[VTimestamp] {
+    pub(super) fn as_slice(&self) -> &[VTimestamp] {
+        debug_assert!(self.0.last().is_none_or(|t| t.time() != 0));
         self.0.as_slice()
     }
 
+    #[inline]
+    pub(super) fn index_mut(&mut self, index: VectorIdx) -> &mut VTimestamp {
+        self.0.as_mut_slice().get_mut(index.to_u32() as usize).unwrap()
+    }
+
     /// Get a mutable slice to the internal vector with minimum `min_len`
-    /// elements, to preserve invariants this vector must modify
+    /// elements. To preserve invariants, the caller must modify
     /// the `min_len`-1 nth element to a non-zero value
     #[inline]
     fn get_mut_with_min_len(&mut self, min_len: usize) -> &mut [VTimestamp] {
         if self.0.len() < min_len {
-            self.0.resize(min_len, 0);
+            self.0.resize(min_len, VTimestamp::ZERO);
         }
         assert!(self.0.len() >= min_len);
         self.0.as_mut_slice()
@@ -88,11 +175,14 @@ impl VClock {
     /// Increment the vector clock at a known index
     /// this will panic if the vector index overflows
     #[inline]
-    pub fn increment_index(&mut self, idx: VectorIdx) {
+    pub(super) fn increment_index(&mut self, idx: VectorIdx, current_span: Span) {
         let idx = idx.index();
         let mut_slice = self.get_mut_with_min_len(idx + 1);
         let idx_ref = &mut mut_slice[idx];
-        *idx_ref = idx_ref.checked_add(1).expect("Vector clock overflow")
+        idx_ref.set_time(idx_ref.time().checked_add(1).expect("Vector clock overflow"));
+        if !current_span.is_dummy() {
+            idx_ref.span = current_span;
+        }
     }
 
     // Join the two vector-clocks together, this
@@ -102,25 +192,42 @@ impl VClock {
         let rhs_slice = other.as_slice();
         let lhs_slice = self.get_mut_with_min_len(rhs_slice.len());
         for (l, &r) in lhs_slice.iter_mut().zip(rhs_slice.iter()) {
+            let l_span = l.span;
+            let r_span = r.span;
             *l = r.max(*l);
+            l.span = l.span.substitute_dummy(r_span).substitute_dummy(l_span);
         }
     }
 
-    /// Set the element at the current index of the vector
-    pub fn set_at_index(&mut self, other: &Self, idx: VectorIdx) {
+    /// Set the element at the current index of the vector. May only increase elements.
+    pub(super) fn set_at_index(&mut self, other: &Self, idx: VectorIdx) {
+        let new_timestamp = other[idx];
+        // Setting to 0 is different, since the last element cannot be 0.
+        if new_timestamp.time() == 0 {
+            if idx.index() >= self.0.len() {
+                // This index does not even exist yet in our clock. Just do nothing.
+                return;
+            }
+            // This changes an existing element. Since it can only increase, that
+            // can never make the last element 0.
+        }
+
         let mut_slice = self.get_mut_with_min_len(idx.index() + 1);
-        mut_slice[idx.index()] = other[idx];
+        let mut_timestamp = &mut mut_slice[idx.index()];
+
+        let prev_span = mut_timestamp.span;
+
+        assert!(*mut_timestamp <= new_timestamp, "set_at_index: may only increase the timestamp");
+        *mut_timestamp = new_timestamp;
+
+        let span = &mut mut_timestamp.span;
+        *span = span.substitute_dummy(prev_span);
     }
 
     /// Set the vector to the all-zero vector
     #[inline]
-    pub fn set_zero_vector(&mut self) {
+    pub(super) fn set_zero_vector(&mut self) {
         self.0.clear();
-    }
-
-    /// Return if this vector is the all-zero vector
-    pub fn is_zero_vector(&self) -> bool {
-        self.0.is_empty()
     }
 }
 
@@ -313,7 +420,7 @@ impl Index<VectorIdx> for VClock {
 
     #[inline]
     fn index(&self, index: VectorIdx) -> &VTimestamp {
-        self.as_slice().get(index.to_u32() as usize).unwrap_or(&0)
+        self.as_slice().get(index.to_u32() as usize).unwrap_or(&VTimestamp::ZERO)
     }
 }
 
@@ -322,22 +429,25 @@ impl Index<VectorIdx> for VClock {
 ///  test suite
 #[cfg(test)]
 mod tests {
+    use std::cmp::Ordering;
+
+    use rustc_span::DUMMY_SP;
 
     use super::{VClock, VTimestamp, VectorIdx};
-    use std::cmp::Ordering;
+    use crate::concurrency::data_race::NaReadType;
 
     #[test]
     fn test_equal() {
         let mut c1 = VClock::default();
         let mut c2 = VClock::default();
         assert_eq!(c1, c2);
-        c1.increment_index(VectorIdx(5));
+        c1.increment_index(VectorIdx(5), DUMMY_SP);
         assert_ne!(c1, c2);
-        c2.increment_index(VectorIdx(53));
+        c2.increment_index(VectorIdx(53), DUMMY_SP);
         assert_ne!(c1, c2);
-        c1.increment_index(VectorIdx(53));
+        c1.increment_index(VectorIdx(53), DUMMY_SP);
         assert_ne!(c1, c2);
-        c2.increment_index(VectorIdx(5));
+        c2.increment_index(VectorIdx(5), DUMMY_SP);
         assert_eq!(c1, c2);
     }
 
@@ -386,85 +496,84 @@ mod tests {
         );
     }
 
-    fn from_slice(mut slice: &[VTimestamp]) -> VClock {
+    fn from_slice(mut slice: &[u32]) -> VClock {
         while let Some(0) = slice.last() {
             slice = &slice[..slice.len() - 1]
         }
-        VClock(smallvec::SmallVec::from_slice(slice))
+        VClock(
+            slice
+                .iter()
+                .copied()
+                .map(|time| VTimestamp::new(time, NaReadType::Read, DUMMY_SP))
+                .collect(),
+        )
     }
 
-    fn assert_order(l: &[VTimestamp], r: &[VTimestamp], o: Option<Ordering>) {
+    fn assert_order(l: &[u32], r: &[u32], o: Option<Ordering>) {
         let l = from_slice(l);
         let r = from_slice(r);
 
         //Test partial_cmp
         let compare = l.partial_cmp(&r);
-        assert_eq!(compare, o, "Invalid comparison\n l: {:?}\n r: {:?}", l, r);
+        assert_eq!(compare, o, "Invalid comparison\n l: {l:?}\n r: {r:?}");
         let alt_compare = r.partial_cmp(&l);
         assert_eq!(
             alt_compare,
             o.map(Ordering::reverse),
-            "Invalid alt comparison\n l: {:?}\n r: {:?}",
-            l,
-            r
+            "Invalid alt comparison\n l: {l:?}\n r: {r:?}"
         );
 
         //Test operators with faster implementations
         assert_eq!(
             matches!(compare, Some(Ordering::Less)),
             l < r,
-            "Invalid (<):\n l: {:?}\n r: {:?}",
-            l,
-            r
+            "Invalid (<):\n l: {l:?}\n r: {r:?}"
         );
         assert_eq!(
             matches!(compare, Some(Ordering::Less) | Some(Ordering::Equal)),
             l <= r,
-            "Invalid (<=):\n l: {:?}\n r: {:?}",
-            l,
-            r
+            "Invalid (<=):\n l: {l:?}\n r: {r:?}"
         );
         assert_eq!(
             matches!(compare, Some(Ordering::Greater)),
             l > r,
-            "Invalid (>):\n l: {:?}\n r: {:?}",
-            l,
-            r
+            "Invalid (>):\n l: {l:?}\n r: {r:?}"
         );
         assert_eq!(
             matches!(compare, Some(Ordering::Greater) | Some(Ordering::Equal)),
             l >= r,
-            "Invalid (>=):\n l: {:?}\n r: {:?}",
-            l,
-            r
+            "Invalid (>=):\n l: {l:?}\n r: {r:?}"
         );
         assert_eq!(
             matches!(alt_compare, Some(Ordering::Less)),
             r < l,
-            "Invalid alt (<):\n l: {:?}\n r: {:?}",
-            l,
-            r
+            "Invalid alt (<):\n l: {l:?}\n r: {r:?}"
         );
         assert_eq!(
             matches!(alt_compare, Some(Ordering::Less) | Some(Ordering::Equal)),
             r <= l,
-            "Invalid alt (<=):\n l: {:?}\n r: {:?}",
-            l,
-            r
+            "Invalid alt (<=):\n l: {l:?}\n r: {r:?}"
         );
         assert_eq!(
             matches!(alt_compare, Some(Ordering::Greater)),
             r > l,
-            "Invalid alt (>):\n l: {:?}\n r: {:?}",
-            l,
-            r
+            "Invalid alt (>):\n l: {l:?}\n r: {r:?}"
         );
         assert_eq!(
             matches!(alt_compare, Some(Ordering::Greater) | Some(Ordering::Equal)),
             r >= l,
-            "Invalid alt (>=):\n l: {:?}\n r: {:?}",
-            l,
-            r
+            "Invalid alt (>=):\n l: {l:?}\n r: {r:?}"
         );
+    }
+
+    #[test]
+    fn set_index_to_0() {
+        let mut clock1 = from_slice(&[0, 1, 2, 3]);
+        let clock2 = from_slice(&[0, 2, 3, 4, 0, 5]);
+        // Naively, this would extend clock1 with a new index and set it to 0, making
+        // the last index 0. Make sure that does not happen.
+        clock1.set_at_index(&clock2, VectorIdx(4));
+        // This must not have made the last element 0.
+        assert!(clock1.0.last().unwrap().time() != 0);
     }
 }

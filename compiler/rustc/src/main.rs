@@ -1,4 +1,7 @@
-#![feature(unix_sigpipe)]
+// We need this feature as it changes `dylib` linking behavior and allows us to link to `rustc_driver`.
+#![feature(rustc_private)]
+// Several crates are depended upon but unused so that they are present in the sysroot
+#![expect(unused_crate_dependencies)]
 
 // A note about jemalloc: rustc uses jemalloc when built for CI and
 // distribution. The obvious way to do this is with the `#[global_allocator]`
@@ -24,13 +27,23 @@
 // The two crates we link to here, `std` and `rustc_driver`, are both dynamic
 // libraries. So we must reference jemalloc symbols one way or another, because
 // this file is the only object code in the rustc executable.
+//
+// NOTE: if you are reading this comment because you want to set a custom `global_allocator` for
+// benchmarking, consider using the benchmarks in the `rustc-perf` collector suite instead:
+// https://github.com/rust-lang/rustc-perf/blob/master/collector/README.md#profiling
+//
+// NOTE: if you are reading this comment because you want to replace jemalloc with another allocator
+// to compare their performance, see
+// https://github.com/rust-lang/rust/commit/b90cfc887c31c3e7a9e6d462e2464db1fe506175#diff-43914724af6e464c1da2171e4a9b6c7e607d5bc1203fa95c0ab85be4122605ef
+// for an example of how to do so.
 
-#[unix_sigpipe = "sig_dfl"]
 fn main() {
     // See the comment at the top of this file for an explanation of this.
-    #[cfg(feature = "jemalloc-sys")]
+    #[cfg(feature = "jemalloc")]
     {
         use std::os::raw::{c_int, c_void};
+
+        use tikv_jemalloc_sys as jemalloc_sys;
 
         #[used]
         static _F1: unsafe extern "C" fn(usize, usize) -> *mut c_void = jemalloc_sys::calloc;
@@ -52,7 +65,7 @@ fn main() {
         // linking, so we need to explicitly depend on the function.
         #[cfg(target_os = "macos")]
         {
-            extern "C" {
+            unsafe extern "C" {
                 fn _rjem_je_zone_register();
             }
 

@@ -1,5 +1,4 @@
-// needs-asm-support
-// run-rustfix
+//@needs-asm-support
 
 #![allow(unused, clippy::needless_pass_by_value, clippy::collapsible_if)]
 #![warn(clippy::map_entry)]
@@ -23,11 +22,13 @@ fn foo() {}
 fn hash_map<K: Eq + Hash + Copy, V: Copy>(m: &mut HashMap<K, V>, m2: &mut HashMap<K, V>, k: K, k2: K, v: V, v2: V) {
     // or_insert(v)
     if !m.contains_key(&k) {
+        //~^ map_entry
         m.insert(k, v);
     }
 
     // semicolon on insert, use or_insert_with(..)
     if !m.contains_key(&k) {
+        //~^ map_entry
         if true {
             m.insert(k, v);
         } else {
@@ -37,6 +38,7 @@ fn hash_map<K: Eq + Hash + Copy, V: Copy>(m: &mut HashMap<K, V>, m2: &mut HashMa
 
     // semicolon on if, use or_insert_with(..)
     if !m.contains_key(&k) {
+        //~^ map_entry
         if true {
             m.insert(k, v)
         } else {
@@ -46,6 +48,7 @@ fn hash_map<K: Eq + Hash + Copy, V: Copy>(m: &mut HashMap<K, V>, m2: &mut HashMa
 
     // early return, use if let
     if !m.contains_key(&k) {
+        //~^ map_entry
         if true {
             m.insert(k, v);
         } else {
@@ -56,12 +59,14 @@ fn hash_map<K: Eq + Hash + Copy, V: Copy>(m: &mut HashMap<K, V>, m2: &mut HashMa
 
     // use or_insert_with(..)
     if !m.contains_key(&k) {
+        //~^ map_entry
         foo();
         m.insert(k, v);
     }
 
     // semicolon on insert and match, use or_insert_with(..)
     if !m.contains_key(&k) {
+        //~^ map_entry
         match 0 {
             1 if true => {
                 m.insert(k, v);
@@ -74,6 +79,7 @@ fn hash_map<K: Eq + Hash + Copy, V: Copy>(m: &mut HashMap<K, V>, m2: &mut HashMa
 
     // one branch doesn't insert, use if let
     if !m.contains_key(&k) {
+        //~^ map_entry
         match 0 {
             0 => foo(),
             _ => {
@@ -84,6 +90,7 @@ fn hash_map<K: Eq + Hash + Copy, V: Copy>(m: &mut HashMap<K, V>, m2: &mut HashMa
 
     // use or_insert_with
     if !m.contains_key(&k) {
+        //~^ map_entry
         foo();
         match 0 {
             0 if false => {
@@ -118,6 +125,7 @@ fn hash_map<K: Eq + Hash + Copy, V: Copy>(m: &mut HashMap<K, V>, m2: &mut HashMa
 
     // macro_expansion test, use or_insert(..)
     if !m.contains_key(&m!(k)) {
+        //~^ map_entry
         m.insert(m!(k), m!(v));
     }
 
@@ -150,9 +158,77 @@ fn hash_map<K: Eq + Hash + Copy, V: Copy>(m: &mut HashMap<K, V>, m2: &mut HashMa
 
     // or_insert_with. Partial move of a local declared in the closure is ok.
     if !m.contains_key(&k) {
+        //~^ map_entry
         let x = (String::new(), String::new());
         let _ = x.0;
         m.insert(k, v);
+    }
+}
+
+// Issue 10331
+// do not suggest a bad expansion because the compiler unrolls the first
+// occurrence of the loop
+pub fn issue_10331() {
+    let mut m = HashMap::new();
+    let mut i = 0;
+    let mut x = 0;
+    while !m.contains_key(&x) {
+        m.insert(x, i);
+        i += 1;
+        x += 1;
+    }
+}
+
+/// Issue 11935
+/// Do not suggest using entries if the map is used inside the `insert` expression.
+pub fn issue_11935() {
+    let mut counts: HashMap<u64, u64> = HashMap::new();
+    if !counts.contains_key(&1) {
+        counts.insert(1, 1);
+    } else {
+        counts.insert(1, counts.get(&1).unwrap() + 1);
+    }
+}
+
+fn issue12489(map: &mut HashMap<u64, u64>) -> Option<()> {
+    if !map.contains_key(&1) {
+        //~^ map_entry
+        let Some(1) = Some(2) else {
+            return None;
+        };
+        map.insert(1, 42);
+    }
+    Some(())
+}
+
+mod issue13934 {
+    use std::collections::HashMap;
+
+    struct Member {}
+
+    pub struct Foo {
+        members: HashMap<u8, Member>,
+    }
+
+    impl Foo {
+        pub fn should_also_not_cause_lint(&mut self, input: u8) {
+            if self.members.contains_key(&input) {
+                todo!();
+            } else {
+                self.other();
+                self.members.insert(input, Member {});
+            }
+        }
+
+        fn other(&self) {}
+    }
+}
+
+fn issue11976() {
+    let mut hashmap = std::collections::HashMap::new();
+    if !hashmap.contains_key(&0) {
+        let _ = || hashmap.get(&0);
+        hashmap.insert(0, 0);
     }
 }
 

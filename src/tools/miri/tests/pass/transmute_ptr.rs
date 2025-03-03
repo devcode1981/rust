@@ -1,4 +1,5 @@
-#![feature(strict_provenance)]
+//@revisions: stack tree
+//@[tree]compile-flags: -Zmiri-tree-borrows
 use std::{mem, ptr};
 
 fn t1() {

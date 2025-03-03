@@ -2,7 +2,7 @@
 #![warn(clippy::clone_on_ref_ptr)]
 #![allow(unused)]
 #![allow(clippy::redundant_clone, clippy::uninlined_format_args, clippy::unnecessary_wraps)]
-
+//@no-rustfix
 use std::cell::RefCell;
 use std::rc::{self, Rc};
 use std::sync::{self, Arc};
@@ -21,33 +21,36 @@ fn clone_on_ref_ptr() {
     let arc_weak = Arc::downgrade(&arc);
 
     rc.clone();
+    //~^ clone_on_ref_ptr
+
     Rc::clone(&rc);
 
     arc.clone();
+    //~^ clone_on_ref_ptr
+
     Arc::clone(&arc);
 
     rcweak.clone();
+    //~^ clone_on_ref_ptr
+
     rc::Weak::clone(&rcweak);
 
     arc_weak.clone();
+    //~^ clone_on_ref_ptr
+
     sync::Weak::clone(&arc_weak);
 
     let x = Arc::new(SomeImpl);
     let _: Arc<dyn SomeTrait> = x.clone();
+    //~^ clone_on_ref_ptr
 }
 
 fn clone_on_copy_generic<T: Copy>(t: T) {
     t.clone();
+    //~^ clone_on_copy
 
     Some(t).clone();
-}
-
-fn clone_on_double_ref() {
-    let x = vec![1];
-    let y = &&x;
-    let z: &Vec<_> = y.clone();
-
-    println!("{:p} {:p}", *y, z);
+    //~^ clone_on_copy
 }
 
 mod many_derefs {
@@ -82,12 +85,9 @@ mod many_derefs {
     fn go1() {
         let a = A;
         let _: E = a.clone();
-        let _: E = *****a;
-    }
+        //~^ clone_on_copy
 
-    fn check(mut encoded: &[u8]) {
-        let _ = &mut encoded.clone();
-        let _ = &encoded.clone();
+        let _: E = *****a;
     }
 }
 
@@ -106,5 +106,6 @@ mod issue2076 {
     fn func() -> Option<Rc<u8>> {
         let rc = Rc::new(42);
         Some(try_opt!(Some(rc)).clone())
+        //~^ clone_on_ref_ptr
     }
 }

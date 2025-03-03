@@ -14,12 +14,16 @@ fn main() {
     // lint here
     let redun_closure = || 1;
     i = redun_closure();
+    //~^ redundant_closure_call
 
     // shadowed closures are supported, lint here
     let shadowed_closure = || 1;
     i = shadowed_closure();
+    //~^ redundant_closure_call
+
     let shadowed_closure = || 2;
     i = shadowed_closure();
+    //~^ redundant_closure_call
 
     // don't lint here
     let shadowed_closure = || 2;

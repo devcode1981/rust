@@ -1,14 +1,13 @@
-//! lint when there is a large size difference between variants on an enum
-
+use clippy_config::Conf;
+use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::source::snippet_with_applicability;
-use clippy_utils::{diagnostics::span_lint_and_then, ty::approx_ty_size, ty::is_copy};
+use clippy_utils::ty::{AdtVariantInfo, approx_ty_size, is_copy};
 use rustc_errors::Applicability;
 use rustc_hir::{Item, ItemKind};
 use rustc_lint::{LateContext, LateLintPass};
-use rustc_middle::lint::in_external_macro;
-use rustc_middle::ty::{Adt, AdtDef, GenericArg, List, Ty};
-use rustc_session::{declare_tool_lint, impl_lint_pass};
-use rustc_span::source_map::Span;
+use rustc_middle::ty::{self, Ty};
+use rustc_session::impl_lint_pass;
+use rustc_span::Span;
 
 declare_clippy_lint! {
     /// ### What it does
@@ -37,7 +36,7 @@ declare_clippy_lint! {
     /// this may lead to a false positive.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// enum Test {
     ///     A(i32),
     ///     B([i32; 8000]),
@@ -45,7 +44,7 @@ declare_clippy_lint! {
     /// ```
     ///
     /// Use instead:
-    /// ```rust
+    /// ```no_run
     /// // Possibly better
     /// enum Test2 {
     ///     A(i32),
@@ -58,79 +57,29 @@ declare_clippy_lint! {
     "large size difference between variants on an enum"
 }
 
-#[derive(Copy, Clone)]
 pub struct LargeEnumVariant {
     maximum_size_difference_allowed: u64,
 }
 
 impl LargeEnumVariant {
-    #[must_use]
-    pub fn new(maximum_size_difference_allowed: u64) -> Self {
+    pub fn new(conf: &'static Conf) -> Self {
         Self {
-            maximum_size_difference_allowed,
+            maximum_size_difference_allowed: conf.enum_variant_size_threshold,
         }
     }
-}
-
-struct FieldInfo {
-    ind: usize,
-    size: u64,
-}
-
-struct VariantInfo {
-    ind: usize,
-    size: u64,
-    fields_size: Vec<FieldInfo>,
-}
-
-fn variants_size<'tcx>(
-    cx: &LateContext<'tcx>,
-    adt: AdtDef<'tcx>,
-    subst: &'tcx List<GenericArg<'tcx>>,
-) -> Vec<VariantInfo> {
-    let mut variants_size = adt
-        .variants()
-        .iter()
-        .enumerate()
-        .map(|(i, variant)| {
-            let mut fields_size = variant
-                .fields
-                .iter()
-                .enumerate()
-                .map(|(i, f)| FieldInfo {
-                    ind: i,
-                    size: approx_ty_size(cx, f.ty(cx.tcx, subst)),
-                })
-                .collect::<Vec<_>>();
-            fields_size.sort_by(|a, b| (a.size.cmp(&b.size)));
-
-            VariantInfo {
-                ind: i,
-                size: fields_size.iter().map(|info| info.size).sum(),
-                fields_size,
-            }
-        })
-        .collect::<Vec<_>>();
-    variants_size.sort_by(|a, b| (b.size.cmp(&a.size)));
-    variants_size
 }
 
 impl_lint_pass!(LargeEnumVariant => [LARGE_ENUM_VARIANT]);
 
 impl<'tcx> LateLintPass<'tcx> for LargeEnumVariant {
     fn check_item(&mut self, cx: &LateContext<'tcx>, item: &Item<'tcx>) {
-        if in_external_macro(cx.tcx.sess, item.span) {
-            return;
-        }
-        if let ItemKind::Enum(ref def, _) = item.kind {
-            let ty = cx.tcx.type_of(item.def_id);
-            let Adt(adt, subst) = ty.kind() else {
-                panic!("already checked whether this is an enum")
-            };
-            if adt.variants().len() <= 1 {
-                return;
-            }
-            let variants_size = variants_size(cx, *adt, subst);
+        if let ItemKind::Enum(ref def, _) = item.kind
+            && let ty = cx.tcx.type_of(item.owner_id).instantiate_identity()
+            && let ty::Adt(adt, subst) = ty.kind()
+            && adt.variants().len() > 1
+            && !item.span.in_external_macro(cx.tcx.sess.source_map())
+        {
+            let variants_size = AdtVariantInfo::new(cx, *adt, subst);
 
             let mut difference = variants_size[0].size - variants_size[1].size;
             if difference > self.maximum_size_difference_allowed {
@@ -151,7 +100,7 @@ impl<'tcx> LateLintPass<'tcx> for LargeEnumVariant {
                         );
                         diag.span_label(
                             def.variants[variants_size[1].ind].span,
-                            &if variants_size[1].fields_size.is_empty() {
+                            if variants_size[1].fields_size.is_empty() {
                                 "the second-largest variant carries no data at all".to_owned()
                             } else {
                                 format!(
@@ -173,16 +122,16 @@ impl<'tcx> LateLintPass<'tcx> for LargeEnumVariant {
                                 .fields_size
                                 .iter()
                                 .rev()
-                                .map_while(|val| {
+                                .map_while(|&(ind, size)| {
                                     if difference > self.maximum_size_difference_allowed {
-                                        difference = difference.saturating_sub(val.size);
+                                        difference = difference.saturating_sub(size);
                                         Some((
-                                            fields[val.ind].ty.span,
+                                            fields[ind].ty.span,
                                             format!(
                                                 "Box<{}>",
                                                 snippet_with_applicability(
                                                     cx,
-                                                    fields[val.ind].ty.span,
+                                                    fields[ind].ty.span,
                                                     "..",
                                                     &mut applicability
                                                 )
@@ -209,8 +158,8 @@ impl<'tcx> LateLintPass<'tcx> for LargeEnumVariant {
 }
 
 fn maybe_copy<'tcx>(cx: &LateContext<'tcx>, ty: Ty<'tcx>) -> bool {
-    if let Adt(_def, substs) = ty.kind()
-        && substs.types().next().is_some()
+    if let ty::Adt(_def, args) = ty.kind()
+        && args.types().next().is_some()
         && let Some(copy_trait) = cx.tcx.lang_items().copy_trait()
     {
         return cx.tcx.non_blanket_impls_for_ty(copy_trait, ty).next().is_some();

@@ -5,6 +5,7 @@ fn main() {
 
     // applicable here
     v.resize(0, 5);
+    //~^ vec_resize_to_zero
 
     // not applicable
     v.resize(2, 5);
