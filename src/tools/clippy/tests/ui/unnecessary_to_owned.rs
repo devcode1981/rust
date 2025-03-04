@@ -1,8 +1,12 @@
-// run-rustfix
-
-#![allow(clippy::needless_borrow, clippy::ptr_arg)]
-#![warn(clippy::unnecessary_to_owned)]
-#![feature(custom_inner_attributes)]
+#![allow(
+    clippy::needless_borrow,
+    clippy::needless_borrows_for_generic_args,
+    clippy::ptr_arg,
+    clippy::manual_async_fn,
+    clippy::needless_lifetimes,
+    clippy::owned_cow
+)]
+#![warn(clippy::unnecessary_to_owned, clippy::redundant_clone)]
 
 use std::borrow::Cow;
 use std::ffi::{CStr, CString, OsStr, OsString};
@@ -24,6 +28,7 @@ impl AsRef<str> for X {
     }
 }
 
+#[allow(clippy::to_string_trait_impl)]
 impl ToString for X {
     fn to_string(&self) -> String {
         self.0.to_string()
@@ -58,82 +63,151 @@ fn main() {
     let x_ref = &x;
 
     require_c_str(&Cow::from(c_str).into_owned());
+    //~^ unnecessary_to_owned
     require_c_str(&c_str.to_owned());
+    //~^ unnecessary_to_owned
 
     require_os_str(&os_str.to_os_string());
+    //~^ unnecessary_to_owned
     require_os_str(&Cow::from(os_str).into_owned());
+    //~^ unnecessary_to_owned
     require_os_str(&os_str.to_owned());
+    //~^ unnecessary_to_owned
 
     require_path(&path.to_path_buf());
+    //~^ unnecessary_to_owned
     require_path(&Cow::from(path).into_owned());
+    //~^ unnecessary_to_owned
     require_path(&path.to_owned());
+    //~^ unnecessary_to_owned
 
     require_str(&s.to_string());
+    //~^ unnecessary_to_owned
     require_str(&Cow::from(s).into_owned());
+    //~^ unnecessary_to_owned
     require_str(&s.to_owned());
+    //~^ unnecessary_to_owned
     require_str(&x_ref.to_string());
+    //~^ unnecessary_to_owned
 
     require_slice(&slice.to_vec());
+    //~^ unnecessary_to_owned
     require_slice(&Cow::from(slice).into_owned());
+    //~^ unnecessary_to_owned
     require_slice(&array.to_owned());
+    //~^ unnecessary_to_owned
     require_slice(&array_ref.to_owned());
+    //~^ unnecessary_to_owned
     require_slice(&slice.to_owned());
+    //~^ unnecessary_to_owned
     require_slice(&x_ref.to_owned()); // No longer flagged because of #8759.
 
     require_x(&Cow::<X>::Owned(x.clone()).into_owned());
+    //~^ unnecessary_to_owned
     require_x(&x_ref.to_owned()); // No longer flagged because of #8759.
 
     require_deref_c_str(c_str.to_owned());
+    //~^ unnecessary_to_owned
     require_deref_os_str(os_str.to_owned());
+    //~^ unnecessary_to_owned
     require_deref_path(path.to_owned());
+    //~^ unnecessary_to_owned
     require_deref_str(s.to_owned());
+    //~^ unnecessary_to_owned
     require_deref_slice(slice.to_owned());
+    //~^ unnecessary_to_owned
 
     require_impl_deref_c_str(c_str.to_owned());
+    //~^ unnecessary_to_owned
     require_impl_deref_os_str(os_str.to_owned());
+    //~^ unnecessary_to_owned
     require_impl_deref_path(path.to_owned());
+    //~^ unnecessary_to_owned
     require_impl_deref_str(s.to_owned());
+    //~^ unnecessary_to_owned
     require_impl_deref_slice(slice.to_owned());
+    //~^ unnecessary_to_owned
 
     require_deref_str_slice(s.to_owned(), slice.to_owned());
+    //~^ unnecessary_to_owned
+    //~| unnecessary_to_owned
     require_deref_slice_str(slice.to_owned(), s.to_owned());
+    //~^ unnecessary_to_owned
+    //~| unnecessary_to_owned
 
     require_as_ref_c_str(c_str.to_owned());
+    //~^ unnecessary_to_owned
     require_as_ref_os_str(os_str.to_owned());
+    //~^ unnecessary_to_owned
     require_as_ref_path(path.to_owned());
+    //~^ unnecessary_to_owned
     require_as_ref_str(s.to_owned());
+    //~^ unnecessary_to_owned
     require_as_ref_str(x.to_owned());
+    //~^ unnecessary_to_owned
     require_as_ref_slice(array.to_owned());
+    //~^ unnecessary_to_owned
     require_as_ref_slice(array_ref.to_owned());
+    //~^ unnecessary_to_owned
     require_as_ref_slice(slice.to_owned());
+    //~^ unnecessary_to_owned
 
     require_impl_as_ref_c_str(c_str.to_owned());
+    //~^ unnecessary_to_owned
     require_impl_as_ref_os_str(os_str.to_owned());
+    //~^ unnecessary_to_owned
     require_impl_as_ref_path(path.to_owned());
+    //~^ unnecessary_to_owned
     require_impl_as_ref_str(s.to_owned());
+    //~^ unnecessary_to_owned
     require_impl_as_ref_str(x.to_owned());
+    //~^ unnecessary_to_owned
     require_impl_as_ref_slice(array.to_owned());
+    //~^ unnecessary_to_owned
     require_impl_as_ref_slice(array_ref.to_owned());
+    //~^ unnecessary_to_owned
     require_impl_as_ref_slice(slice.to_owned());
+    //~^ unnecessary_to_owned
 
     require_as_ref_str_slice(s.to_owned(), array.to_owned());
+    //~^ unnecessary_to_owned
+    //~| unnecessary_to_owned
     require_as_ref_str_slice(s.to_owned(), array_ref.to_owned());
+    //~^ unnecessary_to_owned
+    //~| unnecessary_to_owned
     require_as_ref_str_slice(s.to_owned(), slice.to_owned());
+    //~^ unnecessary_to_owned
+    //~| unnecessary_to_owned
     require_as_ref_slice_str(array.to_owned(), s.to_owned());
+    //~^ unnecessary_to_owned
+    //~| unnecessary_to_owned
     require_as_ref_slice_str(array_ref.to_owned(), s.to_owned());
+    //~^ unnecessary_to_owned
+    //~| unnecessary_to_owned
     require_as_ref_slice_str(slice.to_owned(), s.to_owned());
+    //~^ unnecessary_to_owned
+    //~| unnecessary_to_owned
 
     let _ = x.join(&x_ref.to_string());
+    //~^ unnecessary_to_owned
 
     let _ = slice.to_vec().into_iter();
+    //~^ unnecessary_to_owned
     let _ = slice.to_owned().into_iter();
+    //~^ unnecessary_to_owned
     let _ = [std::path::PathBuf::new()][..].to_vec().into_iter();
+    //~^ unnecessary_to_owned
     let _ = [std::path::PathBuf::new()][..].to_owned().into_iter();
+    //~^ unnecessary_to_owned
 
     let _ = IntoIterator::into_iter(slice.to_vec());
+    //~^ unnecessary_to_owned
     let _ = IntoIterator::into_iter(slice.to_owned());
+    //~^ unnecessary_to_owned
     let _ = IntoIterator::into_iter([std::path::PathBuf::new()][..].to_vec());
+    //~^ unnecessary_to_owned
     let _ = IntoIterator::into_iter([std::path::PathBuf::new()][..].to_owned());
+    //~^ unnecessary_to_owned
 
     let _ = check_files(&[FileType::Account]);
 
@@ -149,10 +223,37 @@ fn main() {
 
     // The following should be flagged by `redundant_clone`, but not by this lint.
     require_c_str(&CString::from_vec_with_nul(vec![0]).unwrap().to_owned());
+    //~^ redundant_clone
     require_os_str(&OsString::from("x").to_os_string());
+    //~^ redundant_clone
     require_path(&std::path::PathBuf::from("x").to_path_buf());
+    //~^ redundant_clone
     require_str(&String::from("x").to_string());
+    //~^ redundant_clone
     require_slice(&[String::from("x")].to_owned());
+    //~^ redundant_clone
+
+    let slice = [0u8; 1024];
+    let _ref_str: &str = &String::from_utf8(slice.to_vec()).expect("not UTF-8");
+    //~^ unnecessary_to_owned
+    let _ref_str: &str = &String::from_utf8(b"foo".to_vec()).unwrap();
+    //~^ unnecessary_to_owned
+    let _ref_str: &str = &String::from_utf8(b"foo".as_slice().to_owned()).unwrap();
+    //~^ unnecessary_to_owned
+    // Expression is of type `&String`, can't suggest `str::from_utf8` here
+    let _ref_string = &String::from_utf8(b"foo".to_vec()).unwrap();
+    macro_rules! arg_from_macro {
+        () => {
+            b"foo".to_vec()
+        };
+    }
+    macro_rules! string_from_utf8_from_macro {
+        () => {
+            &String::from_utf8(b"foo".to_vec()).unwrap()
+        };
+    }
+    let _ref_str: &str = &String::from_utf8(arg_from_macro!()).unwrap();
+    let _ref_str: &str = string_from_utf8_from_macro!();
 }
 
 fn require_c_str(_: &CStr) {}
@@ -196,6 +297,7 @@ fn require_as_ref_slice_str<T, U: AsRef<[T]>, V: AsRef<str>>(_: U, _: V) {}
 // https://github.com/breard-r/acmed/blob/1f0dcc32aadbc5e52de6d23b9703554c0f925113/acmed/src/storage.rs#L262
 fn check_files(file_types: &[FileType]) -> bool {
     for t in file_types.to_vec() {
+        //~^ unnecessary_to_owned
         let path = match get_file_path(&t) {
             Ok(p) => p,
             Err(_) => {
@@ -215,15 +317,17 @@ fn get_file_path(_file_type: &FileType) -> Result<std::path::PathBuf, std::io::E
 
 fn require_string(_: &String) {}
 
+#[clippy::msrv = "1.35"]
 fn _msrv_1_35() {
-    #![clippy::msrv = "1.35"]
     // `copied` was stabilized in 1.36, so clippy should use `cloned`.
     let _ = &["x"][..].to_vec().into_iter();
+    //~^ unnecessary_to_owned
 }
 
+#[clippy::msrv = "1.36"]
 fn _msrv_1_36() {
-    #![clippy::msrv = "1.36"]
     let _ = &["x"][..].to_vec().into_iter();
+    //~^ unnecessary_to_owned
 }
 
 // https://github.com/rust-lang/rust-clippy/issues/8507
@@ -262,6 +366,7 @@ mod issue_8507 {
         }
     }
 
+    #[allow(clippy::to_string_trait_impl)]
     impl ToString for Y {
         fn to_string(&self) -> String {
             self.0.to_string()
@@ -271,6 +376,7 @@ mod issue_8507 {
     // Should lint because Y is copy.
     fn test_y(y: Y) -> Box<dyn Abstracted> {
         Box::new(build(y.to_string()))
+        //~^ unnecessary_to_owned
     }
 }
 
@@ -335,6 +441,7 @@ mod issue_9317 {
 
     struct Bytes {}
 
+    #[allow(clippy::to_string_trait_impl)]
     impl ToString for Bytes {
         fn to_string(&self) -> String {
             "123".to_string()
@@ -379,6 +486,7 @@ mod issue_9351 {
     // Should lint
     fn single_return() -> impl AsRef<str> {
         id("abc".to_string())
+        //~^ unnecessary_to_owned
     }
 
     // Should not lint
@@ -425,4 +533,150 @@ mod issue_9504 {
     async fn bar() {
         foo(std::path::PathBuf::new().to_string_lossy().to_string()).await;
     }
+}
+
+mod issue_9771a {
+    #![allow(dead_code)]
+
+    use std::marker::PhantomData;
+
+    pub struct Key<K: AsRef<[u8]>, V: ?Sized>(K, PhantomData<V>);
+
+    impl<K: AsRef<[u8]>, V: ?Sized> Key<K, V> {
+        pub fn new(key: K) -> Key<K, V> {
+            Key(key, PhantomData)
+        }
+    }
+
+    pub fn pkh(pkh: &[u8]) -> Key<Vec<u8>, String> {
+        Key::new([b"pkh-", pkh].concat().to_vec())
+    }
+}
+
+mod issue_9771b {
+    #![allow(dead_code)]
+
+    pub struct Key<K: AsRef<[u8]>>(K);
+
+    pub fn from(c: &[u8]) -> Key<Vec<u8>> {
+        let v = [c].concat();
+        Key(v.to_vec())
+    }
+}
+
+// This is a watered down version of the code in: https://github.com/oxigraph/rio
+// The ICE is triggered by the call to `to_owned` on this line:
+// https://github.com/oxigraph/rio/blob/66635b9ff8e5423e58932353fa40d6e64e4820f7/testsuite/src/parser_evaluator.rs#L116
+mod issue_10021 {
+    #![allow(unused)]
+
+    pub struct Iri<T>(T);
+
+    impl<T: AsRef<str>> Iri<T> {
+        pub fn parse(iri: T) -> Result<Self, ()> {
+            unimplemented!()
+        }
+    }
+
+    pub fn parse_w3c_rdf_test_file(url: &str) -> Result<(), ()> {
+        let base_iri = Iri::parse(url.to_owned())?;
+        Ok(())
+    }
+}
+
+mod issue_10033 {
+    #![allow(dead_code)]
+    use std::fmt::Display;
+    use std::ops::Deref;
+
+    fn _main() {
+        let f = Foo;
+
+        // Not actually unnecessary - this calls `Foo`'s `Display` impl, not `str`'s (even though `Foo` does
+        // deref to `str`)
+        foo(&f.to_string());
+    }
+
+    fn foo(s: &str) {
+        println!("{}", s);
+    }
+
+    struct Foo;
+
+    impl Deref for Foo {
+        type Target = str;
+
+        fn deref(&self) -> &Self::Target {
+            "str"
+        }
+    }
+
+    impl Display for Foo {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "Foo")
+        }
+    }
+}
+
+mod issue_11952 {
+    use core::future::{Future, IntoFuture};
+
+    fn foo<'a, T: AsRef<[u8]>>(x: T, y: &'a i32) -> impl 'a + Future<Output = Result<(), ()>> {
+        async move {
+            let _y = y;
+            Ok(())
+        }
+    }
+
+    fn bar() {
+        IntoFuture::into_future(foo([].to_vec(), &0));
+        //~^ unnecessary_to_owned
+    }
+}
+
+fn borrow_checks() {
+    use std::borrow::Borrow;
+    use std::collections::HashSet;
+
+    fn inner(a: &[&str]) {
+        let mut s = HashSet::from([vec!["a"]]);
+        s.remove(&a.to_vec());
+        //~^ unnecessary_to_owned
+    }
+
+    let mut s = HashSet::from(["a".to_string()]);
+    s.remove(&"b".to_owned());
+    //~^ unnecessary_to_owned
+    s.remove(&"b".to_string());
+    //~^ unnecessary_to_owned
+    // Should not warn.
+    s.remove("b");
+
+    let mut s = HashSet::from([vec!["a"]]);
+    s.remove(&["b"].to_vec());
+    //~^ unnecessary_to_owned
+    s.remove(&(&["b"]).to_vec());
+    //~^ unnecessary_to_owned
+
+    // Should not warn.
+    s.remove(&["b"].to_vec().clone());
+    s.remove(["a"].as_slice());
+
+    trait SetExt {
+        fn foo<Q: Borrow<str>>(&self, _: &String);
+    }
+
+    impl<K> SetExt for HashSet<K> {
+        fn foo<Q: Borrow<str>>(&self, _: &String) {}
+    }
+
+    // Should not lint!
+    HashSet::<i32>::new().foo::<&str>(&"".to_owned());
+    HashSet::<String>::new().get(&1.to_string());
+}
+
+fn issue13624() -> impl IntoIterator {
+    let cow: Cow<'_, Vec<String>> = Cow::Owned(vec![String::from("foo")]);
+
+    cow.into_owned().into_iter()
 }

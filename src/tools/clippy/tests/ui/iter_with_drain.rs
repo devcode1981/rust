@@ -1,28 +1,33 @@
-// run-rustfix
 // will emits unused mut warnings after fixing
 #![allow(unused_mut)]
 // will emits needless collect warnings after fixing
-#![allow(clippy::needless_collect)]
+#![allow(clippy::needless_collect, clippy::drain_collect)]
 #![warn(clippy::iter_with_drain)]
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 
 fn full() {
     let mut a = vec!["aaa".to_string(), "bbb".to_string()];
     let mut a: BinaryHeap<_> = a.drain(..).collect();
+    //~^ iter_with_drain
     let mut a: HashSet<_> = a.drain().collect();
     let mut a: VecDeque<_> = a.drain().collect();
     let mut a: Vec<_> = a.drain(..).collect();
+    //~^ iter_with_drain
     let mut a: HashMap<_, _> = a.drain(..).map(|x| (x.clone(), x)).collect();
+    //~^ iter_with_drain
     let _: Vec<(String, String)> = a.drain().collect();
 }
 
 fn closed() {
     let mut a = vec!["aaa".to_string(), "bbb".to_string()];
     let mut a: BinaryHeap<_> = a.drain(0..).collect();
+    //~^ iter_with_drain
     let mut a: HashSet<_> = a.drain().collect();
     let mut a: VecDeque<_> = a.drain().collect();
     let mut a: Vec<_> = a.drain(..a.len()).collect();
+    //~^ iter_with_drain
     let mut a: HashMap<_, _> = a.drain(0..a.len()).map(|x| (x.clone(), x)).collect();
+    //~^ iter_with_drain
     let _: Vec<(String, String)> = a.drain().collect();
 }
 

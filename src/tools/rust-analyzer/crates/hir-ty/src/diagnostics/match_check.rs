@@ -1,33 +1,32 @@
 //! Validation of matches.
 //!
-//! This module provides lowering from [hir_def::expr::Pat] to [self::Pat] and match
+//! This module provides lowering from [hir_def::hir::Pat] to [self::Pat] and match
 //! checking algorithm.
 //!
 //! It is modeled on the rustc module `rustc_mir_build::thir::pattern`.
 
 mod pat_util;
 
-pub(crate) mod deconstruct_pat;
-pub(crate) mod usefulness;
+pub(crate) mod pat_analysis;
 
 use chalk_ir::Mutability;
 use hir_def::{
-    adt::VariantData, body::Body, expr::PatId, AdtId, EnumVariantId, HasModule, LocalFieldId,
+    data::adt::VariantData, expr_store::Body, hir::PatId, AdtId, EnumVariantId, LocalFieldId,
     VariantId,
 };
-use hir_expand::name::{name, Name};
+use hir_expand::name::Name;
+use span::Edition;
 use stdx::{always, never};
 
 use crate::{
     db::HirDatabase,
     display::{HirDisplay, HirDisplayError, HirFormatter},
     infer::BindingMode,
+    lang_items::is_box,
     InferenceResult, Interner, Substitution, Ty, TyExt, TyKind,
 };
 
 use self::pat_util::EnumerateAndAdjustIterator;
-
-pub(crate) use self::usefulness::MatchArm;
 
 #[derive(Clone, Debug)]
 pub(crate) enum PatternError {
@@ -54,6 +53,7 @@ pub(crate) struct Pat {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum PatKind {
     Wild,
+    Never,
 
     /// `x`, `ref x`, `x @ P`, etc.
     Binding {
@@ -125,15 +125,15 @@ impl<'a> PatCtxt<'a> {
         let variant = self.infer.variant_resolution_for_pat(pat);
 
         let kind = match self.body[pat] {
-            hir_def::expr::Pat::Wild => PatKind::Wild,
+            hir_def::hir::Pat::Wild => PatKind::Wild,
 
-            hir_def::expr::Pat::Lit(expr) => self.lower_lit(expr),
+            hir_def::hir::Pat::Lit(expr) => self.lower_lit(expr),
 
-            hir_def::expr::Pat::Path(ref path) => {
+            hir_def::hir::Pat::Path(ref path) => {
                 return self.lower_path(pat, path);
             }
 
-            hir_def::expr::Pat::Tuple { ref args, ellipsis } => {
+            hir_def::hir::Pat::Tuple { ref args, ellipsis } => {
                 let arity = match *ty.kind(Interner) {
                     TyKind::Tuple(arity, _) => arity,
                     _ => {
@@ -146,12 +146,18 @@ impl<'a> PatCtxt<'a> {
                 PatKind::Leaf { subpatterns }
             }
 
-            hir_def::expr::Pat::Bind { ref name, subpat, .. } => {
-                let bm = self.infer.pat_binding_modes[&pat];
+            hir_def::hir::Pat::Bind { id, subpat, .. } => {
+                let bm = self.infer.binding_modes[pat];
+                ty = &self.infer[id];
+                let name = &self.body.bindings[id].name;
                 match (bm, ty.kind(Interner)) {
                     (BindingMode::Ref(_), TyKind::Ref(.., rty)) => ty = rty,
                     (BindingMode::Ref(_), _) => {
-                        never!("`ref {}` has wrong type {:?}", name, ty);
+                        never!(
+                            "`ref {}` has wrong type {:?}",
+                            name.display(self.db.upcast(), Edition::LATEST),
+                            ty
+                        );
                         self.errors.push(PatternError::UnexpectedType);
                         return Pat { ty: ty.clone(), kind: PatKind::Wild.into() };
                     }
@@ -160,13 +166,13 @@ impl<'a> PatCtxt<'a> {
                 PatKind::Binding { name: name.clone(), subpattern: self.lower_opt_pattern(subpat) }
             }
 
-            hir_def::expr::Pat::TupleStruct { ref args, ellipsis, .. } if variant.is_some() => {
+            hir_def::hir::Pat::TupleStruct { ref args, ellipsis, .. } if variant.is_some() => {
                 let expected_len = variant.unwrap().variant_data(self.db.upcast()).fields().len();
                 let subpatterns = self.lower_tuple_subpats(args, expected_len, ellipsis);
                 self.lower_variant_or_leaf(pat, ty, subpatterns)
             }
 
-            hir_def::expr::Pat::Record { ref args, .. } if variant.is_some() => {
+            hir_def::hir::Pat::Record { ref args, .. } if variant.is_some() => {
                 let variant_data = variant.unwrap().variant_data(self.db.upcast());
                 let subpatterns = args
                     .iter()
@@ -186,12 +192,12 @@ impl<'a> PatCtxt<'a> {
                     }
                 }
             }
-            hir_def::expr::Pat::TupleStruct { .. } | hir_def::expr::Pat::Record { .. } => {
+            hir_def::hir::Pat::TupleStruct { .. } | hir_def::hir::Pat::Record { .. } => {
                 self.errors.push(PatternError::UnresolvedVariant);
                 PatKind::Wild
             }
 
-            hir_def::expr::Pat::Or(ref pats) => PatKind::Or { pats: self.lower_patterns(pats) },
+            hir_def::hir::Pat::Or(ref pats) => PatKind::Or { pats: self.lower_patterns(pats) },
 
             _ => {
                 self.errors.push(PatternError::Unimplemented);
@@ -206,7 +212,7 @@ impl<'a> PatCtxt<'a> {
         &mut self,
         pats: &[PatId],
         expected_len: usize,
-        ellipsis: Option<usize>,
+        ellipsis: Option<u32>,
     ) -> Vec<FieldPat> {
         if pats.len() > expected_len {
             self.errors.push(PatternError::ExtraFields);
@@ -214,7 +220,7 @@ impl<'a> PatCtxt<'a> {
         }
 
         pats.iter()
-            .enumerate_and_adjust(expected_len, ellipsis)
+            .enumerate_and_adjust(expected_len, ellipsis.map(|it| it as usize))
             .map(|(i, &subpattern)| FieldPat {
                 field: LocalFieldId::from_raw((i as u32).into()),
                 pattern: self.lower_pattern(subpattern),
@@ -278,8 +284,8 @@ impl<'a> PatCtxt<'a> {
         }
     }
 
-    fn lower_lit(&mut self, expr: hir_def::expr::ExprId) -> PatKind {
-        use hir_def::expr::{Expr, Literal::Bool};
+    fn lower_lit(&mut self, expr: hir_def::hir::ExprId) -> PatKind {
+        use hir_def::hir::{Expr, Literal::Bool};
 
         match self.body[expr] {
             Expr::Literal(Bool(value)) => PatKind::LiteralBool { value },
@@ -295,8 +301,9 @@ impl HirDisplay for Pat {
     fn hir_fmt(&self, f: &mut HirFormatter<'_>) -> Result<(), HirDisplayError> {
         match &*self.kind {
             PatKind::Wild => write!(f, "_"),
+            PatKind::Never => write!(f, "!"),
             PatKind::Binding { name, subpattern } => {
-                write!(f, "{name}")?;
+                write!(f, "{}", name.display(f.db.upcast(), f.edition()))?;
                 if let Some(subpattern) = subpattern {
                     write!(f, " @ ")?;
                     subpattern.hir_fmt(f)?;
@@ -316,15 +323,26 @@ impl HirDisplay for Pat {
                 if let Some(variant) = variant {
                     match variant {
                         VariantId::EnumVariantId(v) => {
-                            let data = f.db.enum_data(v.parent);
-                            write!(f, "{}", data.variants[v.local_id].name)?;
+                            write!(
+                                f,
+                                "{}",
+                                f.db.enum_variant_data(v).name.display(f.db.upcast(), f.edition())
+                            )?;
                         }
-                        VariantId::StructId(s) => write!(f, "{}", f.db.struct_data(s).name)?,
-                        VariantId::UnionId(u) => write!(f, "{}", f.db.union_data(u).name)?,
+                        VariantId::StructId(s) => write!(
+                            f,
+                            "{}",
+                            f.db.struct_data(s).name.display(f.db.upcast(), f.edition())
+                        )?,
+                        VariantId::UnionId(u) => write!(
+                            f,
+                            "{}",
+                            f.db.union_data(u).name.display(f.db.upcast(), f.edition())
+                        )?,
                     };
 
                     let variant_data = variant.variant_data(f.db.upcast());
-                    if let VariantData::Record(rec_fields) = &*variant_data {
+                    if let VariantData::Record { fields: rec_fields, .. } = &*variant_data {
                         write!(f, " {{ ")?;
 
                         let mut printed = 0;
@@ -334,7 +352,13 @@ impl HirDisplay for Pat {
                             .map(|p| {
                                 printed += 1;
                                 WriteWith(move |f| {
-                                    write!(f, "{}: ", rec_fields[p.field].name)?;
+                                    write!(
+                                        f,
+                                        "{}: ",
+                                        rec_fields[p.field]
+                                            .name
+                                            .display(f.db.upcast(), f.edition())
+                                    )?;
                                     p.pattern.hir_fmt(f)
                                 })
                             });
@@ -378,7 +402,7 @@ impl HirDisplay for Pat {
             }
             PatKind::Deref { subpattern } => {
                 match self.ty.kind(Interner) {
-                    TyKind::Adt(adt, _) if is_box(adt.0, f.db) => write!(f, "box ")?,
+                    TyKind::Adt(adt, _) if is_box(f.db, adt.0) => write!(f, "box ")?,
                     &TyKind::Ref(mutbl, ..) => {
                         write!(f, "&{}", if mutbl == Mutability::Mut { "mut " } else { "" })?
                     }
@@ -386,7 +410,7 @@ impl HirDisplay for Pat {
                 }
                 subpattern.hir_fmt(f)
             }
-            PatKind::LiteralBool { value } => write!(f, "{}", value),
+            PatKind::LiteralBool { value } => write!(f, "{value}"),
             PatKind::Or { pats } => f.write_joined(pats.iter(), " | "),
         }
     }
@@ -402,107 +426,5 @@ where
 {
     fn hir_fmt(&self, f: &mut HirFormatter<'_>) -> Result<(), HirDisplayError> {
         (self.0)(f)
-    }
-}
-
-fn is_box(adt: AdtId, db: &dyn HirDatabase) -> bool {
-    let owned_box = name![owned_box].to_smol_str();
-    let krate = adt.module(db.upcast()).krate();
-    let box_adt = db.lang_item(krate, owned_box).and_then(|it| it.as_struct()).map(AdtId::from);
-    Some(adt) == box_adt
-}
-
-pub(crate) trait PatternFoldable: Sized {
-    fn fold_with<F: PatternFolder>(&self, folder: &mut F) -> Self {
-        self.super_fold_with(folder)
-    }
-
-    fn super_fold_with<F: PatternFolder>(&self, folder: &mut F) -> Self;
-}
-
-pub(crate) trait PatternFolder: Sized {
-    fn fold_pattern(&mut self, pattern: &Pat) -> Pat {
-        pattern.super_fold_with(self)
-    }
-
-    fn fold_pattern_kind(&mut self, kind: &PatKind) -> PatKind {
-        kind.super_fold_with(self)
-    }
-}
-
-impl<T: PatternFoldable> PatternFoldable for Box<T> {
-    fn super_fold_with<F: PatternFolder>(&self, folder: &mut F) -> Self {
-        let content: T = (**self).fold_with(folder);
-        Box::new(content)
-    }
-}
-
-impl<T: PatternFoldable> PatternFoldable for Vec<T> {
-    fn super_fold_with<F: PatternFolder>(&self, folder: &mut F) -> Self {
-        self.iter().map(|t| t.fold_with(folder)).collect()
-    }
-}
-
-impl<T: PatternFoldable> PatternFoldable for Option<T> {
-    fn super_fold_with<F: PatternFolder>(&self, folder: &mut F) -> Self {
-        self.as_ref().map(|t| t.fold_with(folder))
-    }
-}
-
-macro_rules! clone_impls {
-    ($($ty:ty),+) => {
-        $(
-            impl PatternFoldable for $ty {
-                fn super_fold_with<F: PatternFolder>(&self, _: &mut F) -> Self {
-                    Clone::clone(self)
-                }
-            }
-        )+
-    }
-}
-
-clone_impls! { LocalFieldId, Ty, Substitution, EnumVariantId }
-
-impl PatternFoldable for FieldPat {
-    fn super_fold_with<F: PatternFolder>(&self, folder: &mut F) -> Self {
-        FieldPat { field: self.field.fold_with(folder), pattern: self.pattern.fold_with(folder) }
-    }
-}
-
-impl PatternFoldable for Pat {
-    fn fold_with<F: PatternFolder>(&self, folder: &mut F) -> Self {
-        folder.fold_pattern(self)
-    }
-
-    fn super_fold_with<F: PatternFolder>(&self, folder: &mut F) -> Self {
-        Pat { ty: self.ty.fold_with(folder), kind: self.kind.fold_with(folder) }
-    }
-}
-
-impl PatternFoldable for PatKind {
-    fn fold_with<F: PatternFolder>(&self, folder: &mut F) -> Self {
-        folder.fold_pattern_kind(self)
-    }
-
-    fn super_fold_with<F: PatternFolder>(&self, folder: &mut F) -> Self {
-        match self {
-            PatKind::Wild => PatKind::Wild,
-            PatKind::Binding { name, subpattern } => {
-                PatKind::Binding { name: name.clone(), subpattern: subpattern.fold_with(folder) }
-            }
-            PatKind::Variant { substs, enum_variant, subpatterns } => PatKind::Variant {
-                substs: substs.fold_with(folder),
-                enum_variant: enum_variant.fold_with(folder),
-                subpatterns: subpatterns.fold_with(folder),
-            },
-            PatKind::Leaf { subpatterns } => {
-                PatKind::Leaf { subpatterns: subpatterns.fold_with(folder) }
-            }
-            PatKind::Deref { subpattern } => {
-                PatKind::Deref { subpattern: subpattern.fold_with(folder) }
-            }
-            &PatKind::LiteralBool { value } => PatKind::LiteralBool { value },
-            PatKind::Or { pats } => PatKind::Or { pats: pats.fold_with(folder) },
-        }
     }
 }

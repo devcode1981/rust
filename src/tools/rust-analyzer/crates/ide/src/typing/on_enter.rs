@@ -1,8 +1,9 @@
 //! Handles the `Enter` key press. At the momently, this only continues
 //! comments, but should handle indent some time in the future as well.
 
-use ide_db::base_db::{FilePosition, SourceDatabase};
 use ide_db::RootDatabase;
+use ide_db::{base_db::SourceDatabase, FilePosition};
+use span::EditionedFileId;
 use syntax::{
     algo::find_node_at_offset,
     ast::{self, edit::IndentLevel, AstToken},
@@ -11,16 +12,16 @@ use syntax::{
     SyntaxNode, SyntaxToken, TextRange, TextSize, TokenAtOffset,
 };
 
-use text_edit::TextEdit;
+use ide_db::text_edit::TextEdit;
 
 // Feature: On Enter
 //
-// rust-analyzer can override kbd:[Enter] key to make it smarter:
+// rust-analyzer can override <kbd>Enter</kbd> key to make it smarter:
 //
-// - kbd:[Enter] inside triple-slash comments automatically inserts `///`
-// - kbd:[Enter] in the middle or after a trailing space in `//` inserts `//`
-// - kbd:[Enter] inside `//!` doc comments automatically inserts `//!`
-// - kbd:[Enter] after `{` indents contents and closing `}` of single-line block
+// - <kbd>Enter</kbd> inside triple-slash comments automatically inserts `///`
+// - <kbd>Enter</kbd> in the middle or after a trailing space in `//` inserts `//`
+// - <kbd>Enter</kbd> inside `//!` doc comments automatically inserts `//!`
+// - <kbd>Enter</kbd> after `{` indents contents and closing `}` of single-line block
 //
 // This action needs to be assigned to shortcut explicitly.
 //
@@ -28,31 +29,29 @@ use text_edit::TextEdit;
 // Similarly, if rust-analyzer crashes or stops responding, `Enter` might not work.
 // In that case, you can still press `Shift-Enter` to insert a newline.
 //
-// VS Code::
+// #### VS Code
 //
 // Add the following to `keybindings.json`:
-// [source,json]
-// ----
+// ```json
 // {
 //   "key": "Enter",
 //   "command": "rust-analyzer.onEnter",
 //   "when": "editorTextFocus && !suggestWidgetVisible && editorLangId == rust"
 // }
-// ----
+// ````
 //
 // When using the Vim plugin:
-// [source,json]
-// ----
+// ```json
 // {
 //   "key": "Enter",
 //   "command": "rust-analyzer.onEnter",
 //   "when": "editorTextFocus && !suggestWidgetVisible && editorLangId == rust && vim.mode == 'Insert'"
 // }
-// ----
+// ````
 //
-// image::https://user-images.githubusercontent.com/48062697/113065578-04c21800-91b1-11eb-82b8-22b8c481e645.gif[]
+// ![On Enter](https://user-images.githubusercontent.com/48062697/113065578-04c21800-91b1-11eb-82b8-22b8c481e645.gif)
 pub(crate) fn on_enter(db: &RootDatabase, position: FilePosition) -> Option<TextEdit> {
-    let parse = db.parse(position.file_id);
+    let parse = db.parse(EditionedFileId::current_edition(position.file_id));
     let file = parse.tree();
     let token = file.syntax().token_at_offset(position.offset).left_biased()?;
 
@@ -108,7 +107,7 @@ fn on_enter_in_comment(
     }
 
     let indent = node_indent(file, comment.syntax())?;
-    let inserted = format!("\n{}{} $0", indent, prefix);
+    let inserted = format!("\n{indent}{prefix} $0");
     let delete = if remove_trailing_whitespace {
         let trimmed_len = comment.text().trim_end().len() as u32;
         let trailing_whitespace_len = comment.text().len() as u32 - trimmed_len;
@@ -129,7 +128,7 @@ fn on_enter_in_block(block: ast::BlockExpr, position: FilePosition) -> Option<Te
 
     let indent = IndentLevel::from_node(block.syntax());
     let mut edit = TextEdit::insert(position.offset, format!("\n{}$0", indent + 1));
-    edit.union(TextEdit::insert(contents.text_range().end(), format!("\n{}", indent))).ok()?;
+    edit.union(TextEdit::insert(contents.text_range().end(), format!("\n{indent}"))).ok()?;
     Some(edit)
 }
 
@@ -140,11 +139,8 @@ fn on_enter_in_use_tree_list(list: ast::UseTreeList, position: FilePosition) -> 
 
     let indent = IndentLevel::from_node(list.syntax());
     let mut edit = TextEdit::insert(position.offset, format!("\n{}$0", indent + 1));
-    edit.union(TextEdit::insert(
-        list.r_curly_token()?.text_range().start(),
-        format!("\n{}", indent),
-    ))
-    .ok()?;
+    edit.union(TextEdit::insert(list.r_curly_token()?.text_range().start(), format!("\n{indent}")))
+        .ok()?;
     Some(edit)
 }
 
@@ -210,7 +206,10 @@ mod tests {
         Some(actual)
     }
 
-    fn do_check(ra_fixture_before: &str, ra_fixture_after: &str) {
+    fn do_check(
+        #[rust_analyzer::rust_fixture] ra_fixture_before: &str,
+        #[rust_analyzer::rust_fixture] ra_fixture_after: &str,
+    ) {
         let ra_fixture_after = &trim_indent(ra_fixture_after);
         let actual = apply_on_enter(ra_fixture_before).unwrap();
         assert_eq_text!(ra_fixture_after, &actual);

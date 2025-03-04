@@ -1,3 +1,4 @@
+//@no-rustfix: overlapping suggestions
 #![allow(clippy::uninlined_format_args)]
 
 #[allow(unused_assignments)]
@@ -5,14 +6,32 @@
 fn main() {
     let mut a = 5;
     a += a + 1;
+    //~^ misrefactored_assign_op
+
     a += 1 + a;
+    //~^ misrefactored_assign_op
+
     a -= a - 1;
+    //~^ misrefactored_assign_op
+
     a *= a * 99;
+    //~^ misrefactored_assign_op
+
     a *= 42 * a;
+    //~^ misrefactored_assign_op
+
     a /= a / 2;
+    //~^ misrefactored_assign_op
+
     a %= a % 5;
+    //~^ misrefactored_assign_op
+
     a &= a & 1;
+    //~^ misrefactored_assign_op
+
     a *= a * a;
+    //~^ misrefactored_assign_op
+
     a = a * a * a;
     a = a * 42 * a;
     a = a * 2 + a;
@@ -50,6 +69,7 @@ fn cow_add_assign() {
 
     // this can be linted
     buf = buf + cows.clone();
+    //~^ assign_op_pattern
 
     // this should not as cow<str> Add is not commutative
     buf = cows + buf;

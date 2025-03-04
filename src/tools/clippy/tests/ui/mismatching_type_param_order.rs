@@ -1,5 +1,5 @@
 #![warn(clippy::mismatching_type_param_order)]
-#![allow(clippy::disallowed_names)]
+#![allow(clippy::disallowed_names, clippy::needless_lifetimes)]
 
 fn main() {
     struct Foo<A, B> {
@@ -9,9 +9,12 @@ fn main() {
 
     // lint on both params
     impl<B, A> Foo<B, A> {}
+    //~^ mismatching_type_param_order
+    //~| mismatching_type_param_order
 
     // lint on the 2nd param
     impl<C, A> Foo<C, A> {}
+    //~^ mismatching_type_param_order
 
     // should not lint
     impl<A, B> Foo<A, B> {}
@@ -23,6 +26,8 @@ fn main() {
 
     // should not lint on lifetimes
     impl<'m, 'l, B, A> FooLifetime<'m, 'l, B, A> {}
+    //~^ mismatching_type_param_order
+    //~| mismatching_type_param_order
 
     struct Bar {
         x: i32,
@@ -39,6 +44,9 @@ fn main() {
     }
 
     impl<C, A, B> FooEnum<C, A, B> {}
+    //~^ mismatching_type_param_order
+    //~| mismatching_type_param_order
+    //~| mismatching_type_param_order
 
     // also works for unions
     union FooUnion<A: Copy, B>
@@ -50,6 +58,8 @@ fn main() {
     }
 
     impl<B: Copy, A> FooUnion<B, A> where A: Copy {}
+    //~^ mismatching_type_param_order
+    //~| mismatching_type_param_order
 
     impl<A, B> FooUnion<A, B>
     where

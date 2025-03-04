@@ -1,8 +1,3 @@
-#[cfg(not(feature = "in-rust-tree"))]
-mod ast_src;
-#[cfg(not(feature = "in-rust-tree"))]
-mod sourcegen_ast;
-
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -10,20 +5,22 @@ use std::{
 
 use ast::HasName;
 use expect_test::expect_file;
+use parser::Edition;
 use rayon::prelude::*;
+use stdx::format_to_acc;
 use test_utils::{bench, bench_fixture, project_root};
 
 use crate::{ast, fuzz, AstNode, SourceFile, SyntaxError};
 
 #[test]
 fn parse_smoke_test() {
-    let code = r##"
+    let code = r#"
 fn main() {
     println!("Hello, world!")
 }
-    "##;
+    "#;
 
-    let parse = SourceFile::parse(code);
+    let parse = SourceFile::parse(code, Edition::CURRENT);
     // eprintln!("{:#?}", parse.syntax_node());
     assert!(parse.ok().is_ok());
 }
@@ -37,8 +34,8 @@ fn benchmark_parser() {
     let data = bench_fixture::glorious_old_parser();
     let tree = {
         let _b = bench("parsing");
-        let p = SourceFile::parse(&data);
-        assert!(p.errors.is_empty());
+        let p = SourceFile::parse(&data, Edition::CURRENT);
+        assert!(p.errors().is_empty());
         assert_eq!(p.tree().syntax.text_range().len(), 352474.into());
         p.tree()
     };
@@ -54,9 +51,9 @@ fn benchmark_parser() {
 #[test]
 fn validation_tests() {
     dir_tests(&test_data_dir(), &["parser/validation"], "rast", |text, path| {
-        let parse = SourceFile::parse(text);
+        let parse = SourceFile::parse(text, Edition::CURRENT);
         let errors = parse.errors();
-        assert_errors_are_present(errors, path);
+        assert_errors_are_present(&errors, path);
         parse.debug_dump()
     });
 }
@@ -81,7 +78,25 @@ fn reparse_fuzz_tests() {
 fn self_hosting_parsing() {
     let crates_dir = project_root().join("crates");
 
-    let mut files = ::sourcegen::list_rust_files(&crates_dir);
+    let mut files = Vec::new();
+    let mut work = vec![crates_dir.into_std_path_buf()];
+    while let Some(dir) = work.pop() {
+        for entry in dir.read_dir().unwrap() {
+            let entry = entry.unwrap();
+            let file_type = entry.file_type().unwrap();
+            let path = entry.path();
+            let file_name = &path.file_name().unwrap_or_default().to_str().unwrap_or_default();
+            let is_hidden = file_name.starts_with('.');
+            if !is_hidden {
+                if file_type.is_dir() {
+                    work.push(path);
+                } else if file_type.is_file() && file_name.ends_with(".rs") {
+                    files.push(path);
+                }
+            }
+        }
+    }
+
     files.retain(|path| {
         // Get all files which are not in the crates/syntax/test_data folder
         !path.components().any(|component| component.as_os_str() == "test_data")
@@ -96,7 +111,7 @@ fn self_hosting_parsing() {
         .into_par_iter()
         .filter_map(|file| {
             let text = read_text(&file);
-            match SourceFile::parse(&text).ok() {
+            match SourceFile::parse(&text, Edition::CURRENT).ok() {
                 Ok(_) => None,
                 Err(err) => Some((file, err)),
             }
@@ -104,16 +119,15 @@ fn self_hosting_parsing() {
         .collect::<Vec<_>>();
 
     if !errors.is_empty() {
-        let errors = errors
-            .into_iter()
-            .map(|(path, err)| format!("{}: {:?}\n", path.display(), err[0]))
-            .collect::<String>();
-        panic!("Parsing errors:\n{}\n", errors);
+        let errors = errors.into_iter().fold(String::new(), |mut acc, (path, err)| {
+            format_to_acc!(acc, "{}: {:?}\n", path.display(), err[0])
+        });
+        panic!("Parsing errors:\n{errors}\n");
     }
 }
 
 fn test_data_dir() -> PathBuf {
-    project_root().join("crates/syntax/test_data")
+    project_root().into_std_path_buf().join("crates/syntax/test_data")
 }
 
 fn assert_errors_are_present(errors: &[SyntaxError], path: &Path) {
@@ -157,7 +171,7 @@ fn collect_rust_files(root_dir: &Path, paths: &[&str]) -> Vec<(PathBuf, String)>
 /// Collects paths to all `.rs` files from `dir` in a sorted `Vec<PathBuf>`.
 fn rust_files_in_dir(dir: &Path) -> Vec<PathBuf> {
     let mut acc = Vec::new();
-    for file in fs::read_dir(&dir).unwrap() {
+    for file in fs::read_dir(dir).unwrap() {
         let file = file.unwrap();
         let path = file.path();
         if path.extension().unwrap_or_default() == "rs" {
@@ -181,6 +195,6 @@ fn rust_files_in_dir(dir: &Path) -> Vec<PathBuf> {
 /// so this should always be correct.
 fn read_text(path: &Path) -> String {
     fs::read_to_string(path)
-        .unwrap_or_else(|_| panic!("File at {:?} should be valid", path))
+        .unwrap_or_else(|_| panic!("File at {path:?} should be valid"))
         .replace("\r\n", "\n")
 }

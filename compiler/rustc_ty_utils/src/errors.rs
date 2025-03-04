@@ -1,29 +1,30 @@
 //! Errors emitted by ty_utils
 
+use rustc_errors::codes::*;
 use rustc_macros::{Diagnostic, Subdiagnostic};
-use rustc_middle::ty::Ty;
+use rustc_middle::ty::{GenericArg, Ty};
 use rustc_span::Span;
 
 #[derive(Diagnostic)]
 #[diag(ty_utils_needs_drop_overflow)]
-pub struct NeedsDropOverflow<'tcx> {
+pub(crate) struct NeedsDropOverflow<'tcx> {
     pub query_ty: Ty<'tcx>,
 }
 
 #[derive(Diagnostic)]
 #[diag(ty_utils_generic_constant_too_complex)]
 #[help]
-pub struct GenericConstantTooComplex {
+pub(crate) struct GenericConstantTooComplex {
     #[primary_span]
     pub span: Span,
-    #[note(maybe_supported)]
-    pub maybe_supported: Option<()>,
+    #[note(ty_utils_maybe_supported)]
+    pub maybe_supported: bool,
     #[subdiagnostic]
     pub sub: GenericConstantTooComplexSub,
 }
 
 #[derive(Subdiagnostic)]
-pub enum GenericConstantTooComplexSub {
+pub(crate) enum GenericConstantTooComplexSub {
     #[label(ty_utils_borrow_not_supported)]
     BorrowNotSupported(#[primary_span] Span),
     #[label(ty_utils_address_and_deref_not_supported)]
@@ -66,4 +67,53 @@ pub enum GenericConstantTooComplexSub {
     InlineAsmNotSupported(#[primary_span] Span),
     #[label(ty_utils_operation_not_supported)]
     OperationNotSupported(#[primary_span] Span),
+}
+
+#[derive(Diagnostic)]
+#[diag(ty_utils_unexpected_fnptr_associated_item)]
+pub(crate) struct UnexpectedFnPtrAssociatedItem {
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag(ty_utils_zero_length_simd_type)]
+pub(crate) struct ZeroLengthSimdType<'tcx> {
+    pub ty: Ty<'tcx>,
+}
+
+#[derive(Diagnostic)]
+#[diag(ty_utils_oversized_simd_type)]
+pub(crate) struct OversizedSimdType<'tcx> {
+    pub ty: Ty<'tcx>,
+    pub max_lanes: u64,
+}
+
+#[derive(Diagnostic)]
+#[diag(ty_utils_non_primitive_simd_type)]
+pub(crate) struct NonPrimitiveSimdType<'tcx> {
+    pub ty: Ty<'tcx>,
+    pub e_ty: Ty<'tcx>,
+}
+
+#[derive(Diagnostic)]
+#[diag(ty_utils_impl_trait_duplicate_arg)]
+pub(crate) struct DuplicateArg<'tcx> {
+    pub arg: GenericArg<'tcx>,
+    #[primary_span]
+    #[label]
+    pub span: Span,
+    #[note]
+    pub opaque_span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag(ty_utils_impl_trait_not_param, code = E0792)]
+pub(crate) struct NotParam<'tcx> {
+    pub arg: GenericArg<'tcx>,
+    #[primary_span]
+    #[label]
+    pub span: Span,
+    #[note]
+    pub opaque_span: Span,
 }

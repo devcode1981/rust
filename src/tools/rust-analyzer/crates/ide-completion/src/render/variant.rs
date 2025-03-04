@@ -1,10 +1,10 @@
 //! Code common to structs, unions, and enum variants.
 
 use crate::context::CompletionContext;
-use hir::{db::HirDatabase, HasAttrs, HasCrate, HasVisibility, HirDisplay, StructKind};
+use hir::{db::HirDatabase, sym, HasAttrs, HasCrate, HasVisibility, HirDisplay, StructKind};
 use ide_db::SnippetCap;
 use itertools::Itertools;
-use syntax::SmolStr;
+use syntax::{Edition, SmolStr};
 
 /// A rendered struct, union, or enum variant, split into fields for actual
 /// auto-completion (`literal`, using `field: ()`) and display in the
@@ -21,22 +21,34 @@ pub(crate) fn render_record_lit(
     snippet_cap: Option<SnippetCap>,
     fields: &[hir::Field],
     path: &str,
+    edition: Edition,
 ) -> RenderedLiteral {
+    if snippet_cap.is_none() {
+        return RenderedLiteral { literal: path.to_owned(), detail: path.to_owned() };
+    }
     let completions = fields.iter().enumerate().format_with(", ", |(idx, field), f| {
         if snippet_cap.is_some() {
-            f(&format_args!("{}: ${{{}:()}}", field.name(db), idx + 1))
+            f(&format_args!(
+                "{}: ${{{}:()}}",
+                field.name(db).display(db.upcast(), edition),
+                idx + 1
+            ))
         } else {
-            f(&format_args!("{}: ()", field.name(db)))
+            f(&format_args!("{}: ()", field.name(db).display(db.upcast(), edition)))
         }
     });
 
     let types = fields.iter().format_with(", ", |field, f| {
-        f(&format_args!("{}: {}", field.name(db), field.ty(db).display(db)))
+        f(&format_args!(
+            "{}: {}",
+            field.name(db).display(db.upcast(), edition),
+            field.ty(db).display(db, edition)
+        ))
     });
 
     RenderedLiteral {
-        literal: format!("{} {{ {} }}", path, completions),
-        detail: format!("{} {{ {} }}", path, types),
+        literal: format!("{path} {{ {completions} }}"),
+        detail: format!("{path} {{ {types} }}"),
     }
 }
 
@@ -47,7 +59,11 @@ pub(crate) fn render_tuple_lit(
     snippet_cap: Option<SnippetCap>,
     fields: &[hir::Field],
     path: &str,
+    edition: Edition,
 ) -> RenderedLiteral {
+    if snippet_cap.is_none() {
+        return RenderedLiteral { literal: path.to_owned(), detail: path.to_owned() };
+    }
     let completions = fields.iter().enumerate().format_with(", ", |(idx, _), f| {
         if snippet_cap.is_some() {
             f(&format_args!("${{{}:()}}", idx + 1))
@@ -56,11 +72,11 @@ pub(crate) fn render_tuple_lit(
         }
     });
 
-    let types = fields.iter().format_with(", ", |field, f| f(&field.ty(db).display(db)));
+    let types = fields.iter().format_with(", ", |field, f| f(&field.ty(db).display(db, edition)));
 
     RenderedLiteral {
-        literal: format!("{}({})", path, completions),
-        detail: format!("{}({})", path, types),
+        literal: format!("{path}({completions})"),
+        detail: format!("{path}({types})"),
     }
 }
 
@@ -80,14 +96,21 @@ pub(crate) fn visible_fields(
         .copied()
         .collect::<Vec<_>>();
     let has_invisible_field = n_fields - fields.len() > 0;
-    let is_foreign_non_exhaustive = item.attrs(ctx.db).by_key("non_exhaustive").exists()
+    let is_foreign_non_exhaustive = item.attrs(ctx.db).by_key(&sym::non_exhaustive).exists()
         && item.krate(ctx.db) != module.krate();
     let fields_omitted = has_invisible_field || is_foreign_non_exhaustive;
     Some((fields, fields_omitted))
 }
 
 /// Format a struct, etc. literal option for display in the completions menu.
-pub(crate) fn format_literal_label(name: &str, kind: StructKind) -> SmolStr {
+pub(crate) fn format_literal_label(
+    name: &str,
+    kind: StructKind,
+    snippet_cap: Option<SnippetCap>,
+) -> SmolStr {
+    if snippet_cap.is_none() {
+        return name.into();
+    }
     match kind {
         StructKind::Tuple => SmolStr::from_iter([name, "(…)"]),
         StructKind::Record => SmolStr::from_iter([name, " {…}"]),

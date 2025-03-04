@@ -1,21 +1,21 @@
 //! See [`CargoWorkspace`].
 
-use std::iter;
-use std::path::PathBuf;
+use std::ops;
 use std::str::from_utf8;
-use std::{ops, process::Command};
 
-use anyhow::{Context, Result};
-use base_db::Edition;
+use anyhow::Context;
+use base_db::Env;
 use cargo_metadata::{CargoOpt, MetadataCommand};
 use la_arena::{Arena, Idx};
-use paths::{AbsPath, AbsPathBuf};
-use rustc_hash::FxHashMap;
-use serde::Deserialize;
+use paths::{AbsPath, AbsPathBuf, Utf8PathBuf};
+use rustc_hash::{FxHashMap, FxHashSet};
+use serde_derive::Deserialize;
 use serde_json::from_value;
+use span::Edition;
+use toolchain::Tool;
 
-use crate::CfgOverrides;
-use crate::{utf8_stdout, ManifestPath};
+use crate::{CfgOverrides, InvocationStrategy};
+use crate::{ManifestPath, Sysroot};
 
 /// [`CargoWorkspace`] represents the logical structure of, well, a Cargo
 /// workspace. It pretty closely mirrors `cargo metadata` output.
@@ -32,6 +32,11 @@ pub struct CargoWorkspace {
     packages: Arena<PackageData>,
     targets: Arena<TargetData>,
     workspace_root: AbsPathBuf,
+    target_directory: AbsPathBuf,
+    manifest_path: ManifestPath,
+    is_virtual_workspace: bool,
+    /// Environment variables set in the `.cargo/config` file.
+    config_env: Env,
 }
 
 impl ops::Index<Package> for CargoWorkspace {
@@ -50,25 +55,11 @@ impl ops::Index<Target> for CargoWorkspace {
 
 /// Describes how to set the rustc source directory.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum RustcSource {
+pub enum RustLibSource {
     /// Explicit path for the rustc source directory.
     Path(AbsPathBuf),
     /// Try to automatically detect where the rustc source directory is.
     Discover,
-}
-
-/// Crates to disable `#[cfg(test)]` on.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum UnsetTestCrates {
-    None,
-    Only(Vec<String>),
-    All,
-}
-
-impl Default for UnsetTestCrates {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -90,43 +81,32 @@ impl Default for CargoFeatures {
 
 #[derive(Default, Clone, Debug, PartialEq, Eq)]
 pub struct CargoConfig {
+    /// Whether to pass `--all-targets` to cargo invocations.
+    pub all_targets: bool,
     /// List of features to activate.
     pub features: CargoFeatures,
     /// rustc target
     pub target: Option<String>,
     /// Sysroot loading behavior
-    pub sysroot: Option<RustcSource>,
+    pub sysroot: Option<RustLibSource>,
+    pub sysroot_src: Option<AbsPathBuf>,
     /// rustc private crate source
-    pub rustc_source: Option<RustcSource>,
-    /// crates to disable `#[cfg(test)]` on
-    pub unset_test_crates: UnsetTestCrates,
+    pub rustc_source: Option<RustLibSource>,
+    /// Extra includes to add to the VFS.
+    pub extra_includes: Vec<AbsPathBuf>,
+    pub cfg_overrides: CfgOverrides,
     /// Invoke `cargo check` through the RUSTC_WRAPPER.
     pub wrap_rustc_in_build_scripts: bool,
     /// The command to run instead of `cargo check` for building build scripts.
     pub run_build_script_command: Option<Vec<String>>,
+    /// Extra args to pass to the cargo command.
+    pub extra_args: Vec<String>,
     /// Extra env vars to set when invoking the cargo command
     pub extra_env: FxHashMap<String, String>,
-}
-
-impl CargoConfig {
-    pub fn cfg_overrides(&self) -> CfgOverrides {
-        match &self.unset_test_crates {
-            UnsetTestCrates::None => CfgOverrides::Selective(iter::empty().collect()),
-            UnsetTestCrates::Only(unset_test_crates) => CfgOverrides::Selective(
-                unset_test_crates
-                    .iter()
-                    .cloned()
-                    .zip(iter::repeat_with(|| {
-                        cfg::CfgDiff::new(Vec::new(), vec![cfg::CfgAtom::Flag("test".into())])
-                            .unwrap()
-                    }))
-                    .collect(),
-            ),
-            UnsetTestCrates::All => CfgOverrides::Wildcard(
-                cfg::CfgDiff::new(Vec::new(), vec![cfg::CfgAtom::Flag("test".into())]).unwrap(),
-            ),
-        }
-    }
+    pub invocation_strategy: InvocationStrategy,
+    /// Optional path to use instead of `target` when building
+    pub target_dir: Option<Utf8PathBuf>,
+    pub set_test: bool,
 }
 
 pub type Package = Idx<PackageData>;
@@ -160,6 +140,20 @@ pub struct PackageData {
     pub active_features: Vec<String>,
     /// String representation of package id
     pub id: String,
+    /// Authors as given in the `Cargo.toml`
+    pub authors: Vec<String>,
+    /// Description as given in the `Cargo.toml`
+    pub description: Option<String>,
+    /// Homepage as given in the `Cargo.toml`
+    pub homepage: Option<String>,
+    /// License as given in the `Cargo.toml`
+    pub license: Option<String>,
+    /// License file as given in the `Cargo.toml`
+    pub license_file: Option<Utf8PathBuf>,
+    /// Readme file as given in the `Cargo.toml`
+    pub readme: Option<Utf8PathBuf>,
+    /// Rust version as given in the `Cargo.toml`
+    pub rust_version: Option<semver::Version>,
     /// The contents of [package.metadata.rust-analyzer]
     pub metadata: RustAnalyzerPackageMetaData,
 }
@@ -176,7 +170,7 @@ pub struct PackageDependency {
     pub kind: DepKind,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DepKind {
     /// Available to the library, binary, and dev targets in the package (but not the build script).
     Normal,
@@ -187,23 +181,20 @@ pub enum DepKind {
 }
 
 impl DepKind {
-    fn iter(list: &[cargo_metadata::DepKindInfo]) -> impl Iterator<Item = Self> + '_ {
-        let mut dep_kinds = Vec::new();
+    fn iter(list: &[cargo_metadata::DepKindInfo]) -> impl Iterator<Item = Self> {
+        let mut dep_kinds = [None; 3];
         if list.is_empty() {
-            dep_kinds.push(Self::Normal);
+            dep_kinds[0] = Some(Self::Normal);
         }
         for info in list {
-            let kind = match info.kind {
-                cargo_metadata::DependencyKind::Normal => Self::Normal,
-                cargo_metadata::DependencyKind::Development => Self::Dev,
-                cargo_metadata::DependencyKind::Build => Self::Build,
+            match info.kind {
+                cargo_metadata::DependencyKind::Normal => dep_kinds[0] = Some(Self::Normal),
+                cargo_metadata::DependencyKind::Development => dep_kinds[1] = Some(Self::Dev),
+                cargo_metadata::DependencyKind::Build => dep_kinds[2] = Some(Self::Build),
                 cargo_metadata::DependencyKind::Unknown => continue,
-            };
-            dep_kinds.push(kind);
+            }
         }
-        dep_kinds.sort_unstable();
-        dep_kinds.dedup();
-        dep_kinds.into_iter()
+        dep_kinds.into_iter().flatten()
     }
 }
 
@@ -218,8 +209,6 @@ pub struct TargetData {
     pub root: AbsPathBuf,
     /// Kind of target
     pub kind: TargetKind,
-    /// Is this target a proc-macro
-    pub is_proc_macro: bool,
     /// Required features of the target without which it won't build
     pub required_features: Vec<String>,
 }
@@ -228,7 +217,10 @@ pub struct TargetData {
 pub enum TargetKind {
     Bin,
     /// Any kind of Cargo lib crate-type (dylib, rlib, proc-macro, ...).
-    Lib,
+    Lib {
+        /// Is this target a proc-macro
+        is_proc_macro: bool,
+    },
     Example,
     Test,
     Bench,
@@ -245,13 +237,33 @@ impl TargetKind {
                 "bench" => TargetKind::Bench,
                 "example" => TargetKind::Example,
                 "custom-build" => TargetKind::BuildScript,
-                "proc-macro" => TargetKind::Lib,
-                _ if kind.contains("lib") => TargetKind::Lib,
+                "proc-macro" => TargetKind::Lib { is_proc_macro: true },
+                _ if kind.contains("lib") => TargetKind::Lib { is_proc_macro: false },
                 _ => continue,
             };
         }
         TargetKind::Other
     }
+
+    pub fn is_executable(self) -> bool {
+        matches!(self, TargetKind::Bin | TargetKind::Example)
+    }
+
+    pub fn is_proc_macro(self) -> bool {
+        matches!(self, TargetKind::Lib { is_proc_macro: true })
+    }
+}
+
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
+pub struct CargoMetadataConfig {
+    /// List of features to activate.
+    pub features: CargoFeatures,
+    /// rustc targets
+    pub targets: Vec<String>,
+    /// Extra args to pass to the cargo command.
+    pub extra_args: Vec<String>,
+    /// Extra env vars to set when invoking the cargo command
+    pub extra_env: FxHashMap<String, String>,
 }
 
 // Deserialize helper for the cargo metadata
@@ -262,20 +274,37 @@ struct PackageMetadata {
 }
 
 impl CargoWorkspace {
+    /// Fetches the metadata for the given `cargo_toml` manifest.
+    /// A successful result may contain another metadata error if the initial fetching failed but
+    /// the `--no-deps` retry succeeded.
+    ///
+    /// The sysroot is used to set the `RUSTUP_TOOLCHAIN` env var when invoking cargo
+    /// to ensure that the rustup proxy uses the correct toolchain.
     pub fn fetch_metadata(
         cargo_toml: &ManifestPath,
         current_dir: &AbsPath,
-        config: &CargoConfig,
+        config: &CargoMetadataConfig,
+        sysroot: &Sysroot,
+        locked: bool,
         progress: &dyn Fn(String),
-    ) -> Result<cargo_metadata::Metadata> {
-        let target = config
-            .target
-            .clone()
-            .or_else(|| cargo_config_build_target(cargo_toml, &config.extra_env))
-            .or_else(|| rustc_discover_host_triple(cargo_toml, &config.extra_env));
+    ) -> anyhow::Result<(cargo_metadata::Metadata, Option<anyhow::Error>)> {
+        Self::fetch_metadata_(cargo_toml, current_dir, config, sysroot, locked, false, progress)
+    }
 
+    fn fetch_metadata_(
+        cargo_toml: &ManifestPath,
+        current_dir: &AbsPath,
+        config: &CargoMetadataConfig,
+        sysroot: &Sysroot,
+        locked: bool,
+        no_deps: bool,
+        progress: &dyn Fn(String),
+    ) -> anyhow::Result<(cargo_metadata::Metadata, Option<anyhow::Error>)> {
+        let cargo = sysroot.tool(Tool::Cargo, current_dir);
         let mut meta = MetadataCommand::new();
-        meta.cargo_path(toolchain::cargo());
+        meta.cargo_path(cargo.get_program());
+        cargo.get_envs().for_each(|(var, val)| _ = meta.env(var, val.unwrap_or_default()));
+        config.extra_env.iter().for_each(|(var, val)| _ = meta.env(var, val));
         meta.manifest_path(cargo_toml.to_path_buf());
         match &config.features {
             CargoFeatures::All => {
@@ -283,8 +312,6 @@ impl CargoWorkspace {
             }
             CargoFeatures::Selected { features, no_default_features } => {
                 if *no_default_features {
-                    // FIXME: `NoDefaultFeatures` is mutual exclusive with `SomeFeatures`
-                    // https://github.com/oli-obk/cargo_metadata/issues/79
                     meta.features(CargoOpt::NoDefaultFeatures);
                 }
                 if !features.is_empty() {
@@ -292,59 +319,128 @@ impl CargoWorkspace {
                 }
             }
         }
-        meta.current_dir(current_dir.as_os_str());
+        meta.current_dir(current_dir);
 
-        if let Some(target) = target {
-            meta.other_options(vec![String::from("--filter-platform"), target]);
+        let mut other_options = vec![];
+        // cargo metadata only supports a subset of flags of what cargo usually accepts, and usually
+        // the only relevant flags for metadata here are unstable ones, so we pass those along
+        // but nothing else
+        let mut extra_args = config.extra_args.iter();
+        while let Some(arg) = extra_args.next() {
+            if arg == "-Z" {
+                if let Some(arg) = extra_args.next() {
+                    other_options.push("-Z".to_owned());
+                    other_options.push(arg.to_owned());
+                }
+            }
         }
+
+        if !config.targets.is_empty() {
+            other_options.extend(
+                config.targets.iter().flat_map(|it| ["--filter-platform".to_owned(), it.clone()]),
+            );
+        }
+        // The manifest is a rust file, so this means its a script manifest
+        if cargo_toml.is_rust_manifest() {
+            // Deliberately don't set up RUSTC_BOOTSTRAP or a nightly override here, the user should
+            // opt into it themselves.
+            other_options.push("-Zscript".to_owned());
+        }
+        if locked {
+            other_options.push("--locked".to_owned());
+        }
+        if no_deps {
+            other_options.push("--no-deps".to_owned());
+        }
+        meta.other_options(other_options);
 
         // FIXME: Fetching metadata is a slow process, as it might require
         // calling crates.io. We should be reporting progress here, but it's
         // unclear whether cargo itself supports it.
-        progress("metadata".to_string());
+        progress("metadata".to_owned());
 
-        (|| -> Result<cargo_metadata::Metadata, cargo_metadata::Error> {
-            let mut command = meta.cargo_command();
-            command.envs(&config.extra_env);
-            let output = command.output()?;
+        (|| -> anyhow::Result<(_, _)> {
+            let output = meta.cargo_command().output()?;
             if !output.status.success() {
-                return Err(cargo_metadata::Error::CargoMetadata {
+                let error = cargo_metadata::Error::CargoMetadata {
                     stderr: String::from_utf8(output.stderr)?,
-                });
+                }
+                .into();
+                if !no_deps {
+                    // If we failed to fetch metadata with deps, try again without them.
+                    // This makes r-a still work partially when offline.
+                    if let Ok((metadata, _)) = Self::fetch_metadata_(
+                        cargo_toml,
+                        current_dir,
+                        config,
+                        sysroot,
+                        locked,
+                        true,
+                        progress,
+                    ) {
+                        return Ok((metadata, Some(error)));
+                    }
+                }
+                return Err(error);
             }
             let stdout = from_utf8(&output.stdout)?
                 .lines()
                 .find(|line| line.starts_with('{'))
                 .ok_or(cargo_metadata::Error::NoJson)?;
-            cargo_metadata::MetadataCommand::parse(stdout)
+            Ok((cargo_metadata::MetadataCommand::parse(stdout)?, None))
         })()
+        .map(|(metadata, error)| {
+            (
+                metadata,
+                error.map(|e| e.context(format!("Failed to run `{:?}`", meta.cargo_command()))),
+            )
+        })
         .with_context(|| format!("Failed to run `{:?}`", meta.cargo_command()))
     }
 
-    pub fn new(mut meta: cargo_metadata::Metadata) -> CargoWorkspace {
+    pub fn new(
+        mut meta: cargo_metadata::Metadata,
+        ws_manifest_path: ManifestPath,
+        cargo_config_env: Env,
+    ) -> CargoWorkspace {
         let mut pkg_by_id = FxHashMap::default();
         let mut packages = Arena::default();
         let mut targets = Arena::default();
 
         let ws_members = &meta.workspace_members;
 
+        let workspace_root = AbsPathBuf::assert(meta.workspace_root);
+        let target_directory = AbsPathBuf::assert(meta.target_directory);
+        let mut is_virtual_workspace = true;
+
         meta.packages.sort_by(|a, b| a.id.cmp(&b.id));
-        for meta_pkg in &meta.packages {
+        for meta_pkg in meta.packages {
             let cargo_metadata::Package {
-                id,
-                edition,
                 name,
-                manifest_path,
                 version,
-                metadata,
+                id,
+                source,
+                targets: meta_targets,
+                features,
+                manifest_path,
                 repository,
+                edition,
+                metadata,
+                authors,
+                description,
+                homepage,
+                license,
+                license_file,
+                readme,
+                rust_version,
                 ..
             } = meta_pkg;
-            let meta = from_value::<PackageMetadata>(metadata.clone()).unwrap_or_default();
+            let meta = from_value::<PackageMetadata>(metadata).unwrap_or_default();
             let edition = match edition {
                 cargo_metadata::Edition::E2015 => Edition::Edition2015,
                 cargo_metadata::Edition::E2018 => Edition::Edition2018,
                 cargo_metadata::Edition::E2021 => Edition::Edition2021,
+                cargo_metadata::Edition::_E2024 => Edition::Edition2024,
                 _ => {
                     tracing::error!("Unsupported edition `{:?}`", edition);
                     Edition::CURRENT
@@ -352,41 +448,60 @@ impl CargoWorkspace {
             };
             // We treat packages without source as "local" packages. That includes all members of
             // the current workspace, as well as any path dependency outside the workspace.
-            let is_local = meta_pkg.source.is_none();
-            let is_member = ws_members.contains(id);
+            let is_local = source.is_none();
+            let is_member = ws_members.contains(&id);
 
+            let manifest = ManifestPath::try_from(AbsPathBuf::assert(manifest_path)).unwrap();
+            is_virtual_workspace &= manifest != ws_manifest_path;
             let pkg = packages.alloc(PackageData {
                 id: id.repr.clone(),
-                name: name.clone(),
-                version: version.clone(),
-                manifest: AbsPathBuf::assert(PathBuf::from(&manifest_path)).try_into().unwrap(),
+                name,
+                version,
+                manifest: manifest.clone(),
                 targets: Vec::new(),
                 is_local,
                 is_member,
                 edition,
-                repository: repository.clone(),
+                repository,
+                authors,
+                description,
+                homepage,
+                license,
+                license_file,
+                readme,
+                rust_version,
                 dependencies: Vec::new(),
-                features: meta_pkg.features.clone().into_iter().collect(),
+                features: features.into_iter().collect(),
                 active_features: Vec::new(),
                 metadata: meta.rust_analyzer.unwrap_or_default(),
             });
             let pkg_data = &mut packages[pkg];
             pkg_by_id.insert(id, pkg);
-            for meta_tgt in &meta_pkg.targets {
-                let is_proc_macro = meta_tgt.kind.as_slice() == ["proc-macro"];
+            for meta_tgt in meta_targets {
+                let cargo_metadata::Target { name, kind, required_features, src_path, .. } =
+                    meta_tgt;
+                let kind = TargetKind::new(&kind);
                 let tgt = targets.alloc(TargetData {
                     package: pkg,
-                    name: meta_tgt.name.clone(),
-                    root: AbsPathBuf::assert(PathBuf::from(&meta_tgt.src_path)),
-                    kind: TargetKind::new(meta_tgt.kind.as_slice()),
-                    is_proc_macro,
-                    required_features: meta_tgt.required_features.clone(),
+                    name,
+                    root: if kind == TargetKind::Bin
+                        && manifest.extension().is_some_and(|ext| ext == "rs")
+                    {
+                        // cargo strips the script part of a cargo script away and places the
+                        // modified manifest file into a special target dir which is then used as
+                        // the source path. We don't want that, we want the original here so map it
+                        // back
+                        manifest.clone().into()
+                    } else {
+                        AbsPathBuf::assert(src_path)
+                    },
+                    kind,
+                    required_features,
                 });
                 pkg_data.targets.push(tgt);
             }
         }
-        let resolve = meta.resolve.expect("metadata executed with deps");
-        for mut node in resolve.nodes {
+        for mut node in meta.resolve.map_or_else(Vec::new, |it| it.nodes) {
             let &source = pkg_by_id.get(&node.id).unwrap();
             node.deps.sort_by(|a, b| a.pkg.cmp(&b.pkg));
             let dependencies = node
@@ -401,20 +516,25 @@ impl CargoWorkspace {
             packages[source].active_features.extend(node.features);
         }
 
-        let workspace_root =
-            AbsPathBuf::assert(PathBuf::from(meta.workspace_root.into_os_string()));
-
-        CargoWorkspace { packages, targets, workspace_root }
+        CargoWorkspace {
+            packages,
+            targets,
+            workspace_root,
+            target_directory,
+            manifest_path: ws_manifest_path,
+            is_virtual_workspace,
+            config_env: cargo_config_env,
+        }
     }
 
-    pub fn packages<'a>(&'a self) -> impl Iterator<Item = Package> + ExactSizeIterator + 'a {
+    pub fn packages(&self) -> impl ExactSizeIterator<Item = Package> + '_ {
         self.packages.iter().map(|(id, _pkg)| id)
     }
 
     pub fn target_by_root(&self, root: &AbsPath) -> Option<Target> {
         self.packages()
             .filter(|&pkg| self[pkg].is_member)
-            .find_map(|pkg| self[pkg].targets.iter().find(|&&it| &self[it].root == root))
+            .find_map(|pkg| self[pkg].targets.iter().find(|&&it| self[it].root == root))
             .copied()
     }
 
@@ -422,8 +542,16 @@ impl CargoWorkspace {
         &self.workspace_root
     }
 
+    pub fn manifest_path(&self) -> &ManifestPath {
+        &self.manifest_path
+    }
+
+    pub fn target_directory(&self) -> &AbsPath {
+        &self.target_directory
+    }
+
     pub fn package_flag(&self, package: &PackageData) -> String {
-        if self.is_unique(&*package.name) {
+        if self.is_unique(&package.name) {
             package.name.clone()
         } else {
             format!("{}:{}", package.name, package.version)
@@ -445,7 +573,7 @@ impl CargoWorkspace {
             .collect::<Vec<ManifestPath>>();
 
         // some packages has this pkg as dep. return their manifests
-        if parent_manifests.len() > 0 {
+        if !parent_manifests.is_empty() {
             return Some(parent_manifests);
         }
 
@@ -460,55 +588,32 @@ impl CargoWorkspace {
         None
     }
 
+    /// Returns the union of the features of all member crates in this workspace.
+    pub fn workspace_features(&self) -> FxHashSet<String> {
+        self.packages()
+            .filter_map(|package| {
+                let package = &self[package];
+                if package.is_member {
+                    Some(package.features.keys().cloned().chain(
+                        package.features.keys().map(|key| format!("{}/{key}", package.name)),
+                    ))
+                } else {
+                    None
+                }
+            })
+            .flatten()
+            .collect()
+    }
+
     fn is_unique(&self, name: &str) -> bool {
         self.packages.iter().filter(|(_, v)| v.name == name).count() == 1
     }
-}
 
-fn rustc_discover_host_triple(
-    cargo_toml: &ManifestPath,
-    extra_env: &FxHashMap<String, String>,
-) -> Option<String> {
-    let mut rustc = Command::new(toolchain::rustc());
-    rustc.envs(extra_env);
-    rustc.current_dir(cargo_toml.parent()).arg("-vV");
-    tracing::debug!("Discovering host platform by {:?}", rustc);
-    match utf8_stdout(rustc) {
-        Ok(stdout) => {
-            let field = "host: ";
-            let target = stdout.lines().find_map(|l| l.strip_prefix(field));
-            if let Some(target) = target {
-                Some(target.to_string())
-            } else {
-                // If we fail to resolve the host platform, it's not the end of the world.
-                tracing::info!("rustc -vV did not report host platform, got:\n{}", stdout);
-                None
-            }
-        }
-        Err(e) => {
-            tracing::warn!("Failed to discover host platform: {}", e);
-            None
-        }
+    pub fn is_virtual_workspace(&self) -> bool {
+        self.is_virtual_workspace
     }
-}
 
-fn cargo_config_build_target(
-    cargo_toml: &ManifestPath,
-    extra_env: &FxHashMap<String, String>,
-) -> Option<String> {
-    let mut cargo_config = Command::new(toolchain::cargo());
-    cargo_config.envs(extra_env);
-    cargo_config
-        .current_dir(cargo_toml.parent())
-        .args(&["-Z", "unstable-options", "config", "get", "build.target"])
-        .env("RUSTC_BOOTSTRAP", "1");
-    // if successful we receive `build.target = "target-triple"`
-    tracing::debug!("Discovering cargo config target by {:?}", cargo_config);
-    match utf8_stdout(cargo_config) {
-        Ok(stdout) => stdout
-            .strip_prefix("build.target = \"")
-            .and_then(|stdout| stdout.strip_suffix('"'))
-            .map(ToOwned::to_owned),
-        Err(_) => None,
+    pub fn env(&self) -> &Env {
+        &self.config_env
     }
 }

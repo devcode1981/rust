@@ -2,7 +2,9 @@
 #![allow(
     clippy::disallowed_names,
     clippy::diverging_sub_expression,
-    clippy::uninlined_format_args
+    clippy::uninlined_format_args,
+    clippy::match_single_binding,
+    clippy::match_like_matches_macro
 )]
 
 fn bar<T>(_: T) {}
@@ -21,8 +23,8 @@ fn match_same_arms() {
             a = -31 - a;
             a
         },
+        //~^^^^^^^^^ match_same_arms
         _ => {
-            //~ ERROR match arms have same body
             foo();
             let mut a = 42 + [23].len() as i32;
             if true {
@@ -35,13 +37,15 @@ fn match_same_arms() {
 
     let _ = match 42 {
         42 => foo(),
-        51 => foo(), //~ ERROR match arms have same body
+        51 => foo(),
+        //~^ match_same_arms
         _ => true,
     };
 
     let _ = match Some(42) {
         Some(_) => 24,
-        None => 24, //~ ERROR match arms have same body
+        None => 24,
+        //~^ match_same_arms
     };
 
     let _ = match Some(42) {
@@ -63,13 +67,30 @@ fn match_same_arms() {
 
     match (Some(42), Some(42)) {
         (Some(a), None) => bar(a),
-        (None, Some(a)) => bar(a), //~ ERROR match arms have same body
+        (None, Some(a)) => bar(a),
+        //~^ match_same_arms
         _ => (),
     }
 
+    // No warning because guards are different
+    let _ = match Some(42) {
+        Some(a) if a == 42 => a,
+        Some(a) if a == 24 => a,
+        Some(_) => 24,
+        None => 0,
+    };
+
+    let _ = match (Some(42), Some(42)) {
+        (Some(a), None) if a == 42 => a,
+        (None, Some(a)) if a == 42 => a,
+        //~^ match_same_arms
+        _ => 0,
+    };
+
     match (Some(42), Some(42)) {
         (Some(a), ..) => bar(a),
-        (.., Some(a)) => bar(a), //~ ERROR match arms have same body
+        //~^ match_same_arms
+        (.., Some(a)) => bar(a),
         _ => (),
     }
 
@@ -103,6 +124,7 @@ fn match_same_arms() {
 
     match (x, Some(1i32)) {
         (Ok(x), Some(_)) => println!("ok {}", x),
+        //~^ match_same_arms
         (Ok(_), Some(x)) => println!("ok {}", x),
         _ => println!("err"),
     }
@@ -119,6 +141,7 @@ fn match_same_arms() {
         Ok(_tmp) => println!("ok"),
         Ok(3) => println!("ok"),
         Ok(_) => println!("ok"),
+        //~^ match_same_arms
         Err(_) => {
             unreachable!();
         },
@@ -148,6 +171,7 @@ fn match_same_arms() {
         1 => {
             empty!(0);
         },
+        //~^^^ match_same_arms
         x => {
             empty!(x);
         },
@@ -196,6 +220,7 @@ fn main() {
     // Suggest moving `Foo::Z(_)` up.
     let _ = match Foo::X(0) {
         Foo::X(0) => 1,
+        //~^ match_same_arms
         Foo::X(_) | Foo::Y(_) => 2,
         Foo::Z(_) => 1,
         _ => 0,
@@ -206,6 +231,7 @@ fn main() {
         Foo::X(0) => 1,
         Foo::Y(_) | Foo::Z(0) => 2,
         Foo::Z(_) => 1,
+        //~^ match_same_arms
         _ => 0,
     };
 
@@ -229,6 +255,7 @@ fn main() {
         Some(Bar { y: 10, z: 0, .. }) => 2,
         None => 50,
         Some(Bar { y: 0, x: 5, .. }) => 1,
+        //~^ match_same_arms
         _ => 200,
     };
 
@@ -239,4 +266,29 @@ fn main() {
         3 => core::convert::identity::<u32>(todo!()),
         _ => 5,
     };
+
+    let _ = match 0 {
+        0 => cfg!(not_enable),
+        1 => cfg!(not_enable),
+        //~^ match_same_arms
+        _ => false,
+    };
+}
+
+// issue #8919, fixed on https://github.com/rust-lang/rust/pull/97312
+mod with_lifetime {
+    enum MaybeStaticStr<'a> {
+        Static(&'static str),
+        Borrowed(&'a str),
+    }
+
+    impl<'a> MaybeStaticStr<'a> {
+        fn get(&self) -> &'a str {
+            match *self {
+                MaybeStaticStr::Static(s) => s,
+                MaybeStaticStr::Borrowed(s) => s,
+                //~^ match_same_arms
+            }
+        }
+    }
 }

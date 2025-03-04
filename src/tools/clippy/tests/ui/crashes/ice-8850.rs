@@ -2,12 +2,14 @@ fn fn_pointer_static() -> usize {
     static FN: fn() -> usize = || 1;
     let res = FN() + 1;
     res
+    //~^ let_and_return
 }
 
 fn fn_pointer_const() -> usize {
     const FN: fn() -> usize = || 1;
     let res = FN() + 1;
     res
+    //~^ let_and_return
 }
 
 fn deref_to_dyn_fn() -> usize {
@@ -22,6 +24,7 @@ fn deref_to_dyn_fn() -> usize {
     static FN: Derefs = Derefs;
     let res = FN() + 1;
     res
+    //~^ let_and_return
 }
 
 fn main() {}

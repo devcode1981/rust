@@ -1,7 +1,10 @@
-// run-rustfix
+//@aux-build:proc_macros.rs
 #![warn(clippy::all)]
 #![allow(unused)]
-#![allow(clippy::uninlined_format_args)]
+#![allow(clippy::uninlined_format_args, clippy::single_match)]
+
+#[macro_use]
+extern crate proc_macros;
 
 fn main() {
     let v = Some(true);
@@ -9,6 +12,7 @@ fn main() {
     match v {
         Some(x) => (),
         y @ _ => (),
+        //~^ redundant_pattern
     }
     match v {
         Some(x) => (),
@@ -24,6 +28,7 @@ fn main() {
     // required "ref" left out in suggestion: #5271
     match mutv {
         ref mut x @ _ => {
+            //~^ redundant_pattern
             x.push(4);
             println!("vec: {:?}", x);
         },
@@ -32,6 +37,14 @@ fn main() {
 
     match mutv {
         ref x @ _ => println!("vec: {:?}", x),
+        //~^ redundant_pattern
         ref y if y == &vec![0] => (),
+    }
+    external! {
+        let v = Some(true);
+        match v {
+            Some(x) => (),
+            y @ _ => (),
+        }
     }
 }

@@ -1,0 +1,19 @@
+error[E0275]: overflow evaluating the requirement `<T as Overflow>::Assoc == _`
+  --> $DIR/trait_ref_is_knowable-norm-overflow.rs:10:18
+   |
+LL |     type Assoc = <T as Overflow>::Assoc;
+   |                  ^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0119]: conflicting implementations of trait `Trait`
+  --> $DIR/trait_ref_is_knowable-norm-overflow.rs:18:1
+   |
+LL | impl<T: Copy> Trait for T {}
+   | ------------------------- first implementation here
+LL | struct LocalTy;
+LL | impl Trait for <LocalTy as Overflow>::Assoc {}
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ conflicting implementation
+
+error: aborting due to 2 previous errors
+
+Some errors have detailed explanations: E0119, E0275.
+For more information about an error, try `rustc --explain E0119`.

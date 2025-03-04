@@ -1,21 +1,35 @@
+//@no-rustfix
 #![allow(dead_code)]
 
 fn main() {
     let _ = (0..4).filter_map(|x| if x > 1 { Some(x) } else { None });
+    //~^ unnecessary_filter_map
+
     let _ = (0..4).filter_map(|x| {
+        //~^ unnecessary_filter_map
+
         if x > 1 {
             return Some(x);
         };
         None
     });
     let _ = (0..4).filter_map(|x| match x {
+        //~^ unnecessary_filter_map
         0 | 1 => None,
         _ => Some(x),
     });
 
     let _ = (0..4).filter_map(|x| Some(x + 1));
+    //~^ unnecessary_filter_map
 
     let _ = (0..4).filter_map(i32::checked_abs);
+
+    let _ = (0..4).filter_map(Some);
+
+    let _ = vec![Some(10), None].into_iter().filter_map(|x| Some(x));
+    //~^ redundant_closure
+    //~| unnecessary_filter_map
+    //~| unnecessary_filter_map
 }
 
 fn filter_map_none_changes_item_type() -> impl Iterator<Item = bool> {
@@ -147,4 +161,11 @@ mod comment_1052978898 {
             }
         })
     }
+}
+
+fn issue11260() {
+    // #11260 is about unnecessary_find_map, but the fix also kind of applies to
+    // unnecessary_filter_map
+    let _x = std::iter::once(1).filter_map(|n| (n > 1).then_some(n));
+    //~^ unnecessary_filter_map
 }

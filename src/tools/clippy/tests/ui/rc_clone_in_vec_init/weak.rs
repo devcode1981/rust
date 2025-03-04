@@ -1,4 +1,6 @@
+//@no-rustfix: overlapping suggestions
 #![warn(clippy::rc_clone_in_vec_init)]
+#![allow(clippy::useless_vec)]
 use std::rc::{Rc, Weak as UnSyncWeak};
 use std::sync::{Arc, Mutex, Weak as SyncWeak};
 
@@ -6,10 +8,16 @@ fn main() {}
 
 fn should_warn_simple_case() {
     let v = vec![SyncWeak::<u32>::new(); 2];
+    //~^ rc_clone_in_vec_init
+
     let v2 = vec![UnSyncWeak::<u32>::new(); 2];
+    //~^ rc_clone_in_vec_init
 
     let v = vec![Rc::downgrade(&Rc::new("x".to_string())); 2];
+    //~^ rc_clone_in_vec_init
+
     let v = vec![Arc::downgrade(&Arc::new("x".to_string())); 2];
+    //~^ rc_clone_in_vec_init
 }
 
 fn should_warn_simple_case_with_big_indentation() {
@@ -18,13 +26,19 @@ fn should_warn_simple_case_with_big_indentation() {
         dbg!(k);
         if true {
             let v = vec![Arc::downgrade(&Arc::new("x".to_string())); 2];
+            //~^ rc_clone_in_vec_init
+
             let v2 = vec![Rc::downgrade(&Rc::new("x".to_string())); 2];
+            //~^ rc_clone_in_vec_init
         }
     }
 }
 
 fn should_warn_complex_case() {
     let v = vec![
+    //~^ rc_clone_in_vec_init
+
+
         Arc::downgrade(&Arc::new(Mutex::new({
             let x = 1;
             dbg!(x);
@@ -34,6 +48,9 @@ fn should_warn_complex_case() {
     ];
 
     let v1 = vec![
+    //~^ rc_clone_in_vec_init
+
+
         Rc::downgrade(&Rc::new(Mutex::new({
             let x = 1;
             dbg!(x);

@@ -1,8 +1,8 @@
 mod absurd_extreme_comparisons;
 mod assign_op_pattern;
 mod bit_mask;
-mod cmp_nan;
 mod cmp_owned;
+mod const_comparisons;
 mod double_comparison;
 mod duration_subsec;
 mod eq_op;
@@ -11,6 +11,7 @@ mod float_cmp;
 mod float_equality_without_abs;
 mod identity_op;
 mod integer_division;
+mod manual_midpoint;
 mod misrefactored_assign_op;
 mod modulo_arithmetic;
 mod modulo_one;
@@ -23,9 +24,11 @@ mod verbose_bit_mask;
 
 pub(crate) mod arithmetic_side_effects;
 
+use clippy_config::Conf;
+use clippy_utils::msrvs::Msrv;
 use rustc_hir::{Body, Expr, ExprKind, UnOp};
 use rustc_lint::{LateContext, LateLintPass};
-use rustc_session::{declare_tool_lint, impl_lint_pass};
+use rustc_session::impl_lint_pass;
 
 declare_clippy_lint! {
     /// ### What it does
@@ -48,7 +51,7 @@ declare_clippy_lint! {
     /// like `#[cfg(target_pointer_width = "64")] ..` instead.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// let vec: Vec<isize> = Vec::new();
     /// if vec.len() <= 0 {}
     /// if 100 > i32::MAX {}
@@ -70,16 +73,16 @@ declare_clippy_lint! {
     /// Known safe built-in types like `Wrapping` or `Saturating`, floats, operations in constant
     /// environments, allowed types and non-constant operations that won't overflow are ignored.
     ///
-    /// ### Why is this bad?
+    /// ### Why restrict this?
     /// For integers, overflow will trigger a panic in debug builds or wrap the result in
     /// release mode; division by zero will cause a panic in either mode. As a result, it is
     /// desirable to explicitly call checked, wrapping or saturating arithmetic methods.
     ///
     /// #### Example
-    /// ```rust
+    /// ```no_run
     /// // `n` can be any number, including `i32::MAX`.
     /// fn foo(n: i32) -> i32 {
-    ///   n + 1
+    ///     n + 1
     /// }
     /// ```
     ///
@@ -90,9 +93,6 @@ declare_clippy_lint! {
     /// use rust_decimal::Decimal;
     /// let _n = Decimal::MAX + Decimal::MAX;
     /// ```
-    ///
-    /// ### Allowed types
-    /// Custom allowed types can be specified through the "arithmetic-side-effects-allowed" filter.
     #[clippy::version = "1.64.0"]
     pub ARITHMETIC_SIDE_EFFECTS,
     restriction,
@@ -101,40 +101,14 @@ declare_clippy_lint! {
 
 declare_clippy_lint! {
     /// ### What it does
-    /// Checks for integer arithmetic operations which could overflow or panic.
-    ///
-    /// Specifically, checks for any operators (`+`, `-`, `*`, `<<`, etc) which are capable
-    /// of overflowing according to the [Rust
-    /// Reference](https://doc.rust-lang.org/reference/expressions/operator-expr.html#overflow),
-    /// or which can panic (`/`, `%`). No bounds analysis or sophisticated reasoning is
-    /// attempted.
-    ///
-    /// ### Why is this bad?
-    /// Integer overflow will trigger a panic in debug builds or will wrap in
-    /// release mode. Division by zero will cause a panic in either mode. In some applications one
-    /// wants explicitly checked, wrapping or saturating arithmetic.
-    ///
-    /// ### Example
-    /// ```rust
-    /// # let a = 0;
-    /// a + 1;
-    /// ```
-    #[clippy::version = "pre 1.29.0"]
-    pub INTEGER_ARITHMETIC,
-    restriction,
-    "any integer arithmetic expression which could overflow or panic"
-}
-
-declare_clippy_lint! {
-    /// ### What it does
     /// Checks for float arithmetic.
     ///
-    /// ### Why is this bad?
+    /// ### Why restrict this?
     /// For some embedded systems or kernel development, it
     /// can be useful to rule out floating-point numbers.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// # let a = 0.0;
     /// a + 1.0;
     /// ```
@@ -157,7 +131,7 @@ declare_clippy_lint! {
     /// implementations that differ from the regular `Op` impl.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// let mut a = 5;
     /// let b = 0;
     /// // ...
@@ -166,7 +140,7 @@ declare_clippy_lint! {
     /// ```
     ///
     /// Use instead:
-    /// ```rust
+    /// ```no_run
     /// let mut a = 5;
     /// let b = 0;
     /// // ...
@@ -194,7 +168,7 @@ declare_clippy_lint! {
     /// written as `a = a op a op b` as it's less confusing.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// let mut a = 5;
     /// let b = 2;
     /// // ...
@@ -234,7 +208,7 @@ declare_clippy_lint! {
     /// test-case for this lint.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// # let x = 1;
     /// if (x & 1 == 2) { }
     /// ```
@@ -267,9 +241,16 @@ declare_clippy_lint! {
     /// uncommon).
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// # let x = 1;
     /// if (x | 1 > 3) {  }
+    /// ```
+    ///
+    /// Use instead:
+    ///
+    /// ```no_run
+    /// # let x = 1;
+    /// if (x >= 2) {  }
     /// ```
     #[clippy::version = "pre 1.29.0"]
     pub INEFFECTIVE_BIT_MASK,
@@ -283,16 +264,20 @@ declare_clippy_lint! {
     /// to `trailing_zeros`
     ///
     /// ### Why is this bad?
-    /// `x.trailing_zeros() > 4` is much clearer than `x & 15
+    /// `x.trailing_zeros() >= 4` is much clearer than `x & 15
     /// == 0`
     ///
-    /// ### Known problems
-    /// llvm generates better code for `x & 15 == 0` on x86
-    ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// # let x = 1;
     /// if x & 0b1111 == 0 { }
+    /// ```
+    ///
+    /// Use instead:
+    ///
+    /// ```no_run
+    /// # let x: i32 = 1;
+    /// if x.trailing_zeros() >= 4 { }
     /// ```
     #[clippy::version = "pre 1.29.0"]
     pub VERBOSE_BIT_MASK,
@@ -309,7 +294,7 @@ declare_clippy_lint! {
     /// Readability.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// # let x = 1;
     /// # let y = 2;
     /// if x == y || x < y {}
@@ -317,7 +302,7 @@ declare_clippy_lint! {
     ///
     /// Use instead:
     ///
-    /// ```rust
+    /// ```no_run
     /// # let x = 1;
     /// # let y = 2;
     /// if x <= y {}
@@ -330,6 +315,45 @@ declare_clippy_lint! {
 
 declare_clippy_lint! {
     /// ### What it does
+    /// Checks for double comparisons that can never succeed
+    ///
+    /// ### Why is this bad?
+    /// The whole expression can be replaced by `false`,
+    /// which is probably not the programmer's intention
+    ///
+    /// ### Example
+    /// ```no_run
+    /// # let status_code = 200;
+    /// if status_code <= 400 && status_code > 500 {}
+    /// ```
+    #[clippy::version = "1.73.0"]
+    pub IMPOSSIBLE_COMPARISONS,
+    correctness,
+    "double comparisons that will never evaluate to `true`"
+}
+
+declare_clippy_lint! {
+    /// ### What it does
+    /// Checks for ineffective double comparisons against constants.
+    ///
+    /// ### Why is this bad?
+    /// Only one of the comparisons has any effect on the result, the programmer
+    /// probably intended to flip one of the comparison operators, or compare a
+    /// different value entirely.
+    ///
+    /// ### Example
+    /// ```no_run
+    /// # let status_code = 200;
+    /// if status_code <= 400 && status_code < 500 {}
+    /// ```
+    #[clippy::version = "1.73.0"]
+    pub REDUNDANT_COMPARISONS,
+    correctness,
+    "double comparisons where one of them can be removed"
+}
+
+declare_clippy_lint! {
+    /// ### What it does
     /// Checks for calculation of subsecond microseconds or milliseconds
     /// from other `Duration` methods.
     ///
@@ -338,7 +362,7 @@ declare_clippy_lint! {
     /// `Duration::subsec_millis()` than to calculate them.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// # use std::time::Duration;
     /// # let duration = Duration::new(5, 0);
     /// let micros = duration.subsec_nanos() / 1_000;
@@ -346,7 +370,7 @@ declare_clippy_lint! {
     /// ```
     ///
     /// Use instead:
-    /// ```rust
+    /// ```no_run
     /// # use std::time::Duration;
     /// # let duration = Duration::new(5, 0);
     /// let micros = duration.subsec_micros();
@@ -374,7 +398,7 @@ declare_clippy_lint! {
     /// calls. We may introduce a list of known pure functions in the future.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// # let x = 1;
     /// if x + 1 == x + 1 {}
     ///
@@ -424,7 +448,7 @@ declare_clippy_lint! {
     /// corrected
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// let x = 1;
     /// 0 / x;
     /// 0 * x;
@@ -452,13 +476,13 @@ declare_clippy_lint! {
     /// with an allow.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// pub fn is_roughly_equal(a: f32, b: f32) -> bool {
     ///     (a - b) < f32::EPSILON
     /// }
     /// ```
     /// Use instead:
-    /// ```rust
+    /// ```no_run
     /// pub fn is_roughly_equal(a: f32, b: f32) -> bool {
     ///     (a - b).abs() < f32::EPSILON
     /// }
@@ -478,7 +502,7 @@ declare_clippy_lint! {
     /// meaning. So it just obscures what's going on. Delete it mercilessly.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// # let x = 1;
     /// x / 1 + 0 * 1 - 0 | 0;
     /// ```
@@ -492,19 +516,19 @@ declare_clippy_lint! {
     /// ### What it does
     /// Checks for division of integers
     ///
-    /// ### Why is this bad?
+    /// ### Why restrict this?
     /// When outside of some very specific algorithms,
     /// integer division is very often a mistake because it discards the
     /// remainder.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// let x = 3 / 2;
     /// println!("{}", x);
     /// ```
     ///
     /// Use instead:
-    /// ```rust
+    /// ```no_run
     /// let x = 3f32 / 2f32;
     /// println!("{}", x);
     /// ```
@@ -512,31 +536,6 @@ declare_clippy_lint! {
     pub INTEGER_DIVISION,
     restriction,
     "integer division may cause loss of precision"
-}
-
-declare_clippy_lint! {
-    /// ### What it does
-    /// Checks for comparisons to NaN.
-    ///
-    /// ### Why is this bad?
-    /// NaN does not compare meaningfully to anything – not
-    /// even itself – so those comparisons are simply wrong.
-    ///
-    /// ### Example
-    /// ```rust
-    /// # let x = 1.0;
-    /// if x == f32::NAN { }
-    /// ```
-    ///
-    /// Use instead:
-    /// ```rust
-    /// # let x = 1.0f32;
-    /// if x.is_nan() { }
-    /// ```
-    #[clippy::version = "pre 1.29.0"]
-    pub CMP_NAN,
-    correctness,
-    "comparisons to `NAN`, which will always return false, probably not intended"
 }
 
 declare_clippy_lint! {
@@ -550,14 +549,14 @@ declare_clippy_lint! {
     /// needlessly consuming code and heap space.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// # let x = "foo";
     /// # let y = String::from("foo");
     /// if x.to_owned() == y {}
     /// ```
     ///
     /// Use instead:
-    /// ```rust
+    /// ```no_run
     /// # let x = "foo";
     /// # let y = String::from("foo");
     /// if x == y {}
@@ -575,74 +574,128 @@ declare_clippy_lint! {
     /// implement equality for a type involving floats).
     ///
     /// ### Why is this bad?
-    /// Floating point calculations are usually imprecise, so
-    /// asking if two values are *exactly* equal is asking for trouble. For a good
-    /// guide on what to do, see [the floating point
-    /// guide](http://www.floating-point-gui.de/errors/comparison).
+    /// Floating point calculations are usually imprecise, so asking if two values are *exactly*
+    /// equal is asking for trouble because arriving at the same logical result via different
+    /// routes (e.g. calculation versus constant) may yield different values.
     ///
     /// ### Example
-    /// ```rust
-    /// let x = 1.2331f64;
-    /// let y = 1.2332f64;
     ///
-    /// if y == 1.23f64 { }
-    /// if y != x {} // where both are floats
+    /// ```no_run
+    /// let a: f64 = 1000.1;
+    /// let b: f64 = 0.2;
+    /// let x = a + b;
+    /// let y = 1000.3; // Expected value.
+    ///
+    /// // Actual value: 1000.3000000000001
+    /// println!("{x}");
+    ///
+    /// let are_equal = x == y;
+    /// println!("{are_equal}"); // false
     /// ```
     ///
-    /// Use instead:
-    /// ```rust
-    /// # let x = 1.2331f64;
-    /// # let y = 1.2332f64;
-    /// let error_margin = f64::EPSILON; // Use an epsilon for comparison
-    /// // Or, if Rust <= 1.42, use `std::f64::EPSILON` constant instead.
-    /// // let error_margin = std::f64::EPSILON;
-    /// if (y - 1.23f64).abs() < error_margin { }
-    /// if (y - x).abs() > error_margin { }
+    /// The correct way to compare floating point numbers is to define an allowed error margin. This
+    /// may be challenging if there is no "natural" error margin to permit. Broadly speaking, there
+    /// are two cases:
+    ///
+    /// 1. If your values are in a known range and you can define a threshold for "close enough to
+    ///    be equal", it may be appropriate to define an absolute error margin. For example, if your
+    ///    data is "length of vehicle in centimeters", you may consider 0.1 cm to be "close enough".
+    /// 1. If your code is more general and you do not know the range of values, you should use a
+    ///    relative error margin, accepting e.g. 0.1% of error regardless of specific values.
+    ///
+    /// For the scenario where you can define a meaningful absolute error margin, consider using:
+    ///
+    /// ```no_run
+    /// let a: f64 = 1000.1;
+    /// let b: f64 = 0.2;
+    /// let x = a + b;
+    /// let y = 1000.3; // Expected value.
+    ///
+    /// const ALLOWED_ERROR_VEHICLE_LENGTH_CM: f64 = 0.1;
+    /// let within_tolerance = (x - y).abs() < ALLOWED_ERROR_VEHICLE_LENGTH_CM;
+    /// println!("{within_tolerance}"); // true
     /// ```
+    ///
+    /// NB! Do not use `f64::EPSILON` - while the error margin is often called "epsilon", this is
+    /// a different use of the term that is not suitable for floating point equality comparison.
+    /// Indeed, for the example above using `f64::EPSILON` as the allowed error would return `false`.
+    ///
+    /// For the scenario where no meaningful absolute error can be defined, refer to
+    /// [the floating point guide](https://www.floating-point-gui.de/errors/comparison)
+    /// for a reference implementation of relative error based comparison of floating point values.
+    /// `MIN_NORMAL` in the reference implementation is equivalent to `MIN_POSITIVE` in Rust.
     #[clippy::version = "pre 1.29.0"]
     pub FLOAT_CMP,
     pedantic,
-    "using `==` or `!=` on float values instead of comparing difference with an epsilon"
+    "using `==` or `!=` on float values instead of comparing difference with an allowed error"
 }
 
 declare_clippy_lint! {
     /// ### What it does
-    /// Checks for (in-)equality comparisons on floating-point
-    /// value and constant, except in functions called `*eq*` (which probably
+    /// Checks for (in-)equality comparisons on constant floating-point
+    /// values (apart from zero), except in functions called `*eq*` (which probably
     /// implement equality for a type involving floats).
     ///
-    /// ### Why is this bad?
-    /// Floating point calculations are usually imprecise, so
-    /// asking if two values are *exactly* equal is asking for trouble. For a good
-    /// guide on what to do, see [the floating point
-    /// guide](http://www.floating-point-gui.de/errors/comparison).
+    /// ### Why restrict this?
+    /// Floating point calculations are usually imprecise, so asking if two values are *exactly*
+    /// equal is asking for trouble because arriving at the same logical result via different
+    /// routes (e.g. calculation versus constant) may yield different values.
     ///
     /// ### Example
-    /// ```rust
-    /// let x: f64 = 1.0;
-    /// const ONE: f64 = 1.00;
     ///
-    /// if x == ONE { } // where both are floats
+    /// ```no_run
+    /// let a: f64 = 1000.1;
+    /// let b: f64 = 0.2;
+    /// let x = a + b;
+    /// const Y: f64 = 1000.3; // Expected value.
+    ///
+    /// // Actual value: 1000.3000000000001
+    /// println!("{x}");
+    ///
+    /// let are_equal = x == Y;
+    /// println!("{are_equal}"); // false
     /// ```
     ///
-    /// Use instead:
-    /// ```rust
-    /// # let x: f64 = 1.0;
-    /// # const ONE: f64 = 1.00;
-    /// let error_margin = f64::EPSILON; // Use an epsilon for comparison
-    /// // Or, if Rust <= 1.42, use `std::f64::EPSILON` constant instead.
-    /// // let error_margin = std::f64::EPSILON;
-    /// if (x - ONE).abs() < error_margin { }
+    /// The correct way to compare floating point numbers is to define an allowed error margin. This
+    /// may be challenging if there is no "natural" error margin to permit. Broadly speaking, there
+    /// are two cases:
+    ///
+    /// 1. If your values are in a known range and you can define a threshold for "close enough to
+    ///    be equal", it may be appropriate to define an absolute error margin. For example, if your
+    ///    data is "length of vehicle in centimeters", you may consider 0.1 cm to be "close enough".
+    /// 1. If your code is more general and you do not know the range of values, you should use a
+    ///    relative error margin, accepting e.g. 0.1% of error regardless of specific values.
+    ///
+    /// For the scenario where you can define a meaningful absolute error margin, consider using:
+    ///
+    /// ```no_run
+    /// let a: f64 = 1000.1;
+    /// let b: f64 = 0.2;
+    /// let x = a + b;
+    /// const Y: f64 = 1000.3; // Expected value.
+    ///
+    /// const ALLOWED_ERROR_VEHICLE_LENGTH_CM: f64 = 0.1;
+    /// let within_tolerance = (x - Y).abs() < ALLOWED_ERROR_VEHICLE_LENGTH_CM;
+    /// println!("{within_tolerance}"); // true
     /// ```
+    ///
+    /// NB! Do not use `f64::EPSILON` - while the error margin is often called "epsilon", this is
+    /// a different use of the term that is not suitable for floating point equality comparison.
+    /// Indeed, for the example above using `f64::EPSILON` as the allowed error would return `false`.
+    ///
+    /// For the scenario where no meaningful absolute error can be defined, refer to
+    /// [the floating point guide](https://www.floating-point-gui.de/errors/comparison)
+    /// for a reference implementation of relative error based comparison of floating point values.
+    /// `MIN_NORMAL` in the reference implementation is equivalent to `MIN_POSITIVE` in Rust.
     #[clippy::version = "pre 1.29.0"]
     pub FLOAT_CMP_CONST,
     restriction,
-    "using `==` or `!=` on float constants instead of comparing difference with an epsilon"
+    "using `==` or `!=` on float constants instead of comparing difference with an allowed error"
 }
 
 declare_clippy_lint! {
     /// ### What it does
-    /// Checks for getting the remainder of a division by one or minus
+    /// Checks for getting the remainder of integer division by one or minus
     /// one.
     ///
     /// ### Why is this bad?
@@ -653,7 +706,7 @@ declare_clippy_lint! {
     /// contest, it's probably a bad idea. Use something more underhanded.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// # let x = 1;
     /// let a = x % 1;
     /// let a = x % -1;
@@ -661,15 +714,15 @@ declare_clippy_lint! {
     #[clippy::version = "pre 1.29.0"]
     pub MODULO_ONE,
     correctness,
-    "taking a number modulo +/-1, which can either panic/overflow or always returns 0"
+    "taking an integer modulo +/-1, which can either panic/overflow or always returns 0"
 }
 
 declare_clippy_lint! {
     /// ### What it does
     /// Checks for modulo arithmetic.
     ///
-    /// ### Why is this bad?
-    /// The results of modulo (%) operation might differ
+    /// ### Why restrict this?
+    /// The results of modulo (`%`) operation might differ
     /// depending on the language, when negative numbers are involved.
     /// If you interop with different languages it might be beneficial
     /// to double check all places that use modulo arithmetic.
@@ -677,7 +730,7 @@ declare_clippy_lint! {
     /// For example, in Rust `17 % -3 = 2`, but in Python `17 % -3 = -1`.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// let x = -17 % 3;
     /// ```
     #[clippy::version = "1.42.0"]
@@ -688,7 +741,7 @@ declare_clippy_lint! {
 
 declare_clippy_lint! {
     /// ### What it does
-    /// Checks for uses of bitwise and/or operators between booleans, where performance may be improved by using
+    /// Checks for usage of bitwise and/or operators between booleans, where performance may be improved by using
     /// a lazy and.
     ///
     /// ### Why is this bad?
@@ -700,12 +753,12 @@ declare_clippy_lint! {
     /// determination is quite conservative.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// let (x,y) = (true, false);
     /// if x & !y {} // where both x and y are booleans
     /// ```
     /// Use instead:
-    /// ```rust
+    /// ```no_run
     /// let (x,y) = (true, false);
     /// if x && !y {}
     /// ```
@@ -725,14 +778,14 @@ declare_clippy_lint! {
     /// comparing the values they point to.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// let a = &[1, 2, 3];
     /// let b = &[1, 2, 3];
     ///
     /// assert!(a as *const _ as usize == b as *const _ as usize);
     /// ```
     /// Use instead:
-    /// ```rust
+    /// ```no_run
     /// let a = &[1, 2, 3];
     /// let b = &[1, 2, 3];
     ///
@@ -757,7 +810,7 @@ declare_clippy_lint! {
     /// indexing operations they are assumed not to have any side effects.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// struct Event {
     ///     x: i32,
     /// }
@@ -768,7 +821,7 @@ declare_clippy_lint! {
     /// ```
     ///
     /// Should be:
-    /// ```rust
+    /// ```no_run
     /// struct Event {
     ///     x: i32,
     /// }
@@ -783,14 +836,50 @@ declare_clippy_lint! {
     "explicit self-assignment"
 }
 
+declare_clippy_lint! {
+    /// ### What it does
+    /// Checks for manual implementation of `midpoint`.
+    ///
+    /// ### Why is this bad?
+    /// Using `(x + y) / 2` might cause an overflow on the intermediate
+    /// addition result.
+    ///
+    /// ### Example
+    /// ```no_run
+    /// # let a: u32 = 0;
+    /// let c = (a + 10) / 2;
+    /// ```
+    /// Use instead:
+    /// ```no_run
+    /// # let a: u32 = 0;
+    /// let c = u32::midpoint(a, 10);
+    /// ```
+    #[clippy::version = "1.87.0"]
+    pub MANUAL_MIDPOINT,
+    pedantic,
+    "manual implementation of `midpoint` which can overflow"
+}
+
 pub struct Operators {
     arithmetic_context: numeric_arithmetic::Context,
     verbose_bit_mask_threshold: u64,
+    modulo_arithmetic_allow_comparison_to_zero: bool,
+    msrv: Msrv,
 }
+impl Operators {
+    pub fn new(conf: &'static Conf) -> Self {
+        Self {
+            arithmetic_context: numeric_arithmetic::Context::default(),
+            verbose_bit_mask_threshold: conf.verbose_bit_mask_threshold,
+            modulo_arithmetic_allow_comparison_to_zero: conf.allow_comparison_to_zero,
+            msrv: conf.msrv,
+        }
+    }
+}
+
 impl_lint_pass!(Operators => [
     ABSURD_EXTREME_COMPARISONS,
     ARITHMETIC_SIDE_EFFECTS,
-    INTEGER_ARITHMETIC,
     FLOAT_ARITHMETIC,
     ASSIGN_OP_PATTERN,
     MISREFACTORED_ASSIGN_OP,
@@ -798,6 +887,8 @@ impl_lint_pass!(Operators => [
     INEFFECTIVE_BIT_MASK,
     VERBOSE_BIT_MASK,
     DOUBLE_COMPARISONS,
+    IMPOSSIBLE_COMPARISONS,
+    REDUNDANT_COMPARISONS,
     DURATION_SUBSEC,
     EQ_OP,
     OP_REF,
@@ -805,7 +896,6 @@ impl_lint_pass!(Operators => [
     FLOAT_EQUALITY_WITHOUT_ABS,
     IDENTITY_OP,
     INTEGER_DIVISION,
-    CMP_NAN,
     CMP_OWNED,
     FLOAT_CMP,
     FLOAT_CMP_CONST,
@@ -814,15 +904,9 @@ impl_lint_pass!(Operators => [
     NEEDLESS_BITWISE_BOOL,
     PTR_EQ,
     SELF_ASSIGNMENT,
+    MANUAL_MIDPOINT,
 ]);
-impl Operators {
-    pub fn new(verbose_bit_mask_threshold: u64) -> Self {
-        Self {
-            arithmetic_context: numeric_arithmetic::Context::default(),
-            verbose_bit_mask_threshold,
-        }
-    }
-}
+
 impl<'tcx> LateLintPass<'tcx> for Operators {
     fn check_expr(&mut self, cx: &LateContext<'tcx>, e: &'tcx Expr<'_>) {
         eq_op::check_assert(cx, e);
@@ -838,24 +922,32 @@ impl<'tcx> LateLintPass<'tcx> for Operators {
                     identity_op::check(cx, e, op.node, lhs, rhs);
                     needless_bitwise_bool::check(cx, e, op.node, lhs, rhs);
                     ptr_eq::check(cx, e, op.node, lhs, rhs);
+                    manual_midpoint::check(cx, e, op.node, lhs, rhs, self.msrv);
                 }
                 self.arithmetic_context.check_binary(cx, e, op.node, lhs, rhs);
                 bit_mask::check(cx, e, op.node, lhs, rhs);
                 verbose_bit_mask::check(cx, e, op.node, lhs, rhs, self.verbose_bit_mask_threshold);
                 double_comparison::check(cx, op.node, lhs, rhs, e.span);
+                const_comparisons::check(cx, op, lhs, rhs, e.span);
                 duration_subsec::check(cx, e, op.node, lhs, rhs);
                 float_equality_without_abs::check(cx, e, op.node, lhs, rhs);
                 integer_division::check(cx, e, op.node, lhs, rhs);
-                cmp_nan::check(cx, e, op.node, lhs, rhs);
                 cmp_owned::check(cx, op.node, lhs, rhs);
                 float_cmp::check(cx, e, op.node, lhs, rhs);
                 modulo_one::check(cx, e, op.node, rhs);
-                modulo_arithmetic::check(cx, e, op.node, lhs, rhs);
+                modulo_arithmetic::check(
+                    cx,
+                    e,
+                    op.node,
+                    lhs,
+                    rhs,
+                    self.modulo_arithmetic_allow_comparison_to_zero,
+                );
             },
             ExprKind::AssignOp(op, lhs, rhs) => {
                 self.arithmetic_context.check_binary(cx, e, op.node, lhs, rhs);
                 misrefactored_assign_op::check(cx, e, op.node, lhs, rhs);
-                modulo_arithmetic::check(cx, e, op.node, lhs, rhs);
+                modulo_arithmetic::check(cx, e, op.node, lhs, rhs, false);
             },
             ExprKind::Assign(lhs, rhs, _) => {
                 assign_op_pattern::check(cx, e, lhs, rhs);
@@ -874,11 +966,11 @@ impl<'tcx> LateLintPass<'tcx> for Operators {
         self.arithmetic_context.expr_post(e.hir_id);
     }
 
-    fn check_body(&mut self, cx: &LateContext<'tcx>, b: &'tcx Body<'_>) {
+    fn check_body(&mut self, cx: &LateContext<'tcx>, b: &Body<'_>) {
         self.arithmetic_context.enter_body(cx, b);
     }
 
-    fn check_body_post(&mut self, cx: &LateContext<'tcx>, b: &'tcx Body<'_>) {
+    fn check_body_post(&mut self, cx: &LateContext<'tcx>, b: &Body<'_>) {
         self.arithmetic_context.body_post(cx, b);
     }
 }

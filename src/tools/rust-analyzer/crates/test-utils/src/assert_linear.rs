@@ -11,7 +11,7 @@
 //! Ideally, we should use a proper "model selection" to directly compare
 //! quadratic and linear models, but that sounds rather complicated:
 //!
-//!     https://stats.stackexchange.com/questions/21844/selecting-best-model-based-on-linear-quadratic-and-cubic-fit-of-data
+//! > https://stats.stackexchange.com/questions/21844/selecting-best-model-based-on-linear-quadratic-and-cubic-fit-of-data
 //!
 //! We might get false positives on a VM, but never false negatives. So, if the
 //! first round fails, we repeat the ordeal three more times and fail only if
@@ -83,7 +83,7 @@ impl Round {
 
         let a = mean_y - b * mean_x;
 
-        self.plot = format!("y_pred = {:.3} + {:.3} * x\n\nx     y     y_pred\n", a, b);
+        self.plot = format!("y_pred = {a:.3} + {b:.3} * x\n\nx     y     y_pred\n");
 
         let mut se = 0.0;
         let mut max_error = 0.0f64;
@@ -100,7 +100,7 @@ impl Round {
 
         self.linear = rmse < 0.05 && max_error < 0.1 && a > -0.1;
 
-        fn normalize(xs: &mut Vec<f64>) {
+        fn normalize(xs: &mut [f64]) {
             let max = xs.iter().copied().max_by(|a, b| a.partial_cmp(b).unwrap()).unwrap();
             xs.iter_mut().for_each(|it| *it /= max);
         }

@@ -1,22 +1,28 @@
 //! Defines a unit of change that can applied to the database to get the next
 //! state. Changes are transactional.
 
-use std::{fmt, sync::Arc};
+use std::fmt;
 
-use salsa::Durability;
+use ra_salsa::Durability;
+use rustc_hash::FxHashMap;
+use triomphe::Arc;
 use vfs::FileId;
 
-use crate::{CrateGraph, SourceDatabaseExt, SourceRoot, SourceRootId};
+use crate::{
+    CrateGraph, CrateId, CrateWorkspaceData, SourceDatabaseFileInputExt, SourceRoot,
+    SourceRootDatabase, SourceRootId,
+};
 
 /// Encapsulate a bunch of raw `.set` calls on the database.
 #[derive(Default)]
-pub struct Change {
+pub struct FileChange {
     pub roots: Option<Vec<SourceRoot>>,
-    pub files_changed: Vec<(FileId, Option<Arc<String>>)>,
+    pub files_changed: Vec<(FileId, Option<String>)>,
     pub crate_graph: Option<CrateGraph>,
+    pub ws_data: Option<FxHashMap<CrateId, Arc<CrateWorkspaceData>>>,
 }
 
-impl fmt::Debug for Change {
+impl fmt::Debug for FileChange {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut d = fmt.debug_struct("Change");
         if let Some(roots) = &self.roots {
@@ -32,16 +38,16 @@ impl fmt::Debug for Change {
     }
 }
 
-impl Change {
-    pub fn new() -> Change {
-        Change::default()
+impl FileChange {
+    pub fn new() -> Self {
+        FileChange::default()
     }
 
     pub fn set_roots(&mut self, roots: Vec<SourceRoot>) {
         self.roots = Some(roots);
     }
 
-    pub fn change_file(&mut self, file_id: FileId, new_text: Option<Arc<String>>) {
+    pub fn change_file(&mut self, file_id: FileId, new_text: Option<String>) {
         self.files_changed.push((file_id, new_text))
     }
 
@@ -49,8 +55,12 @@ impl Change {
         self.crate_graph = Some(graph);
     }
 
-    pub fn apply(self, db: &mut dyn SourceDatabaseExt) {
-        let _p = profile::span("RootDatabase::apply_change");
+    pub fn set_ws_data(&mut self, data: FxHashMap<CrateId, Arc<CrateWorkspaceData>>) {
+        self.ws_data = Some(data);
+    }
+
+    pub fn apply(self, db: &mut dyn SourceRootDatabase) {
+        let _p = tracing::info_span!("FileChange::apply").entered();
         if let Some(roots) = self.roots {
             for (idx, root) in roots.into_iter().enumerate() {
                 let root_id = SourceRootId(idx as u32);
@@ -68,10 +78,13 @@ impl Change {
             let durability = durability(&source_root);
             // XXX: can't actually remove the file, just reset the text
             let text = text.unwrap_or_default();
-            db.set_file_text_with_durability(file_id, text, durability)
+            db.set_file_text_with_durability(file_id, &text, durability)
         }
         if let Some(crate_graph) = self.crate_graph {
-            db.set_crate_graph_with_durability(Arc::new(crate_graph), Durability::HIGH)
+            db.set_crate_graph_with_durability(Arc::new(crate_graph), Durability::HIGH);
+        }
+        if let Some(data) = self.ws_data {
+            db.set_crate_workspace_data_with_durability(Arc::new(data), Durability::HIGH);
         }
     }
 }

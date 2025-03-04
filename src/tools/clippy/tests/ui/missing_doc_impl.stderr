@@ -1,107 +1,57 @@
 error: missing documentation for a struct
-  --> $DIR/missing_doc_impl.rs:13:1
+  --> tests/ui/missing_doc_impl.rs:13:1
    |
 LL | / struct Foo {
+LL | |
 LL | |     a: isize,
-LL | |     b: isize,
+...  |
 LL | | }
    | |_^
    |
    = note: `-D clippy::missing-docs-in-private-items` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::missing_docs_in_private_items)]`
 
 error: missing documentation for a struct field
-  --> $DIR/missing_doc_impl.rs:14:5
+  --> tests/ui/missing_doc_impl.rs:15:5
    |
 LL |     a: isize,
    |     ^^^^^^^^
 
 error: missing documentation for a struct field
-  --> $DIR/missing_doc_impl.rs:15:5
+  --> tests/ui/missing_doc_impl.rs:17:5
    |
 LL |     b: isize,
    |     ^^^^^^^^
 
-error: missing documentation for a struct
-  --> $DIR/missing_doc_impl.rs:18:1
-   |
-LL | / pub struct PubFoo {
-LL | |     pub a: isize,
-LL | |     b: isize,
-LL | | }
-   | |_^
-
 error: missing documentation for a struct field
-  --> $DIR/missing_doc_impl.rs:19:5
-   |
-LL |     pub a: isize,
-   |     ^^^^^^^^^^^^
-
-error: missing documentation for a struct field
-  --> $DIR/missing_doc_impl.rs:20:5
+  --> tests/ui/missing_doc_impl.rs:23:5
    |
 LL |     b: isize,
    |     ^^^^^^^^
 
-error: missing documentation for a trait
-  --> $DIR/missing_doc_impl.rs:43:1
-   |
-LL | / pub trait C {
-LL | |     fn foo(&self);
-LL | |     fn foo_with_impl(&self) {}
-LL | | }
-   | |_^
-
 error: missing documentation for an associated function
-  --> $DIR/missing_doc_impl.rs:44:5
-   |
-LL |     fn foo(&self);
-   |     ^^^^^^^^^^^^^^
-
-error: missing documentation for an associated function
-  --> $DIR/missing_doc_impl.rs:45:5
-   |
-LL |     fn foo_with_impl(&self) {}
-   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-error: missing documentation for an associated type
-  --> $DIR/missing_doc_impl.rs:55:5
-   |
-LL |     type AssociatedType;
-   |     ^^^^^^^^^^^^^^^^^^^^
-
-error: missing documentation for an associated type
-  --> $DIR/missing_doc_impl.rs:56:5
-   |
-LL |     type AssociatedTypeDef = Self;
-   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-error: missing documentation for an associated function
-  --> $DIR/missing_doc_impl.rs:67:5
+  --> tests/ui/missing_doc_impl.rs:71:5
    |
 LL | /     pub fn new() -> Self {
+LL | |
 LL | |         Foo { a: 0, b: 0 }
 LL | |     }
    | |_____^
 
 error: missing documentation for an associated function
-  --> $DIR/missing_doc_impl.rs:70:5
+  --> tests/ui/missing_doc_impl.rs:75:5
    |
 LL |     fn bar() {}
    |     ^^^^^^^^^^^
 
 error: missing documentation for an associated function
-  --> $DIR/missing_doc_impl.rs:74:5
-   |
-LL |     pub fn foo() {}
-   |     ^^^^^^^^^^^^^^^
-
-error: missing documentation for an associated function
-  --> $DIR/missing_doc_impl.rs:78:5
+  --> tests/ui/missing_doc_impl.rs:84:5
    |
 LL | /     fn foo2() -> u32 {
+LL | |
 LL | |         1
 LL | |     }
    | |_____^
 
-error: aborting due to 15 previous errors
+error: aborting due to 7 previous errors
 

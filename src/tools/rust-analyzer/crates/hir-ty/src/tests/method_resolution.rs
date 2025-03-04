@@ -9,6 +9,7 @@ fn infer_slice_method() {
     check_types(
         r#"
 impl<T> [T] {
+    #[rustc_allow_incoherent_impl]
     fn foo(&self) -> T {
         loop {}
     }
@@ -35,6 +36,7 @@ fn test() {
 //- /lib.rs crate:other_crate
 mod foo {
     impl f32 {
+        #[rustc_allow_incoherent_impl]
         pub fn foo(self) -> f32 { 0. }
     }
 }
@@ -47,6 +49,7 @@ fn infer_array_inherent_impl() {
     check_types(
         r#"
 impl<T, const N: usize> [T; N] {
+    #[rustc_allow_incoherent_impl]
     fn foo(&self) -> T {
         loop {}
     }
@@ -164,16 +167,16 @@ fn infer_associated_method_with_modules() {
     check_infer(
         r#"
         mod a {
-            struct A;
+            pub struct A;
             impl A { pub fn thing() -> A { A {} }}
         }
 
         mod b {
-            struct B;
+            pub struct B;
             impl B { pub fn thing() -> u32 { 99 }}
 
-            mod c {
-                struct C;
+            pub mod c {
+                pub struct C;
                 impl C { pub fn thing() -> C { C {} }}
             }
         }
@@ -186,22 +189,22 @@ fn infer_associated_method_with_modules() {
         }
         "#,
         expect![[r#"
-            55..63 '{ A {} }': A
-            57..61 'A {}': A
-            125..131 '{ 99 }': u32
-            127..129 '99': u32
-            201..209 '{ C {} }': C
-            203..207 'C {}': C
-            240..324 '{     ...g(); }': ()
-            250..251 'x': A
-            254..265 'a::A::thing': fn thing() -> A
-            254..267 'a::A::thing()': A
-            277..278 'y': u32
-            281..292 'b::B::thing': fn thing() -> u32
-            281..294 'b::B::thing()': u32
-            304..305 'z': C
-            308..319 'c::C::thing': fn thing() -> C
-            308..321 'c::C::thing()': C
+            59..67 '{ A {} }': A
+            61..65 'A {}': A
+            133..139 '{ 99 }': u32
+            135..137 '99': u32
+            217..225 '{ C {} }': C
+            219..223 'C {}': C
+            256..340 '{     ...g(); }': ()
+            266..267 'x': A
+            270..281 'a::A::thing': fn thing() -> A
+            270..283 'a::A::thing()': A
+            293..294 'y': u32
+            297..308 'b::B::thing': fn thing() -> u32
+            297..310 'b::B::thing()': u32
+            320..321 'z': C
+            324..335 'c::C::thing': fn thing() -> C
+            324..337 'c::C::thing()': C
         "#]],
     );
 }
@@ -380,6 +383,24 @@ mod bar_test {
         S.method();
       //^^^^^^^^^^ i128
     }
+}
+        "#,
+    );
+}
+
+#[test]
+fn infer_trait_method_multiple_mutable_reference() {
+    check_types(
+        r#"
+trait Trait {
+    fn method(&mut self) -> i32 { 5 }
+}
+struct S;
+impl Trait for &mut &mut S {}
+fn test() {
+    let s = &mut &mut &mut S;
+    s.method();
+  //^^^^^^^^^^ i32
 }
         "#,
     );
@@ -637,7 +658,7 @@ fn infer_call_trait_method_on_generic_param_1() {
         }
         "#,
         expect![[r#"
-            29..33 'self': &Self
+            29..33 'self': &'? Self
             63..64 't': T
             69..88 '{     ...d(); }': ()
             75..76 't': T
@@ -658,7 +679,7 @@ fn infer_call_trait_method_on_generic_param_2() {
         }
         "#,
         expect![[r#"
-            32..36 'self': &Self
+            32..36 'self': &'? Self
             70..71 't': T
             76..95 '{     ...d(); }': ()
             82..83 't': T
@@ -736,7 +757,7 @@ struct S;
 impl Clone for S {}
 impl Clone for &S {}
 fn test() { (S.clone(), (&S).clone(), (&&S).clone()); }
-          //^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ (S, S, &S)
+          //^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ (S, S, &'? S)
 "#,
     );
 }
@@ -813,7 +834,7 @@ fn test() {
 fn method_resolution_trait_from_prelude() {
     check_types(
         r#"
-//- /main.rs crate:main deps:core
+//- /main.rs edition:2018 crate:main deps:core
 struct S;
 impl Clone for S {}
 
@@ -986,14 +1007,13 @@ fn main() {
 }
 
 #[test]
-fn method_resolution_encountering_fn_type() {
+fn explicit_fn_once_call_fn_item() {
     check_types(
         r#"
-//- /main.rs
+//- minicore: fn
 fn foo() {}
-trait FnOnce { fn call(self); }
-fn test() { foo.call(); }
-          //^^^^^^^^^^ {unknown}
+fn test() { foo.call_once(); }
+          //^^^^^^^^^^^^^^^ ()
 "#,
     );
 }
@@ -1130,12 +1150,12 @@ fn dyn_trait_super_trait_not_in_scope() {
         }
         "#,
         expect![[r#"
-            51..55 'self': &Self
+            51..55 'self': &'? Self
             64..69 '{ 0 }': u32
             66..67 '0': u32
-            176..177 'd': &dyn Trait
+            176..177 'd': &'? dyn Trait
             191..207 '{     ...o(); }': ()
-            197..198 'd': &dyn Trait
+            197..198 'd': &'? dyn Trait
             197..204 'd.foo()': u32
         "#]],
     );
@@ -1162,16 +1182,15 @@ fn test() {
 }
 "#,
         expect![[r#"
-            75..79 'self': &S
+            75..79 'self': &'? S
             89..109 '{     ...     }': bool
             99..103 'true': bool
             123..167 '{     ...o(); }': ()
-            133..134 's': &S
-            137..151 'unsafe { f() }': &S
-            137..151 'unsafe { f() }': &S
-            146..147 'f': fn f() -> &S
-            146..149 'f()': &S
-            157..158 's': &S
+            133..134 's': &'static S
+            137..151 'unsafe { f() }': &'static S
+            146..147 'f': fn f() -> &'static S
+            146..149 'f()': &'static S
+            157..158 's': &'static S
             157..164 's.foo()': bool
         "#]],
     );
@@ -1191,7 +1210,74 @@ impl<T> Slice<T> {
 fn main() {
     let foo: Slice<u32>;
     foo.into_vec(); // we shouldn't crash on this at least
-} //^^^^^^^^^^^^^^ {unknown}
+} //^^^^^^^^^^^^^^ ()
+"#,
+    );
+}
+
+#[test]
+fn inherent_method_deref_raw() {
+    check_types(
+        r#"
+struct Val;
+
+impl Val {
+    pub fn method(self: *const Val) -> u32 {
+        0
+    }
+}
+
+fn main() {
+    let foo: *const Val;
+    foo.method();
+ // ^^^^^^^^^^^^ u32
+}
+"#,
+    );
+}
+
+#[test]
+fn inherent_method_ref_self_deref_raw() {
+    check_types(
+        r#"
+struct Val;
+
+impl Val {
+    pub fn method(&self) -> u32 {
+        0
+    }
+}
+
+fn main() {
+    let foo: *const Val;
+    foo.method();
+ // ^^^^^^^^^^^^ {unknown}
+}
+"#,
+    );
+}
+
+#[test]
+fn trait_method_deref_raw() {
+    check_types(
+        r#"
+trait Trait {
+    fn method(self: *const Self) -> u32;
+}
+
+struct Val;
+
+impl Trait for Val {
+    fn method(self: *const Self) -> u32 {
+        0
+    }
+}
+
+fn main() {
+    let foo: *const Val;
+    foo.method();
+ // ^^^^^^^^^^^^ u32
+}
 "#,
     );
 }
@@ -1200,6 +1286,7 @@ fn main() {
 fn method_on_dyn_impl() {
     check_types(
         r#"
+//- minicore: coerce_unsized
 trait Foo {}
 
 impl Foo for u32 {}
@@ -1256,7 +1343,7 @@ fn foo<T: Trait>(a: &T) {
 fn autoderef_visibility_field() {
     check(
         r#"
-//- minicore: deref
+//- minicore: receiver
 mod a {
     pub struct Foo(pub char);
     pub struct Bar(i32);
@@ -1275,7 +1362,7 @@ mod a {
 mod b {
     fn foo() {
         let x = super::a::Bar::new().0;
-             // ^^^^^^^^^^^^^^^^^^^^ adjustments: Deref(Some(OverloadedDeref(Not)))
+             // ^^^^^^^^^^^^^^^^^^^^ adjustments: Deref(Some(OverloadedDeref(Some(Not))))
              // ^^^^^^^^^^^^^^^^^^^^^^ type: char
     }
 }
@@ -1288,7 +1375,7 @@ fn autoderef_visibility_method() {
     cov_mark::check!(autoderef_candidate_not_visible);
     check(
         r#"
-//- minicore: deref
+//- minicore: receiver
 mod a {
     pub struct Foo(pub char);
     impl Foo {
@@ -1376,28 +1463,6 @@ fn f() {
 }
 
 #[test]
-fn trait_impl_in_synstructure_const() {
-    check_types(
-        r#"
-struct S;
-
-trait Tr {
-    fn method(&self) -> u16;
-}
-
-const _DERIVE_Tr_: () = {
-    impl Tr for S {}
-};
-
-fn f() {
-    S.method();
-  //^^^^^^^^^^ u16
-}
-    "#,
-    );
-}
-
-#[test]
 fn inherent_impl_in_unnamed_const() {
     check_types(
         r#"
@@ -1438,6 +1503,7 @@ fn resolve_const_generic_array_methods() {
         r#"
 #[lang = "array"]
 impl<T, const N: usize> [T; N] {
+    #[rustc_allow_incoherent_impl]
     pub fn map<F, U>(self, f: F) -> [U; N]
     where
         F: FnMut(T) -> U,
@@ -1446,6 +1512,7 @@ impl<T, const N: usize> [T; N] {
 
 #[lang = "slice"]
 impl<T> [T] {
+    #[rustc_allow_incoherent_impl]
     pub fn map<F, U>(self, f: F) -> &[U]
     where
         F: FnMut(T) -> U,
@@ -1469,6 +1536,7 @@ struct Const<const N: usize>;
 
 #[lang = "array"]
 impl<T, const N: usize> [T; N] {
+    #[rustc_allow_incoherent_impl]
     pub fn my_map<F, U, const X: usize>(self, f: F, c: Const<X>) -> [U; X]
     where
         F: FnMut(T) -> U,
@@ -1477,6 +1545,7 @@ impl<T, const N: usize> [T; N] {
 
 #[lang = "slice"]
 impl<T> [T] {
+    #[rustc_allow_incoherent_impl]
     pub fn my_map<F, const X: usize, U>(self, f: F, c: Const<X>) -> &[U]
     where
         F: FnMut(T) -> U,
@@ -1527,17 +1596,17 @@ fn f(x: U2) {
 fn skip_array_during_method_dispatch() {
     check_types(
         r#"
-//- /main2018.rs crate:main2018 deps:core
+//- /main2018.rs crate:main2018 deps:core edition:2018
 use core::IntoIterator;
 
 fn f() {
     let v = [4].into_iter();
     v;
-  //^ &i32
+  //^ &'? i32
 
     let a = [0, 1].into_iter();
     a;
-  //^ &i32
+  //^ &'? i32
 }
 
 //- /main2021.rs crate:main2021 deps:core edition:2021
@@ -1550,11 +1619,60 @@ fn f() {
 
     let a = [0, 1].into_iter();
     a;
-  //^ &i32
+  //^ &'? i32
 }
 
 //- /core.rs crate:core
 #[rustc_skip_array_during_method_dispatch]
+pub trait IntoIterator {
+    type Out;
+    fn into_iter(self) -> Self::Out;
+}
+
+impl<T> IntoIterator for [T; 1] {
+    type Out = T;
+    fn into_iter(self) -> Self::Out { loop {} }
+}
+impl<'a, T> IntoIterator for &'a [T] {
+    type Out = &'a T;
+    fn into_iter(self) -> Self::Out { loop {} }
+}
+    "#,
+    );
+}
+
+#[test]
+fn skip_during_method_dispatch() {
+    check_types(
+        r#"
+//- /main2018.rs crate:main2018 deps:core edition:2018
+use core::IntoIterator;
+
+fn f() {
+    let v = [4].into_iter();
+    v;
+  //^ &'? i32
+
+    let a = [0, 1].into_iter();
+    a;
+  //^ &'? i32
+}
+
+//- /main2021.rs crate:main2021 deps:core edition:2021
+use core::IntoIterator;
+
+fn f() {
+    let v = [4].into_iter();
+    v;
+  //^ i32
+
+    let a = [0, 1].into_iter();
+    a;
+  //^ &'? i32
+}
+
+//- /core.rs crate:core
+#[rustc_skip_during_method_dispatch(array, boxed_slice)]
 pub trait IntoIterator {
     type Out;
     fn into_iter(self) -> Self::Out;
@@ -1623,7 +1741,7 @@ fn main() {
 fn deref_fun_1() {
     check_types(
         r#"
-//- minicore: deref
+//- minicore: receiver
 
 struct A<T, U>(T, U);
 struct B<T>(T);
@@ -1664,7 +1782,7 @@ fn test() {
 fn deref_fun_2() {
     check_types(
         r#"
-//- minicore: deref
+//- minicore: receiver
 
 struct A<T, U>(T, U);
 struct B<T>(T);
@@ -1699,12 +1817,27 @@ fn test() {
     let a2 = A(make(), 1i32);
     let _: &str = a2.thing();
     a2;
-  //^^ A<C<&str>, i32>
+  //^^ A<C<&'? str>, i32>
 }
 "#,
     );
 }
 
+#[test]
+fn deref_into_inference_var() {
+    check_types(
+        r#"
+//- minicore:deref
+struct A<T>(T);
+impl core::ops::Deref for A<u32> {}
+impl A<i32> { fn foo(&self) {} }
+fn main() {
+    A(0).foo();
+  //^^^^^^^^^^ ()
+}
+"#,
+    );
+}
 #[test]
 fn receiver_adjustment_autoref() {
     check(
@@ -1715,9 +1848,9 @@ impl Foo {
 }
 fn test() {
     Foo.foo();
-  //^^^ adjustments: Borrow(Ref(Not))
+  //^^^ adjustments: Borrow(Ref('?1, Not))
     (&Foo).foo();
-  // ^^^^ adjustments: ,
+  // ^^^^ adjustments: Deref(None), Borrow(Ref('?3, Not))
 }
 "#,
     );
@@ -1725,14 +1858,13 @@ fn test() {
 
 #[test]
 fn receiver_adjustment_unsize_array() {
-    // FIXME not quite correct
     check(
         r#"
 //- minicore: slice
 fn test() {
     let a = [1, 2, 3];
     a.len();
-} //^ adjustments: Pointer(Unsize), Borrow(Ref(Not))
+} //^ adjustments: Borrow(Ref('?7, Not)), Pointer(Unsize)
 "#,
     );
 }
@@ -1771,7 +1903,7 @@ pub fn test(generic_args: impl Into<Foo>) {
 fn bad_inferred_reference_2() {
     check_no_mismatches(
         r#"
-//- minicore: deref
+//- minicore: receiver
 trait ExactSizeIterator {
     fn len(&self) -> usize;
 }
@@ -1865,5 +1997,176 @@ fn g<T: Trait>(a: T) {
       //^isize
 }
         "#,
+    );
+}
+
+#[test]
+fn incoherent_impls() {
+    check(
+        r#"
+//- minicore: error, send
+pub struct Box<T>(T);
+use core::error::Error;
+
+impl dyn Error {
+    #[rustc_allow_incoherent_impl]
+    pub fn downcast<T: Error + 'static>(self: Box<Self>) -> Result<Box<T>, Box<dyn Error>> {
+        loop {}
+    }
+}
+impl dyn Error + Send {
+    #[rustc_allow_incoherent_impl]
+    /// Attempts to downcast the box to a concrete type.
+    pub fn downcast<T: Error + 'static>(self: Box<Self>) -> Result<Box<T>, Box<dyn Error + Send>> {
+        let err: Box<dyn Error> = self;
+                               // ^^^^ expected Box<dyn Error>, got Box<dyn Error + Send>
+                               // FIXME, type mismatch should not occur
+        <dyn Error>::downcast(err).map_err(|_| loop {})
+      //^^^^^^^^^^^^^^^^^^^^^ type: fn downcast<{unknown}>(Box<dyn Error>) -> Result<Box<{unknown}>, Box<dyn Error>>
+    }
+}
+"#,
+    );
+}
+
+#[test]
+fn fallback_private_methods() {
+    check(
+        r#"
+mod module {
+    pub struct Struct;
+
+    impl Struct {
+        fn func(&self) {}
+    }
+}
+
+fn foo() {
+    let s = module::Struct;
+    s.func();
+  //^^^^^^^^ type: ()
+}
+"#,
+    );
+}
+
+#[test]
+fn box_deref_is_builtin() {
+    check(
+        r#"
+//- minicore: receiver
+use core::ops::Deref;
+
+#[lang = "owned_box"]
+struct Box<T>(*mut T);
+
+impl<T> Box<T> {
+    fn new(t: T) -> Self {
+        loop {}
+    }
+}
+
+impl<T> Deref for Box<T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target;
+}
+
+struct Foo;
+impl Foo {
+    fn foo(&self) {}
+}
+fn test() {
+    Box::new(Foo).foo();
+  //^^^^^^^^^^^^^ adjustments: Deref(None), Borrow(Ref('?3, Not))
+}
+"#,
+    );
+}
+
+#[test]
+fn manually_drop_deref_is_not_builtin() {
+    check(
+        r#"
+//- minicore: manually_drop, receiver
+struct Foo;
+impl Foo {
+    fn foo(&self) {}
+}
+use core::mem::ManuallyDrop;
+fn test() {
+    ManuallyDrop::new(Foo).foo();
+  //^^^^^^^^^^^^^^^^^^^^^^ adjustments: Deref(Some(OverloadedDeref(Some(Not)))), Borrow(Ref('?4, Not))
+}
+"#,
+    );
+}
+
+#[test]
+fn mismatched_args_due_to_supertraits_with_deref() {
+    check_no_mismatches(
+        r#"
+//- minicore: receiver
+use core::ops::Deref;
+
+trait Trait1 {
+    type Assoc: Deref<Target = String>;
+}
+
+trait Trait2: Trait1 {
+}
+
+trait Trait3 {
+    type T1: Trait1;
+    type T2: Trait2;
+    fn bar(&self, x: bool, y: bool);
+}
+
+struct Foo;
+
+impl Foo {
+    fn bar(&mut self, _: &'static str) {}
+}
+
+impl Deref for Foo {
+    type Target = u32;
+    fn deref(&self) -> &Self::Target { &0 }
+}
+
+fn problem_method<T: Trait3>() {
+    let mut foo = Foo;
+    foo.bar("hello"); // Rustc ok, RA errors (mismatched args)
+}
+"#,
+    );
+}
+
+#[test]
+fn receiver_without_deref_impl() {
+    check(
+        r#"
+//- minicore: receiver
+use core::ops::Receiver;
+
+struct Foo;
+
+impl Foo {
+    fn foo1(self: &Bar) -> i32 { 42 }
+    fn foo2(self: Bar) -> bool { true }
+}
+
+struct Bar;
+
+impl Receiver for Bar {
+    type Target = Foo;
+}
+
+fn main() {
+    let bar = Bar;
+    let _v1 = bar.foo1();
+      //^^^ type: {unknown}
+    let _v2 = bar.foo2();
+      //^^^ type: {unknown}
+}
+"#,
     );
 }

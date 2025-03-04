@@ -1,6 +1,5 @@
 use std::fmt;
 use std::hash::Hash;
-use std::iter::FromIterator;
 
 use super::map::SsoHashMap;
 
@@ -81,7 +80,7 @@ impl<T> SsoHashSet<T> {
 
     /// Clears the set, returning all elements in an iterator.
     #[inline]
-    pub fn drain(&mut self) -> impl Iterator<Item = T> + '_ {
+    pub fn drain(&mut self) -> impl Iterator<Item = T> {
         self.map.drain().map(entry_to_key)
     }
 }

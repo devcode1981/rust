@@ -49,7 +49,7 @@ fn let_stmt_coerce() {
 //- minicore: coerce_unsized
 fn test() {
     let x: &[isize] = &[1];
-                   // ^^^^ adjustments: Deref(None), Borrow(Ref(Not)), Pointer(Unsize)
+                   // ^^^^ adjustments: Deref(None), Borrow(Ref('?2, Not)), Pointer(Unsize)
     let x: *const [isize] = &[1];
                          // ^^^^ adjustments: Deref(None), Borrow(RawPtr(Not)), Pointer(Unsize)
 }
@@ -96,7 +96,7 @@ fn foo<T>(x: &[T]) -> &[T] { x }
 fn test() {
     let x = if true {
         foo(&[1])
-         // ^^^^ adjustments: Deref(None), Borrow(Ref(Not)), Pointer(Unsize)
+         // ^^^^ adjustments: Deref(None), Borrow(Ref('?8, Not)), Pointer(Unsize)
     } else {
         &[1]
     };
@@ -123,6 +123,23 @@ fn test() {
 }
 
 #[test]
+fn if_else_adjust_for_branches_discard_type_var() {
+    check_no_mismatches(
+        r#"
+fn test() {
+    let f = || {
+        if true {
+            &""
+        } else {
+            ""
+        }
+    };
+}
+"#,
+    );
+}
+
+#[test]
 fn match_first_coerce() {
     check_no_mismatches(
         r#"
@@ -131,7 +148,7 @@ fn foo<T>(x: &[T]) -> &[T] { x }
 fn test(i: i32) {
     let x = match i {
         2 => foo(&[2]),
-              // ^^^^ adjustments: Deref(None), Borrow(Ref(Not)), Pointer(Unsize)
+              // ^^^^ adjustments: Deref(None), Borrow(Ref('?8, Not)), Pointer(Unsize)
         1 => &[1],
         _ => &[3],
     };
@@ -168,17 +185,32 @@ fn test() {
     let t = &mut 1;
     let x = match 1 {
         1 => t as *mut i32,
+           //^^^^^^^^^^^^^ adjustments: Pointer(MutToConstPointer)
         2 => t as &i32,
-           //^^^^^^^^^ expected *mut i32, got &i32
+           //^^^^^^^^^ expected *mut i32, got &'? i32
         _ => t as *const i32,
-          // ^^^^^^^^^^^^^^^ adjustments: Pointer(MutToConstPointer)
-
     };
     x;
   //^ type: *const i32
 
 }
         ",
+    );
+}
+
+#[test]
+fn match_adjust_for_branches_discard_type_var() {
+    check_no_mismatches(
+        r#"
+fn test() {
+    let f = || {
+        match 0i32 {
+            0i32 => &"",
+            _ => "",
+        }
+    };
+}
+"#,
     );
 }
 
@@ -234,7 +266,7 @@ fn takes_ref_str(x: &str) {}
 fn returns_string() -> String { loop {} }
 fn test() {
     takes_ref_str(&{ returns_string() });
-               // ^^^^^^^^^^^^^^^^^^^^^ adjustments: Deref(None), Deref(Some(OverloadedDeref(Not))), Borrow(Ref(Not))
+               // ^^^^^^^^^^^^^^^^^^^^^ adjustments: Deref(None), Deref(Some(OverloadedDeref(Some(Not)))), Borrow(Ref('{error}, Not))
 }
 "#,
     );
@@ -274,7 +306,7 @@ fn test() {
     let foo = Foo;
       //^^^ type: Foo<{unknown}>
     let _: &u32 = &Foo;
-                //^^^^ expected &u32, got &Foo<{unknown}>
+                //^^^^ expected &'? u32, got &'? Foo<{unknown}>
 }",
     );
 }
@@ -295,7 +327,7 @@ fn foo() {
 }
 
 #[test]
-fn generator_yield_return_coerce() {
+fn coroutine_yield_return_coerce() {
     check_no_mismatches(
         r#"
 fn test() {
@@ -357,7 +389,20 @@ fn test() {
     let f: fn(u32) -> isize = foo;
                            // ^^^ adjustments: Pointer(ReifyFnPointer)
     let f: unsafe fn(u32) -> isize = foo;
-                                  // ^^^ adjustments: Pointer(ReifyFnPointer)
+                                  // ^^^ adjustments: Pointer(ReifyFnPointer), Pointer(UnsafeFnPointer)
+}",
+    );
+}
+
+#[test]
+fn coerce_fn_item_to_fn_ptr_in_array() {
+    check_no_mismatches(
+        r"
+fn foo(x: u32) -> isize { 1 }
+fn bar(x: u32) -> isize { 1 }
+fn test() {
+    let f = [foo, bar];
+          // ^^^ adjustments: Pointer(ReifyFnPointer)
 }",
     );
 }
@@ -366,6 +411,23 @@ fn test() {
 fn coerce_fn_items_in_match_arms() {
     cov_mark::check!(coerce_fn_reification);
 
+    check_no_mismatches(
+        r"
+fn foo1(x: u32) -> isize { 1 }
+fn foo2(x: u32) -> isize { 2 }
+fn foo3(x: u32) -> isize { 3 }
+fn test() {
+    let x = match 1 {
+        1 => foo1,
+          // ^^^^ adjustments: Pointer(ReifyFnPointer)
+        2 => foo2,
+          // ^^^^ adjustments: Pointer(ReifyFnPointer)
+        _ => foo3,
+          // ^^^^ adjustments: Pointer(ReifyFnPointer)
+    };
+    x;
+}",
+    );
     check_types(
         r"
 fn foo1(x: u32) -> isize { 1 }
@@ -388,7 +450,10 @@ fn coerce_closure_to_fn_ptr() {
     check_no_mismatches(
         r"
 fn test() {
-    let f: fn(u32) -> isize = |x| { 1 };
+    let f: fn(u32) -> u32 = |x| x;
+                         // ^^^^^ adjustments: Pointer(ClosureFnPointer(Safe))
+    let f: unsafe fn(u32) -> u32 = |x| x;
+                                // ^^^^^ adjustments: Pointer(ClosureFnPointer(Unsafe))
 }",
     );
 }
@@ -470,7 +535,6 @@ fn test() {
 
 #[test]
 fn coerce_unsize_generic() {
-    // FIXME: fix the type mismatches here
     check(
         r#"
 //- minicore: coerce_unsized
@@ -479,9 +543,9 @@ struct Bar<T>(Foo<T>);
 
 fn test() {
     let _: &Foo<[usize]> = &Foo { t: [1, 2, 3] };
-                                   //^^^^^^^^^ expected [usize], got [usize; 3]
+                         //^^^^^^^^^^^^^^^^^^^^^ expected &'? Foo<[usize]>, got &'? Foo<[i32; 3]>
     let _: &Bar<[usize]> = &Bar(Foo { t: [1, 2, 3] });
-                                       //^^^^^^^^^ expected [usize], got [usize; 3]
+                         //^^^^^^^^^^^^^^^^^^^^^^^^^^ expected &'? Bar<[usize]>, got &'? Bar<[i32; 3]>
 }
 "#,
     );
@@ -497,7 +561,7 @@ trait Foo {}
 fn test(f: impl Foo, g: &(impl Foo + ?Sized)) {
     let _: &dyn Foo = &f;
     let _: &dyn Foo = g;
-                    //^ expected &dyn Foo, got &impl Foo + ?Sized
+                    //^ expected &'? dyn Foo, got &'? impl Foo + ?Sized
 }
         "#,
     );
@@ -509,8 +573,9 @@ fn two_closures_lub() {
         r#"
 fn foo(c: i32) {
     let add = |a: i32, b: i32| a + b;
+            //^^^^^^^^^^^^^^^^^^^^^^ impl Fn(i32, i32) -> i32
     let sub = |a, b| a - b;
-            //^^^^^^^^^^^^ |i32, i32| -> i32
+            //^^^^^^^^^^^^ impl Fn(i32, i32) -> i32
     if c > 42 { add } else { sub };
   //^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ fn(i32, i32) -> i32
 }
@@ -762,12 +827,133 @@ struct V<T> { t: T }
 fn main() {
     let a: V<&dyn Tr>;
     (a,) = V { t: &S };
-  //^^^^expected V<&S>, got (V<&dyn Tr>,)
+  //^^^^expected V<&'? S>, got (V<&'? dyn Tr>,)
 
     let mut a: V<&dyn Tr> = V { t: &S };
     (a,) = V { t: &S };
-  //^^^^expected V<&S>, got (V<&dyn Tr>,)
+  //^^^^expected V<&'? S>, got (V<&'? dyn Tr>,)
 }
         "#,
+    );
+}
+
+#[test]
+fn adjust_comparison_arguments() {
+    check_no_mismatches(
+        r"
+//- minicore: eq
+struct Struct;
+impl core::cmp::PartialEq for Struct {
+    fn eq(&self, other: &Self) -> bool { true }
+}
+fn test() {
+    Struct == Struct;
+ // ^^^^^^ adjustments: Borrow(Ref('{error}, Not))
+           // ^^^^^^ adjustments: Borrow(Ref('{error}, Not))
+}",
+    );
+}
+
+#[test]
+fn adjust_assign_lhs() {
+    check_no_mismatches(
+        r"
+//- minicore: add
+struct Struct;
+impl core::ops::AddAssign for Struct {
+    fn add_assign(&mut self, other: Self) {}
+}
+fn test() {
+    Struct += Struct;
+ // ^^^^^^ adjustments: Borrow(Ref('{error}, Mut))
+           // ^^^^^^ adjustments:
+}",
+    );
+}
+
+#[test]
+fn adjust_index() {
+    check_no_mismatches(
+        r"
+//- minicore: index, slice, coerce_unsized
+fn test() {
+    let x = [1, 2, 3];
+    x[2] = 6;
+ // ^ adjustments: Borrow(Ref('?8, Mut))
+}
+    ",
+    );
+    check_no_mismatches(
+        r"
+//- minicore: index
+struct Struct;
+impl core::ops::Index<usize> for Struct {
+    type Output = ();
+
+    fn index(&self, index: usize) -> &Self::Output { &() }
+}
+struct StructMut;
+
+impl core::ops::Index<usize> for StructMut {
+    type Output = ();
+
+    fn index(&self, index: usize) -> &Self::Output { &() }
+}
+impl core::ops::IndexMut for StructMut {
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output { &mut () }
+}
+fn test() {
+    Struct[0];
+ // ^^^^^^ adjustments: Borrow(Ref('?2, Not))
+    StructMut[0];
+ // ^^^^^^^^^ adjustments: Borrow(Ref('?5, Not))
+    &mut StructMut[0];
+      // ^^^^^^^^^ adjustments: Borrow(Ref('?8, Mut))
+}",
+    );
+}
+
+#[test]
+fn regression_14443_dyn_coercion_block_impls() {
+    check_no_mismatches(
+        r#"
+//- minicore: coerce_unsized
+trait T {}
+
+fn dyn_t(d: &dyn T) {}
+
+fn main() {
+    struct A;
+    impl T for A {}
+
+    let a = A;
+
+    let b = {
+        struct B;
+        impl T for B {}
+
+        B
+    };
+
+    dyn_t(&a);
+    dyn_t(&b);
+}
+"#,
+    )
+}
+
+#[test]
+fn regression_18626() {
+    check_no_mismatches(
+        r#"
+fn f() {
+    trait T {
+        fn f() {}
+    }
+    impl T for i32 {}
+    impl T for u32 {}
+    &[i32::f, u32::f] as &[fn()];
+}
+    "#,
     );
 }

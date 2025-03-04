@@ -29,7 +29,16 @@ pub struct Assist {
     /// cumbersome, especially if you want to embed an assist into another data
     /// structure, such as a diagnostic.
     pub source_change: Option<SourceChange>,
-    pub trigger_signature_help: bool,
+    /// The command to execute after the assist is applied.
+    pub command: Option<Command>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Command {
+    /// Show the parameter hints popup.
+    TriggerParameterHints,
+    /// Rename the just inserted item.
+    Rename,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,7 +97,7 @@ impl FromStr for AssistKind {
             "RefactorExtract" => Ok(AssistKind::RefactorExtract),
             "RefactorInline" => Ok(AssistKind::RefactorInline),
             "RefactorRewrite" => Ok(AssistKind::RefactorRewrite),
-            unknown => Err(format!("Unknown AssistKind: '{}'", unknown)),
+            unknown => Err(format!("Unknown AssistKind: '{unknown}'")),
         }
     }
 }
@@ -98,7 +107,7 @@ impl FromStr for AssistKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AssistId(pub &'static str, pub AssistKind);
 
-/// A way to control how many asssist to resolve during the assist resolution.
+/// A way to control how many assist to resolve during the assist resolution.
 /// When an assist is resolved, its edits are calculated that might be costly to always do by default.
 #[derive(Debug)]
 pub enum AssistResolveStrategy {

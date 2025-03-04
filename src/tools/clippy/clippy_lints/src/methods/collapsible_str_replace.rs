@@ -1,6 +1,6 @@
 use clippy_utils::diagnostics::span_lint_and_sugg;
 use clippy_utils::source::snippet;
-use clippy_utils::visitors::for_each_expr;
+use clippy_utils::visitors::for_each_expr_without_closures;
 use clippy_utils::{eq_expr_value, get_parent_expr};
 use core::ops::ControlFlow;
 use rustc_errors::Applicability;
@@ -8,8 +8,7 @@ use rustc_hir as hir;
 use rustc_lint::LateContext;
 use std::collections::VecDeque;
 
-use super::method_call;
-use super::COLLAPSIBLE_STR_REPLACE;
+use super::{COLLAPSIBLE_STR_REPLACE, method_call};
 
 pub(super) fn check<'tcx>(
     cx: &LateContext<'tcx>,
@@ -23,7 +22,7 @@ pub(super) fn check<'tcx>(
         // If the parent node's `to` argument is the same as the `to` argument
         // of the last replace call in the current chain, don't lint as it was already linted
         if let Some(parent) = get_parent_expr(cx, expr)
-            && let Some(("replace", _, [current_from, current_to], _)) = method_call(parent)
+            && let Some(("replace", _, [current_from, current_to], _, _)) = method_call(parent)
             && eq_expr_value(cx, to, current_to)
             && from_kind == cx.typeck_results().expr_ty(current_from).peel_refs().kind()
         {
@@ -47,14 +46,14 @@ fn collect_replace_calls<'tcx>(
     let mut methods = VecDeque::new();
     let mut from_args = VecDeque::new();
 
-    let _: Option<()> = for_each_expr(expr, |e| {
-        if let Some(("replace", _, [from, to], _)) = method_call(e) {
+    let _: Option<()> = for_each_expr_without_closures(expr, |e| {
+        if let Some(("replace", _, [from, to], _, _)) = method_call(e) {
             if eq_expr_value(cx, to_arg, to) && cx.typeck_results().expr_ty(from).peel_refs().is_char() {
                 methods.push_front(e);
                 from_args.push_front(from);
                 ControlFlow::Continue(())
             } else {
-                ControlFlow::BREAK
+                ControlFlow::Break(())
             }
         } else {
             ControlFlow::Continue(())
@@ -78,7 +77,7 @@ fn check_consecutive_replace_calls<'tcx>(
         .collect();
     let app = Applicability::MachineApplicable;
     let earliest_replace_call = replace_methods.methods.front().unwrap();
-    if let Some((_, _, [..], span_lo)) = method_call(earliest_replace_call) {
+    if let Some((_, _, [..], span_lo, _)) = method_call(earliest_replace_call) {
         span_lint_and_sugg(
             cx,
             COLLAPSIBLE_STR_REPLACE,

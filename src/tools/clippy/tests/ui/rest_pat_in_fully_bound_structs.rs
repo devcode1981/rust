@@ -1,4 +1,5 @@
 #![warn(clippy::rest_pat_in_fully_bound_structs)]
+#![allow(clippy::struct_field_names)]
 
 struct A {
     a: i32,
@@ -20,13 +21,16 @@ fn main() {
 
     match a_struct {
         A { a: 5, b: 42, c: "", .. } => {}, // Lint
-        A { a: 0, b: 0, c: "", .. } => {},  // Lint
+        //~^ rest_pat_in_fully_bound_structs
+        A { a: 0, b: 0, c: "", .. } => {}, // Lint
+        //~^ rest_pat_in_fully_bound_structs
         _ => {},
     }
 
     match a_struct {
         A { a: 5, b: 42, .. } => {},
         A { a: 0, b: 0, c: "", .. } => {}, // Lint
+        //~^ rest_pat_in_fully_bound_structs
         _ => {},
     }
 

@@ -1,8 +1,9 @@
+use rustc_abi::{FieldIdx, VariantIdx};
+use rustc_hir::HirId;
+use rustc_macros::{HashStable, TyDecodable, TyEncodable, TypeFoldable, TypeVisitable};
+
 use crate::ty;
 use crate::ty::Ty;
-
-use rustc_hir::HirId;
-use rustc_target::abi::VariantIdx;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, TyEncodable, TyDecodable, HashStable)]
 #[derive(TypeFoldable, TypeVisitable)]
@@ -27,7 +28,7 @@ pub enum ProjectionKind {
     /// the field. The field is identified by which variant
     /// it appears in along with a field index. The variant
     /// is used for enums.
-    Field(u32, VariantIdx),
+    Field(FieldIdx, VariantIdx),
 
     /// Some index like `B[x]`, where `B` is the base
     /// expression. We don't preserve the index `x` because
@@ -36,6 +37,10 @@ pub enum ProjectionKind {
 
     /// A subslice covering a range of values like `B[x..y]`.
     Subslice,
+
+    /// A conversion from an opaque type to its hidden type so we can
+    /// do further projections on it.
+    OpaqueCast,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, TyEncodable, TyDecodable, HashStable)]
@@ -66,7 +71,6 @@ pub struct Place<'tcx> {
 ///
 /// This is an HIR version of [`rustc_middle::mir::Place`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash, TyEncodable, TyDecodable, HashStable)]
-#[derive(TypeFoldable, TypeVisitable)]
 pub struct PlaceWithHirId<'tcx> {
     /// `HirId` of the expression or pattern producing this value.
     pub hir_id: HirId,
@@ -93,7 +97,7 @@ impl<'tcx> Place<'tcx> {
     /// The types are in the reverse order that they are applied. So if
     /// `x: &*const u32` and the `Place` is `**x`, then the types returned are
     ///`*const u32` then `&*const u32`.
-    pub fn deref_tys(&self) -> impl Iterator<Item = Ty<'tcx>> + '_ {
+    pub fn deref_tys(&self) -> impl Iterator<Item = Ty<'tcx>> {
         self.projections.iter().enumerate().rev().filter_map(move |(index, proj)| {
             if ProjectionKind::Deref == proj.kind {
                 Some(self.ty_before_projection(index))

@@ -1,12 +1,13 @@
 //! Code for applying replacement templates for matches that have previously been found.
 
+use ide_db::text_edit::TextEdit;
 use ide_db::{FxHashMap, FxHashSet};
 use itertools::Itertools;
+use parser::Edition;
 use syntax::{
     ast::{self, AstNode, AstToken},
     SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken, TextRange, TextSize,
 };
-use text_edit::TextEdit;
 
 use crate::{fragments, resolving::ResolvedRule, Match, SsrMatches};
 
@@ -14,14 +15,16 @@ use crate::{fragments, resolving::ResolvedRule, Match, SsrMatches};
 /// template. Placeholders in the template will have been substituted with whatever they matched to
 /// in the original code.
 pub(crate) fn matches_to_edit(
+    db: &dyn hir::db::ExpandDatabase,
     matches: &SsrMatches,
     file_src: &str,
     rules: &[ResolvedRule],
 ) -> TextEdit {
-    matches_to_edit_at_offset(matches, file_src, 0.into(), rules)
+    matches_to_edit_at_offset(db, matches, file_src, 0.into(), rules)
 }
 
 fn matches_to_edit_at_offset(
+    db: &dyn hir::db::ExpandDatabase,
     matches: &SsrMatches,
     file_src: &str,
     relative_start: TextSize,
@@ -31,13 +34,14 @@ fn matches_to_edit_at_offset(
     for m in &matches.matches {
         edit_builder.replace(
             m.range.range.checked_sub(relative_start).unwrap(),
-            render_replace(m, file_src, rules),
+            render_replace(db, m, file_src, rules, m.range.file_id.edition()),
         );
     }
     edit_builder.finish()
 }
 
 struct ReplacementRenderer<'a> {
+    db: &'a dyn hir::db::ExpandDatabase,
     match_info: &'a Match,
     file_src: &'a str,
     rules: &'a [ResolvedRule],
@@ -51,15 +55,23 @@ struct ReplacementRenderer<'a> {
     // is parsed, placeholders don't get split. e.g. if a template of `$a.to_string()` results in `1
     // + 2.to_string()` then the placeholder value `1 + 2` was split and needs parenthesis.
     placeholder_tokens_requiring_parenthesis: FxHashSet<SyntaxToken>,
+    edition: Edition,
 }
 
-fn render_replace(match_info: &Match, file_src: &str, rules: &[ResolvedRule]) -> String {
+fn render_replace(
+    db: &dyn hir::db::ExpandDatabase,
+    match_info: &Match,
+    file_src: &str,
+    rules: &[ResolvedRule],
+    edition: Edition,
+) -> String {
     let rule = &rules[match_info.rule_index];
     let template = rule
         .template
         .as_ref()
         .expect("You called MatchFinder::edits after calling MatchFinder::add_search_pattern");
     let mut renderer = ReplacementRenderer {
+        db,
         match_info,
         file_src,
         rules,
@@ -67,6 +79,7 @@ fn render_replace(match_info: &Match, file_src: &str, rules: &[ResolvedRule]) ->
         out: String::new(),
         placeholder_tokens_requiring_parenthesis: FxHashSet::default(),
         placeholder_tokens_by_range: FxHashMap::default(),
+        edition,
     };
     renderer.render_node(&template.node);
     renderer.maybe_rerender_with_extra_parenthesis(&template.node);
@@ -96,7 +109,7 @@ impl ReplacementRenderer<'_> {
 
     fn render_node(&mut self, node: &SyntaxNode) {
         if let Some(mod_path) = self.match_info.rendered_template_paths.get(node) {
-            self.out.push_str(&mod_path.to_string());
+            self.out.push_str(&mod_path.display(self.db, self.edition).to_string());
             // Emit everything except for the segment's name-ref, since we already effectively
             // emitted that as part of `mod_path`.
             if let Some(path) = ast::Path::cast(node.clone()) {
@@ -144,6 +157,7 @@ impl ReplacementRenderer<'_> {
                     );
                 }
                 let edit = matches_to_edit_at_offset(
+                    self.db,
                     &placeholder_value.inner_matches,
                     self.file_src,
                     range.start(),

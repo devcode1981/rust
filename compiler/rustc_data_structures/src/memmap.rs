@@ -2,24 +2,34 @@ use std::fs::File;
 use std::io;
 use std::ops::{Deref, DerefMut};
 
-use crate::owning_ref::StableAddress;
-
-/// A trivial wrapper for [`memmap2::Mmap`] that implements [`StableAddress`].
-#[cfg(not(target_arch = "wasm32"))]
+/// A trivial wrapper for [`memmap2::Mmap`] (or `Vec<u8>` on WASM).
+#[cfg(not(any(miri, target_arch = "wasm32")))]
 pub struct Mmap(memmap2::Mmap);
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(miri, target_arch = "wasm32"))]
 pub struct Mmap(Vec<u8>);
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(miri, target_arch = "wasm32")))]
 impl Mmap {
+    /// # Safety
+    ///
+    /// The given file must not be mutated (i.e., not written, not truncated, ...) until the mapping is closed.
+    ///
+    /// However in practice most callers do not ensure this, so uses of this function are likely unsound.
     #[inline]
     pub unsafe fn map(file: File) -> io::Result<Self> {
-        memmap2::Mmap::map(&file).map(Mmap)
+        // By default, memmap2 creates shared mappings, implying that we could see updates to the
+        // file through the mapping. That would violate our precondition; so by requesting a
+        // map_copy_read_only we do not lose anything.
+        // This mapping mode also improves our support for filesystems such as cacheless virtiofs.
+        // For more details see https://github.com/rust-lang/rust/issues/122262
+        //
+        // SAFETY: The caller must ensure that this is safe.
+        unsafe { memmap2::MmapOptions::new().map_copy_read_only(&file).map(Mmap) }
     }
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(miri, target_arch = "wasm32"))]
 impl Mmap {
     #[inline]
     pub unsafe fn map(mut file: File) -> io::Result<Self> {
@@ -36,23 +46,23 @@ impl Deref for Mmap {
 
     #[inline]
     fn deref(&self) -> &[u8] {
-        &*self.0
+        &self.0
     }
 }
 
-// SAFETY: On architectures other than WASM, mmap is used as backing storage. The address of this
-// memory map is stable. On WASM, `Vec<u8>` is used as backing storage. The `Mmap` type doesn't
-// export any function that can cause the `Vec` to be re-allocated. As such the address of the
-// bytes inside this `Vec` is stable.
-unsafe impl StableAddress for Mmap {}
+impl AsRef<[u8]> for Mmap {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(miri, target_arch = "wasm32")))]
 pub struct MmapMut(memmap2::MmapMut);
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(miri, target_arch = "wasm32"))]
 pub struct MmapMut(Vec<u8>);
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(miri, target_arch = "wasm32")))]
 impl MmapMut {
     #[inline]
     pub fn map_anon(len: usize) -> io::Result<Self> {
@@ -72,7 +82,7 @@ impl MmapMut {
     }
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(miri, target_arch = "wasm32"))]
 impl MmapMut {
     #[inline]
     pub fn map_anon(len: usize) -> io::Result<Self> {
@@ -96,13 +106,13 @@ impl Deref for MmapMut {
 
     #[inline]
     fn deref(&self) -> &[u8] {
-        &*self.0
+        &self.0
     }
 }
 
 impl DerefMut for MmapMut {
     #[inline]
     fn deref_mut(&mut self) -> &mut [u8] {
-        &mut *self.0
+        &mut self.0
     }
 }

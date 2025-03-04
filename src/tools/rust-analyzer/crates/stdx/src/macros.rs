@@ -1,21 +1,32 @@
 //! Convenience macros.
 
-#[macro_export]
-macro_rules! eprintln {
-    ($($tt:tt)*) => {{
-        if $crate::is_ci() {
-            panic!("Forgot to remove debug-print?")
-        }
-        std::eprintln!($($tt)*)
-    }}
-}
-
 /// Appends formatted string to a `String`.
 #[macro_export]
 macro_rules! format_to {
     ($buf:expr) => ();
     ($buf:expr, $lit:literal $($arg:tt)*) => {
-        { use ::std::fmt::Write as _; let _ = ::std::write!($buf, $lit $($arg)*); }
+        {
+            use ::std::fmt::Write as _;
+            // We can't do ::std::fmt::Write::write_fmt($buf, format_args!($lit $($arg)*))
+            // unfortunately, as that loses out on autoref behavior.
+            _ = $buf.write_fmt(format_args!($lit $($arg)*))
+        }
+    };
+}
+
+/// Appends formatted string to a `String` and returns the `String`.
+///
+/// Useful for folding iterators into a `String`.
+#[macro_export]
+macro_rules! format_to_acc {
+    ($buf:expr, $lit:literal $($arg:tt)*) => {
+        {
+            use ::std::fmt::Write as _;
+            // We can't do ::std::fmt::Write::write_fmt($buf, format_args!($lit $($arg)*))
+            // unfortunately, as that loses out on autoref behavior.
+            _ = $buf.write_fmt(format_args!($lit $($arg)*));
+            $buf
+        }
     };
 }
 
@@ -23,7 +34,7 @@ macro_rules! format_to {
 ///
 /// # Example
 ///
-/// ```rust
+/// ```ignore
 /// impl_from!(Struct, Union, Enum for Adt);
 /// ```
 #[macro_export]
@@ -42,6 +53,15 @@ macro_rules! impl_from {
                     }
                 }
             )*)?
+        )*
+    };
+    ($($variant:ident$(<$V:ident>)?),* for $enum:ident) => {
+        $(
+            impl$(<$V>)? From<$variant$(<$V>)?> for $enum$(<$V>)? {
+                fn from(it: $variant$(<$V>)?) -> $enum$(<$V>)? {
+                    $enum::$variant(it)
+                }
+            }
         )*
     }
 }

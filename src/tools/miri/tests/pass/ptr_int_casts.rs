@@ -1,6 +1,5 @@
 //@compile-flags: -Zmiri-permissive-provenance
-use std::mem;
-use std::ptr;
+use std::{mem, ptr};
 
 fn eq_ref<T>(x: &T, y: &T) -> bool {
     x as *const _ == y as *const _

@@ -1,4 +1,4 @@
-use hir::known;
+use hir::{sym, Name};
 use ide_db::famous_defs::FamousDefs;
 use stdx::format_to;
 use syntax::{
@@ -114,24 +114,28 @@ pub(crate) fn convert_for_loop_with_for_each(
         |builder| {
             let mut buf = String::new();
 
-            if let Some((expr_behind_ref, method)) =
+            if let Some((expr_behind_ref, method, krate)) =
                 is_ref_and_impls_iter_method(&ctx.sema, &iterable)
             {
                 // We have either "for x in &col" and col implements a method called iter
                 //             or "for x in &mut col" and col implements a method called iter_mut
-                format_to!(buf, "{}.{}()", expr_behind_ref, method);
+                format_to!(
+                    buf,
+                    "{expr_behind_ref}.{}()",
+                    method.display(ctx.db(), krate.edition(ctx.db()))
+                );
             } else if let ast::Expr::RangeExpr(..) = iterable {
                 // range expressions need to be parenthesized for the syntax to be correct
-                format_to!(buf, "({})", iterable);
+                format_to!(buf, "({iterable})");
             } else if impls_core_iter(&ctx.sema, &iterable) {
-                format_to!(buf, "{}", iterable);
+                format_to!(buf, "{iterable}");
             } else if let ast::Expr::RefExpr(_) = iterable {
-                format_to!(buf, "({}).into_iter()", iterable);
+                format_to!(buf, "({iterable}).into_iter()");
             } else {
-                format_to!(buf, "{}.into_iter()", iterable);
+                format_to!(buf, "{iterable}.into_iter()");
             }
 
-            format_to!(buf, ".for_each(|{}| {});", pat, body);
+            format_to!(buf, ".for_each(|{pat}| {body});");
 
             builder.replace(for_loop.syntax().text_range(), buf)
         },
@@ -144,12 +148,16 @@ pub(crate) fn convert_for_loop_with_for_each(
 fn is_ref_and_impls_iter_method(
     sema: &hir::Semantics<'_, ide_db::RootDatabase>,
     iterable: &ast::Expr,
-) -> Option<(ast::Expr, hir::Name)> {
+) -> Option<(ast::Expr, hir::Name, hir::Crate)> {
     let ref_expr = match iterable {
         ast::Expr::RefExpr(r) => r,
         _ => return None,
     };
-    let wanted_method = if ref_expr.mut_token().is_some() { known::iter_mut } else { known::iter };
+    let wanted_method = Name::new_symbol_root(if ref_expr.mut_token().is_some() {
+        sym::iter_mut.clone()
+    } else {
+        sym::iter.clone()
+    });
     let expr_behind_ref = ref_expr.expr()?;
     let ty = sema.type_of_expr(&expr_behind_ref)?.adjusted();
     let scope = sema.scope(iterable.syntax())?;
@@ -157,25 +165,18 @@ fn is_ref_and_impls_iter_method(
     let iter_trait = FamousDefs(sema, krate).core_iter_Iterator()?;
 
     let has_wanted_method = ty
-        .iterate_method_candidates(
-            sema.db,
-            &scope,
-            &scope.visible_traits().0,
-            None,
-            Some(&wanted_method),
-            |func| {
-                if func.ret_type(sema.db).impls_trait(sema.db, iter_trait, &[]) {
-                    return Some(());
-                }
-                None
-            },
-        )
+        .iterate_method_candidates(sema.db, &scope, None, Some(&wanted_method), |func| {
+            if func.ret_type(sema.db).impls_trait(sema.db, iter_trait, &[]) {
+                return Some(());
+            }
+            None
+        })
         .is_some();
     if !has_wanted_method {
         return None;
     }
 
-    Some((expr_behind_ref, wanted_method))
+    Some((expr_behind_ref, wanted_method, krate))
 }
 
 /// Whether iterable implements core::Iterator
@@ -216,7 +217,7 @@ fn validate_method_call_expr(
     let krate = module.krate();
 
     let iter_trait = FamousDefs(sema, krate).core_iter_Iterator()?;
-    it_type.impls_trait(sema.db, iter_trait, &[]).then(|| (expr, receiver))
+    it_type.impls_trait(sema.db, iter_trait, &[]).then_some((expr, receiver))
 }
 
 #[cfg(test)]

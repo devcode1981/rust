@@ -10,17 +10,24 @@
 //! * By **copying** the whole rustc `lib_proc_macro` code, we are able to build this with `stable`
 //!   rustc rather than `unstable`. (Although in general ABI compatibility is still an issue)…
 
-#![warn(rust_2018_idioms, unused_lifetimes, semicolon_in_expressions_from_macros)]
-#![cfg_attr(
-    feature = "sysroot-abi",
-    feature(proc_macro_internals, proc_macro_diagnostic, proc_macro_span)
-)]
-#![allow(unreachable_pub)]
+#![cfg(any(feature = "sysroot-abi", rust_analyzer))]
+#![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
+#![feature(proc_macro_internals, proc_macro_diagnostic, proc_macro_span)]
+#![allow(unreachable_pub, internal_features, clippy::disallowed_types, clippy::print_stderr)]
+#![deny(deprecated_safe)]
+
+extern crate proc_macro;
+#[cfg(feature = "in-rust-tree")]
+extern crate rustc_driver as _;
+
+#[cfg(not(feature = "in-rust-tree"))]
+extern crate ra_ap_rustc_lexer as rustc_lexer;
+#[cfg(feature = "in-rust-tree")]
+extern crate rustc_lexer;
 
 mod dylib;
-mod abis;
-
-pub mod cli;
+mod proc_macros;
+mod server_impl;
 
 use std::{
     collections::{hash_map::Entry, HashMap},
@@ -28,58 +35,77 @@ use std::{
     ffi::OsString,
     fs,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex, PoisonError},
     thread,
-    time::SystemTime,
 };
 
-use proc_macro_api::{
-    msg::{ExpandMacro, FlatTree, PanicMessage},
-    ProcMacroKind,
-};
+use paths::{Utf8Path, Utf8PathBuf};
+use span::{Span, TokenId};
 
-#[derive(Default)]
-pub(crate) struct ProcMacroSrv {
-    expanders: HashMap<(PathBuf, SystemTime), dylib::Expander>,
+use crate::server_impl::TokenStream;
+
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub enum ProcMacroKind {
+    CustomDerive,
+    Attr,
+    Bang,
+}
+
+pub const RUSTC_VERSION_STRING: &str = env!("RUSTC_VERSION");
+
+pub struct ProcMacroSrv<'env> {
+    expanders: Mutex<HashMap<Utf8PathBuf, Arc<dylib::Expander>>>,
+    env: &'env EnvSnapshot,
+}
+
+impl<'env> ProcMacroSrv<'env> {
+    pub fn new(env: &'env EnvSnapshot) -> Self {
+        Self { expanders: Default::default(), env }
+    }
 }
 
 const EXPANDER_STACK_SIZE: usize = 8 * 1024 * 1024;
 
-impl ProcMacroSrv {
-    pub fn expand(&mut self, task: ExpandMacro) -> Result<FlatTree, PanicMessage> {
-        let expander = self.expander(task.lib.as_ref()).map_err(|err| {
-            debug_assert!(false, "should list macros before asking to expand");
-            PanicMessage(format!("failed to load macro: {}", err))
-        })?;
+impl ProcMacroSrv<'_> {
+    pub fn expand<S: ProcMacroSrvSpan>(
+        &self,
+        lib: impl AsRef<Utf8Path>,
+        env: Vec<(String, String)>,
+        current_dir: Option<impl AsRef<Path>>,
+        macro_name: String,
+        macro_body: tt::TopSubtree<S>,
+        attribute: Option<tt::TopSubtree<S>>,
+        def_site: S,
+        call_site: S,
+        mixed_site: S,
+    ) -> Result<Vec<tt::TokenTree<S>>, String> {
+        let snapped_env = self.env;
+        let expander =
+            self.expander(lib.as_ref()).map_err(|err| format!("failed to load macro: {err}"))?;
 
-        let prev_env = EnvSnapshot::new();
-        for (k, v) in &task.env {
-            env::set_var(k, v);
-        }
-        let prev_working_dir = match task.current_dir {
-            Some(dir) => {
-                let prev_working_dir = std::env::current_dir().ok();
-                if let Err(err) = std::env::set_current_dir(&dir) {
-                    eprintln!("Failed to set the current working dir to {}. Error: {:?}", dir, err)
-                }
-                prev_working_dir
-            }
-            None => None,
-        };
+        let prev_env = EnvChange::apply(snapped_env, env, current_dir.as_ref().map(<_>::as_ref));
 
-        let macro_body = task.macro_body.to_subtree();
-        let attributes = task.attributes.map(|it| it.to_subtree());
+        // Note, we spawn a new thread here so that thread locals allocation don't accumulate (this
+        // includes the proc-macro symbol interner)
         let result = thread::scope(|s| {
             let thread = thread::Builder::new()
                 .stack_size(EXPANDER_STACK_SIZE)
-                .name(task.macro_name.clone())
-                .spawn_scoped(s, || {
+                .name(macro_name.clone())
+                .spawn_scoped(s, move || {
                     expander
-                        .expand(&task.macro_name, &macro_body, attributes.as_ref())
-                        .map(|it| FlatTree::new(&it))
+                        .expand(
+                            &macro_name,
+                            server_impl::TopSubtree(macro_body.0.into_vec()),
+                            attribute.map(|it| server_impl::TopSubtree(it.0.into_vec())),
+                            def_site,
+                            call_site,
+                            mixed_site,
+                        )
+                        .map(|tt| tt.0)
                 });
             let res = match thread {
                 Ok(handle) => handle.join(),
-                Err(e) => std::panic::resume_unwind(Box::new(e)),
+                Err(e) => return Err(e.to_string()),
             };
 
             match res {
@@ -87,11 +113,151 @@ impl ProcMacroSrv {
                 Err(e) => std::panic::resume_unwind(e),
             }
         });
-
         prev_env.rollback();
 
-        if let Some(dir) = prev_working_dir {
-            if let Err(err) = std::env::set_current_dir(&dir) {
+        result
+    }
+
+    pub fn list_macros(
+        &self,
+        dylib_path: &Utf8Path,
+    ) -> Result<Vec<(String, ProcMacroKind)>, String> {
+        let expander = self.expander(dylib_path)?;
+        Ok(expander.list_macros())
+    }
+
+    fn expander(&self, path: &Utf8Path) -> Result<Arc<dylib::Expander>, String> {
+        let expander = || {
+            let expander = dylib::Expander::new(path)
+                .map_err(|err| format!("Cannot create expander for {path}: {err}",));
+            expander.map(Arc::new)
+        };
+
+        Ok(
+            match self
+                .expanders
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .entry(path.to_path_buf())
+            {
+                Entry::Vacant(v) => v.insert(expander()?).clone(),
+                Entry::Occupied(mut e) => {
+                    let time = fs::metadata(path).and_then(|it| it.modified()).ok();
+                    if Some(e.get().modified_time()) != time {
+                        e.insert(expander()?);
+                    }
+                    e.get().clone()
+                }
+            },
+        )
+    }
+}
+
+pub trait ProcMacroSrvSpan: Copy + Send {
+    type Server: proc_macro::bridge::server::Server<TokenStream = TokenStream<Self>>;
+    fn make_server(call_site: Self, def_site: Self, mixed_site: Self) -> Self::Server;
+}
+
+impl ProcMacroSrvSpan for TokenId {
+    type Server = server_impl::token_id::TokenIdServer;
+
+    fn make_server(call_site: Self, def_site: Self, mixed_site: Self) -> Self::Server {
+        Self::Server { call_site, def_site, mixed_site }
+    }
+}
+impl ProcMacroSrvSpan for Span {
+    type Server = server_impl::rust_analyzer_span::RaSpanServer;
+    fn make_server(call_site: Self, def_site: Self, mixed_site: Self) -> Self::Server {
+        Self::Server {
+            call_site,
+            def_site,
+            mixed_site,
+            tracked_env_vars: Default::default(),
+            tracked_paths: Default::default(),
+        }
+    }
+}
+pub struct PanicMessage {
+    message: Option<String>,
+}
+
+impl PanicMessage {
+    pub fn into_string(self) -> Option<String> {
+        self.message
+    }
+}
+
+pub struct EnvSnapshot {
+    vars: HashMap<OsString, OsString>,
+}
+
+impl Default for EnvSnapshot {
+    fn default() -> EnvSnapshot {
+        EnvSnapshot { vars: env::vars_os().collect() }
+    }
+}
+
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+struct EnvChange<'snap> {
+    changed_vars: Vec<String>,
+    prev_working_dir: Option<PathBuf>,
+    snap: &'snap EnvSnapshot,
+    _guard: std::sync::MutexGuard<'snap, ()>,
+}
+
+impl<'snap> EnvChange<'snap> {
+    fn apply(
+        snap: &'snap EnvSnapshot,
+        new_vars: Vec<(String, String)>,
+        current_dir: Option<&Path>,
+    ) -> EnvChange<'snap> {
+        let guard = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prev_working_dir = match current_dir {
+            Some(dir) => {
+                let prev_working_dir = std::env::current_dir().ok();
+                if let Err(err) = std::env::set_current_dir(dir) {
+                    eprintln!(
+                        "Failed to set the current working dir to {}. Error: {err:?}",
+                        dir.display()
+                    )
+                }
+                prev_working_dir
+            }
+            None => None,
+        };
+        EnvChange {
+            snap,
+            changed_vars: new_vars
+                .into_iter()
+                .map(|(k, v)| {
+                    // SAFETY: We have acquired the environment lock
+                    unsafe { env::set_var(&k, v) };
+                    k
+                })
+                .collect(),
+            prev_working_dir,
+            _guard: guard,
+        }
+    }
+
+    fn rollback(self) {}
+}
+
+impl Drop for EnvChange<'_> {
+    fn drop(&mut self) {
+        for name in self.changed_vars.drain(..) {
+            // SAFETY: We have acquired the environment lock
+            unsafe {
+                match self.snap.vars.get::<std::ffi::OsStr>(name.as_ref()) {
+                    Some(prev_val) => env::set_var(name, prev_val),
+                    None => env::remove_var(name),
+                }
+            }
+        }
+
+        if let Some(dir) = &self.prev_working_dir {
+            if let Err(err) = std::env::set_current_dir(dir) {
                 eprintln!(
                     "Failed to set the current working dir to {}. Error: {:?}",
                     dir.display(),
@@ -99,62 +265,13 @@ impl ProcMacroSrv {
                 )
             }
         }
-
-        result.map_err(PanicMessage)
-    }
-
-    pub(crate) fn list_macros(
-        &mut self,
-        dylib_path: &Path,
-    ) -> Result<Vec<(String, ProcMacroKind)>, String> {
-        let expander = self.expander(dylib_path)?;
-        Ok(expander.list_macros())
-    }
-
-    fn expander(&mut self, path: &Path) -> Result<&dylib::Expander, String> {
-        let time = fs::metadata(path).and_then(|it| it.modified()).map_err(|err| {
-            format!("Failed to get file metadata for {}: {:?}", path.display(), err)
-        })?;
-
-        Ok(match self.expanders.entry((path.to_path_buf(), time)) {
-            Entry::Vacant(v) => v.insert(dylib::Expander::new(path).map_err(|err| {
-                format!("Cannot create expander for {}: {:?}", path.display(), err)
-            })?),
-            Entry::Occupied(e) => e.into_mut(),
-        })
     }
 }
 
-struct EnvSnapshot {
-    vars: HashMap<OsString, OsString>,
-}
-
-impl EnvSnapshot {
-    fn new() -> EnvSnapshot {
-        EnvSnapshot { vars: env::vars_os().collect() }
-    }
-
-    fn rollback(self) {
-        let mut old_vars = self.vars;
-        for (name, value) in env::vars_os() {
-            let old_value = old_vars.remove(&name);
-            if old_value != Some(value) {
-                match old_value {
-                    None => env::remove_var(name),
-                    Some(old_value) => env::set_var(name, old_value),
-                }
-            }
-        }
-        for (name, old_value) in old_vars {
-            env::set_var(name, old_value)
-        }
-    }
-}
-
-#[cfg(all(feature = "sysroot-abi", test))]
+#[cfg(test)]
 mod tests;
 
 #[cfg(test)]
-pub fn proc_macro_test_dylib_path() -> std::path::PathBuf {
+pub fn proc_macro_test_dylib_path() -> paths::Utf8PathBuf {
     proc_macro_test::PROC_MACRO_TEST_LOCATION.into()
 }

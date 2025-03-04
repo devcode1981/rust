@@ -9,21 +9,23 @@
 // `InferredIndex` is a newtype'd int representing the index of such
 // a variable.
 
+use std::fmt;
+
 use rustc_arena::DroplessArena;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{LocalDefId, LocalDefIdMap};
 use rustc_middle::ty::{self, TyCtxt};
-use std::fmt;
+use tracing::debug;
 
 use self::VarianceTerm::*;
 
-pub type VarianceTermPtr<'a> = &'a VarianceTerm<'a>;
+pub(crate) type VarianceTermPtr<'a> = &'a VarianceTerm<'a>;
 
 #[derive(Copy, Clone, Debug)]
-pub struct InferredIndex(pub usize);
+pub(crate) struct InferredIndex(pub usize);
 
 #[derive(Copy, Clone)]
-pub enum VarianceTerm<'a> {
+pub(crate) enum VarianceTerm<'a> {
     ConstantTerm(ty::Variance),
     TransformTerm(VarianceTermPtr<'a>, VarianceTermPtr<'a>),
     InferredTerm(InferredIndex),
@@ -32,8 +34,8 @@ pub enum VarianceTerm<'a> {
 impl<'a> fmt::Debug for VarianceTerm<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
-            ConstantTerm(c1) => write!(f, "{:?}", c1),
-            TransformTerm(v1, v2) => write!(f, "({:?} \u{00D7} {:?})", v1, v2),
+            ConstantTerm(c1) => write!(f, "{c1:?}"),
+            TransformTerm(v1, v2) => write!(f, "({v1:?} \u{00D7} {v2:?})"),
             InferredTerm(id) => write!(f, "[{}]", {
                 let InferredIndex(i) = id;
                 i
@@ -42,26 +44,26 @@ impl<'a> fmt::Debug for VarianceTerm<'a> {
     }
 }
 
-// The first pass over the crate simply builds up the set of inferreds.
+/// The first pass over the crate simply builds up the set of inferreds.
 
-pub struct TermsContext<'a, 'tcx> {
+pub(crate) struct TermsContext<'a, 'tcx> {
     pub tcx: TyCtxt<'tcx>,
     pub arena: &'a DroplessArena,
 
-    // For marker types, UnsafeCell, and other lang items where
-    // variance is hardcoded, records the item-id and the hardcoded
-    // variance.
+    /// For marker types, `UnsafeCell`, and other lang items where
+    /// variance is hardcoded, records the item-id and the hardcoded
+    /// variance.
     pub lang_items: Vec<(LocalDefId, Vec<ty::Variance>)>,
 
-    // Maps from the node id of an item to the first inferred index
-    // used for its type & region parameters.
+    /// Maps from the node id of an item to the first inferred index
+    /// used for its type & region parameters.
     pub inferred_starts: LocalDefIdMap<InferredIndex>,
 
-    // Maps from an InferredIndex to the term for that variable.
+    /// Maps from an InferredIndex to the term for that variable.
     pub inferred_terms: Vec<VarianceTermPtr<'a>>,
 }
 
-pub fn determine_parameters_to_be_inferred<'a, 'tcx>(
+pub(crate) fn determine_parameters_to_be_inferred<'a, 'tcx>(
     tcx: TyCtxt<'tcx>,
     arena: &'a DroplessArena,
 ) -> TermsContext<'a, 'tcx> {
@@ -91,12 +93,15 @@ pub fn determine_parameters_to_be_inferred<'a, 'tcx>(
 
                 let adt = tcx.adt_def(def_id);
                 for variant in adt.variants() {
-                    if let Some(ctor) = variant.ctor_def_id {
-                        terms_cx.add_inferreds_for_item(ctor.expect_local());
+                    if let Some(ctor_def_id) = variant.ctor_def_id() {
+                        terms_cx.add_inferreds_for_item(ctor_def_id.expect_local());
                     }
                 }
             }
             DefKind::Fn | DefKind::AssocFn => terms_cx.add_inferreds_for_item(def_id),
+            DefKind::TyAlias if tcx.type_alias_is_lazy(def_id) => {
+                terms_cx.add_inferreds_for_item(def_id)
+            }
             _ => {}
         }
     }

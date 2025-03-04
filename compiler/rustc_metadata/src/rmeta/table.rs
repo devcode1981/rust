@@ -1,28 +1,73 @@
+use rustc_hir::def::CtorOf;
+use rustc_index::Idx;
+
 use crate::rmeta::*;
 
-use rustc_data_structures::fingerprint::Fingerprint;
-use rustc_hir::def::{CtorKind, CtorOf};
-use rustc_index::vec::Idx;
-use rustc_middle::ty::ParameterizedOverTcx;
-use rustc_serialize::opaque::FileEncoder;
-use rustc_serialize::Encoder as _;
-use rustc_span::hygiene::MacroKind;
-use std::convert::TryInto;
-use std::marker::PhantomData;
-use std::num::NonZeroUsize;
+pub(super) trait IsDefault: Default {
+    fn is_default(&self) -> bool;
+}
+
+impl<T> IsDefault for Option<T> {
+    fn is_default(&self) -> bool {
+        self.is_none()
+    }
+}
+
+impl IsDefault for AttrFlags {
+    fn is_default(&self) -> bool {
+        self.is_empty()
+    }
+}
+
+impl IsDefault for bool {
+    fn is_default(&self) -> bool {
+        !self
+    }
+}
+
+impl IsDefault for u32 {
+    fn is_default(&self) -> bool {
+        *self == 0
+    }
+}
+
+impl IsDefault for u64 {
+    fn is_default(&self) -> bool {
+        *self == 0
+    }
+}
+
+impl<T> IsDefault for LazyArray<T> {
+    fn is_default(&self) -> bool {
+        self.num_elems == 0
+    }
+}
+
+impl IsDefault for UnusedGenericParams {
+    fn is_default(&self) -> bool {
+        // UnusedGenericParams encodes the *un*usedness as a bitset.
+        // This means that 0 corresponds to all bits used, which is indeed the default.
+        let is_default = self.bits() == 0;
+        debug_assert_eq!(is_default, self.all_used());
+        is_default
+    }
+}
 
 /// Helper trait, for encoding to, and decoding from, a fixed number of bytes.
 /// Used mainly for Lazy positions and lengths.
 /// Unchecked invariant: `Self::default()` should encode as `[0; BYTE_LEN]`,
 /// but this has no impact on safety.
-pub(super) trait FixedSizeEncoding: Default {
+pub(super) trait FixedSizeEncoding: IsDefault {
     /// This should be `[u8; BYTE_LEN]`;
+    /// Cannot use an associated `const BYTE_LEN: usize` instead due to const eval limitations.
     type ByteArray;
 
     fn from_bytes(b: &Self::ByteArray) -> Self;
     fn write_to_bytes(self, b: &mut Self::ByteArray);
 }
 
+/// This implementation is not used generically, but for reading/writing
+/// concrete `u32` fields in `Lazy*` structures, which may be zero.
 impl FixedSizeEncoding for u32 {
     type ByteArray = [u8; 4];
 
@@ -33,6 +78,20 @@ impl FixedSizeEncoding for u32 {
 
     #[inline]
     fn write_to_bytes(self, b: &mut [u8; 4]) {
+        *b = self.to_le_bytes();
+    }
+}
+
+impl FixedSizeEncoding for u64 {
+    type ByteArray = [u8; 8];
+
+    #[inline]
+    fn from_bytes(b: &[u8; 8]) -> Self {
+        Self::from_le_bytes(*b)
+    }
+
+    #[inline]
+    fn write_to_bytes(self, b: &mut [u8; 8]) {
         *b = self.to_le_bytes();
     }
 }
@@ -58,7 +117,7 @@ macro_rules! fixed_size_enum {
             fn write_to_bytes(self, b: &mut [u8;1]) {
                 use $ty::*;
                 b[0] = match self {
-                    None => 0,
+                    None => unreachable!(),
                     $(Some($($pat)*) => 1 + ${index()},)*
                 }
             }
@@ -90,24 +149,28 @@ fixed_size_enum! {
         ( AnonConst                                )
         ( InlineConst                              )
         ( OpaqueTy                                 )
-        ( ImplTraitPlaceholder                     )
         ( Field                                    )
         ( LifetimeParam                            )
         ( GlobalAsm                                )
-        ( Impl                                     )
+        ( Impl { of_trait: false }                 )
+        ( Impl { of_trait: true }                  )
         ( Closure                                  )
-        ( Generator                                )
-        ( Static(ast::Mutability::Not)             )
-        ( Static(ast::Mutability::Mut)             )
+        ( Static { safety: hir::Safety::Unsafe, mutability: ast::Mutability::Not, nested: false } )
+        ( Static { safety: hir::Safety::Safe, mutability: ast::Mutability::Not, nested: false } )
+        ( Static { safety: hir::Safety::Unsafe, mutability: ast::Mutability::Mut, nested: false } )
+        ( Static { safety: hir::Safety::Safe, mutability: ast::Mutability::Mut, nested: false } )
+        ( Static { safety: hir::Safety::Unsafe, mutability: ast::Mutability::Not, nested: true } )
+        ( Static { safety: hir::Safety::Safe, mutability: ast::Mutability::Not, nested: true } )
+        ( Static { safety: hir::Safety::Unsafe, mutability: ast::Mutability::Mut, nested: true } )
+        ( Static { safety: hir::Safety::Safe, mutability: ast::Mutability::Mut, nested: true } )
         ( Ctor(CtorOf::Struct, CtorKind::Fn)       )
         ( Ctor(CtorOf::Struct, CtorKind::Const)    )
-        ( Ctor(CtorOf::Struct, CtorKind::Fictive)  )
         ( Ctor(CtorOf::Variant, CtorKind::Fn)      )
         ( Ctor(CtorOf::Variant, CtorKind::Const)   )
-        ( Ctor(CtorOf::Variant, CtorKind::Fictive) )
         ( Macro(MacroKind::Bang)                   )
         ( Macro(MacroKind::Attr)                   )
         ( Macro(MacroKind::Derive)                 )
+        ( SyntheticCoroutineBody                   )
     }
 }
 
@@ -135,16 +198,39 @@ fixed_size_enum! {
 }
 
 fixed_size_enum! {
-    hir::IsAsync {
-        ( NotAsync )
-        ( Async    )
+    hir::Safety {
+        ( Unsafe )
+        ( Safe   )
+    }
+}
+
+fixed_size_enum! {
+    ty::Asyncness {
+        ( Yes )
+        ( No  )
+    }
+}
+
+fixed_size_enum! {
+    hir::CoroutineKind {
+        ( Coroutine(hir::Movability::Movable)                                          )
+        ( Coroutine(hir::Movability::Static)                                           )
+        ( Desugared(hir::CoroutineDesugaring::Gen, hir::CoroutineSource::Block)        )
+        ( Desugared(hir::CoroutineDesugaring::Gen, hir::CoroutineSource::Fn)           )
+        ( Desugared(hir::CoroutineDesugaring::Gen, hir::CoroutineSource::Closure)      )
+        ( Desugared(hir::CoroutineDesugaring::Async, hir::CoroutineSource::Block)      )
+        ( Desugared(hir::CoroutineDesugaring::Async, hir::CoroutineSource::Fn)         )
+        ( Desugared(hir::CoroutineDesugaring::Async, hir::CoroutineSource::Closure)    )
+        ( Desugared(hir::CoroutineDesugaring::AsyncGen, hir::CoroutineSource::Block)   )
+        ( Desugared(hir::CoroutineDesugaring::AsyncGen, hir::CoroutineSource::Fn)      )
+        ( Desugared(hir::CoroutineDesugaring::AsyncGen, hir::CoroutineSource::Closure) )
     }
 }
 
 fixed_size_enum! {
     ty::AssocItemContainer {
-        ( TraitContainer )
-        ( ImplContainer  )
+        ( Trait )
+        ( Impl  )
     }
 }
 
@@ -156,63 +242,106 @@ fixed_size_enum! {
     }
 }
 
-// We directly encode `DefPathHash` because a `LazyValue` would incur a 25% cost.
-impl FixedSizeEncoding for Option<DefPathHash> {
-    type ByteArray = [u8; 16];
-
-    #[inline]
-    fn from_bytes(b: &[u8; 16]) -> Self {
-        Some(DefPathHash(Fingerprint::from_le_bytes(*b)))
-    }
-
-    #[inline]
-    fn write_to_bytes(self, b: &mut [u8; 16]) {
-        let Some(DefPathHash(fingerprint)) = self else {
-            panic!("Trying to encode absent DefPathHash.")
-        };
-        *b = fingerprint.to_le_bytes();
-    }
-}
-
 // We directly encode RawDefId because using a `LazyValue` would incur a 50% overhead in the worst case.
 impl FixedSizeEncoding for Option<RawDefId> {
     type ByteArray = [u8; 8];
 
     #[inline]
-    fn from_bytes(b: &[u8; 8]) -> Self {
-        let krate = u32::from_le_bytes(b[0..4].try_into().unwrap());
-        let index = u32::from_le_bytes(b[4..8].try_into().unwrap());
+    fn from_bytes(encoded: &[u8; 8]) -> Self {
+        let (index, krate) = decode_interleaved(encoded);
+        let krate = u32::from_le_bytes(krate);
         if krate == 0 {
             return None;
         }
+        let index = u32::from_le_bytes(index);
+
         Some(RawDefId { krate: krate - 1, index })
     }
 
     #[inline]
-    fn write_to_bytes(self, b: &mut [u8; 8]) {
+    fn write_to_bytes(self, dest: &mut [u8; 8]) {
         match self {
-            None => *b = [0; 8],
+            None => unreachable!(),
             Some(RawDefId { krate, index }) => {
-                // CrateNum is less than `CrateNum::MAX_AS_U32`.
                 debug_assert!(krate < u32::MAX);
-                b[0..4].copy_from_slice(&(1 + krate).to_le_bytes());
-                b[4..8].copy_from_slice(&index.to_le_bytes());
+                // CrateNum is less than `CrateNum::MAX_AS_U32`.
+                let krate = (krate + 1).to_le_bytes();
+                let index = index.to_le_bytes();
+
+                // CrateNum is usually much smaller than the index within the crate, so put it in
+                // the second slot.
+                encode_interleaved(index, krate, dest);
             }
         }
     }
 }
 
-impl FixedSizeEncoding for Option<()> {
+impl FixedSizeEncoding for AttrFlags {
     type ByteArray = [u8; 1];
 
     #[inline]
     fn from_bytes(b: &[u8; 1]) -> Self {
-        (b[0] != 0).then(|| ())
+        AttrFlags::from_bits_truncate(b[0])
     }
 
     #[inline]
     fn write_to_bytes(self, b: &mut [u8; 1]) {
-        b[0] = self.is_some() as u8
+        debug_assert!(!self.is_default());
+        b[0] = self.bits();
+    }
+}
+
+impl FixedSizeEncoding for bool {
+    type ByteArray = [u8; 1];
+
+    #[inline]
+    fn from_bytes(b: &[u8; 1]) -> Self {
+        b[0] != 0
+    }
+
+    #[inline]
+    fn write_to_bytes(self, b: &mut [u8; 1]) {
+        debug_assert!(!self.is_default());
+        b[0] = self as u8
+    }
+}
+
+impl FixedSizeEncoding for Option<bool> {
+    type ByteArray = [u8; 1];
+
+    #[inline]
+    fn from_bytes(b: &[u8; 1]) -> Self {
+        match b[0] {
+            0 => Some(false),
+            1 => Some(true),
+            2 => None,
+            _ => unreachable!(),
+        }
+    }
+
+    #[inline]
+    fn write_to_bytes(self, b: &mut [u8; 1]) {
+        debug_assert!(!self.is_default());
+        b[0] = match self {
+            Some(false) => 0,
+            Some(true) => 1,
+            None => 2,
+        };
+    }
+}
+
+impl FixedSizeEncoding for UnusedGenericParams {
+    type ByteArray = [u8; 4];
+
+    #[inline]
+    fn from_bytes(b: &[u8; 4]) -> Self {
+        let x: u32 = u32::from_bytes(b);
+        UnusedGenericParams::from_bits(x)
+    }
+
+    #[inline]
+    fn write_to_bytes(self, b: &mut [u8; 4]) {
+        self.bits().write_to_bytes(b);
     }
 }
 
@@ -220,126 +349,207 @@ impl FixedSizeEncoding for Option<()> {
 // generic `LazyValue<T>` impl, but in the general case we might not need / want
 // to fit every `usize` in `u32`.
 impl<T> FixedSizeEncoding for Option<LazyValue<T>> {
-    type ByteArray = [u8; 4];
-
-    #[inline]
-    fn from_bytes(b: &[u8; 4]) -> Self {
-        let position = NonZeroUsize::new(u32::from_bytes(b) as usize)?;
-        Some(LazyValue::from_position(position))
-    }
-
-    #[inline]
-    fn write_to_bytes(self, b: &mut [u8; 4]) {
-        let position = self.map_or(0, |lazy| lazy.position.get());
-        let position: u32 = position.try_into().unwrap();
-        position.write_to_bytes(b)
-    }
-}
-
-impl<T> FixedSizeEncoding for Option<LazyArray<T>> {
     type ByteArray = [u8; 8];
 
     #[inline]
     fn from_bytes(b: &[u8; 8]) -> Self {
-        let ([ref position_bytes, ref meta_bytes],[])= b.as_chunks::<4>() else { panic!() };
-        let position = NonZeroUsize::new(u32::from_bytes(position_bytes) as usize)?;
-        let len = u32::from_bytes(meta_bytes) as usize;
-        Some(LazyArray::from_position_and_num_elems(position, len))
+        let position = NonZero::new(u64::from_bytes(b) as usize)?;
+        Some(LazyValue::from_position(position))
     }
 
     #[inline]
     fn write_to_bytes(self, b: &mut [u8; 8]) {
-        let ([ref mut position_bytes, ref mut meta_bytes],[])= b.as_chunks_mut::<4>() else { panic!() };
+        match self {
+            None => unreachable!(),
+            Some(lazy) => {
+                let position = lazy.position.get();
+                let position: u64 = position.try_into().unwrap();
+                position.write_to_bytes(b)
+            }
+        }
+    }
+}
 
-        let position = self.map_or(0, |lazy| lazy.position.get());
-        let position: u32 = position.try_into().unwrap();
-        position.write_to_bytes(position_bytes);
+impl<T> LazyArray<T> {
+    #[inline]
+    fn write_to_bytes_impl(self, dest: &mut [u8; 16]) {
+        let position = (self.position.get() as u64).to_le_bytes();
+        let len = (self.num_elems as u64).to_le_bytes();
 
-        let len = self.map_or(0, |lazy| lazy.num_elems);
-        let len: u32 = len.try_into().unwrap();
-        len.write_to_bytes(meta_bytes);
+        encode_interleaved(position, len, dest)
+    }
+
+    fn from_bytes_impl(position: &[u8; 8], meta: &[u8; 8]) -> Option<LazyArray<T>> {
+        let position = NonZero::new(u64::from_bytes(position) as usize)?;
+        let len = u64::from_bytes(meta) as usize;
+        Some(LazyArray::from_position_and_num_elems(position, len))
+    }
+}
+
+// Interleaving the bytes of the two integers exposes trailing bytes in the first integer
+// to the varint scheme that we use for tables.
+#[inline]
+fn decode_interleaved<const N: usize, const M: usize>(encoded: &[u8; N]) -> ([u8; M], [u8; M]) {
+    assert_eq!(M * 2, N);
+    let mut first = [0u8; M];
+    let mut second = [0u8; M];
+    for i in 0..M {
+        first[i] = encoded[2 * i];
+        second[i] = encoded[2 * i + 1];
+    }
+    (first, second)
+}
+
+// Element width is selected at runtime on a per-table basis by omitting trailing
+// zero bytes in table elements. This works very naturally when table elements are
+// simple numbers but sometimes we have a pair of integers. If naively encoded, the second element
+// would shield the trailing zeroes in the first. Interleaving the bytes exposes trailing zeroes in
+// both to the optimization.
+//
+// Prefer passing a and b such that `b` is usually smaller.
+#[inline]
+fn encode_interleaved<const N: usize, const M: usize>(a: [u8; M], b: [u8; M], dest: &mut [u8; N]) {
+    assert_eq!(M * 2, N);
+    for i in 0..M {
+        dest[2 * i] = a[i];
+        dest[2 * i + 1] = b[i];
+    }
+}
+
+impl<T> FixedSizeEncoding for LazyArray<T> {
+    type ByteArray = [u8; 16];
+
+    #[inline]
+    fn from_bytes(b: &[u8; 16]) -> Self {
+        let (position, meta) = decode_interleaved(b);
+
+        if meta == [0; 8] {
+            return Default::default();
+        }
+        LazyArray::from_bytes_impl(&position, &meta).unwrap()
+    }
+
+    #[inline]
+    fn write_to_bytes(self, b: &mut [u8; 16]) {
+        assert!(!self.is_default());
+        self.write_to_bytes_impl(b)
+    }
+}
+
+impl<T> FixedSizeEncoding for Option<LazyArray<T>> {
+    type ByteArray = [u8; 16];
+
+    #[inline]
+    fn from_bytes(b: &[u8; 16]) -> Self {
+        let (position, meta) = decode_interleaved(b);
+
+        LazyArray::from_bytes_impl(&position, &meta)
+    }
+
+    #[inline]
+    fn write_to_bytes(self, b: &mut [u8; 16]) {
+        match self {
+            None => unreachable!(),
+            Some(lazy) => lazy.write_to_bytes_impl(b),
+        }
     }
 }
 
 /// Helper for constructing a table's serialization (also see `Table`).
-pub(super) struct TableBuilder<I: Idx, T>
-where
-    Option<T>: FixedSizeEncoding,
-{
-    blocks: IndexVec<I, <Option<T> as FixedSizeEncoding>::ByteArray>,
+pub(super) struct TableBuilder<I: Idx, T: FixedSizeEncoding> {
+    width: usize,
+    blocks: IndexVec<I, T::ByteArray>,
     _marker: PhantomData<T>,
 }
 
-impl<I: Idx, T> Default for TableBuilder<I, T>
-where
-    Option<T>: FixedSizeEncoding,
-{
+impl<I: Idx, T: FixedSizeEncoding> Default for TableBuilder<I, T> {
     fn default() -> Self {
-        TableBuilder { blocks: Default::default(), _marker: PhantomData }
+        TableBuilder { width: 0, blocks: Default::default(), _marker: PhantomData }
     }
 }
 
-impl<I: Idx, T> TableBuilder<I, T>
+impl<I: Idx, const N: usize, T> TableBuilder<I, Option<T>>
 where
-    Option<T>: FixedSizeEncoding,
+    Option<T>: FixedSizeEncoding<ByteArray = [u8; N]>,
 {
-    pub(crate) fn set<const N: usize>(&mut self, i: I, value: T)
-    where
-        Option<T>: FixedSizeEncoding<ByteArray = [u8; N]>,
-    {
-        // FIXME(eddyb) investigate more compact encodings for sparse tables.
-        // On the PR @michaelwoerister mentioned:
-        // > Space requirements could perhaps be optimized by using the HAMT `popcnt`
-        // > trick (i.e. divide things into buckets of 32 or 64 items and then
-        // > store bit-masks of which item in each bucket is actually serialized).
-        self.blocks.ensure_contains_elem(i, || [0; N]);
-        Some(value).write_to_bytes(&mut self.blocks[i]);
+    pub(crate) fn set_some(&mut self, i: I, value: T) {
+        self.set(i, Some(value))
+    }
+}
+
+impl<I: Idx, const N: usize, T: FixedSizeEncoding<ByteArray = [u8; N]>> TableBuilder<I, T> {
+    /// Sets the table value if it is not default.
+    /// ATTENTION: For optimization default values are simply ignored by this function, because
+    /// right now metadata tables never need to reset non-default values to default. If such need
+    /// arises in the future then a new method (e.g. `clear` or `reset`) will need to be introduced
+    /// for doing that explicitly.
+    pub(crate) fn set(&mut self, i: I, value: T) {
+        if !value.is_default() {
+            // FIXME(eddyb) investigate more compact encodings for sparse tables.
+            // On the PR @michaelwoerister mentioned:
+            // > Space requirements could perhaps be optimized by using the HAMT `popcnt`
+            // > trick (i.e. divide things into buckets of 32 or 64 items and then
+            // > store bit-masks of which item in each bucket is actually serialized).
+            let block = self.blocks.ensure_contains_elem(i, || [0; N]);
+            value.write_to_bytes(block);
+            if self.width != N {
+                let width = N - trailing_zeros(block);
+                self.width = self.width.max(width);
+            }
+        }
     }
 
-    pub(crate) fn encode<const N: usize>(&self, buf: &mut FileEncoder) -> LazyTable<I, T>
-    where
-        Option<T>: FixedSizeEncoding<ByteArray = [u8; N]>,
-    {
+    pub(crate) fn encode(&self, buf: &mut FileEncoder) -> LazyTable<I, T> {
         let pos = buf.position();
+
+        let width = self.width;
         for block in &self.blocks {
-            buf.emit_raw_bytes(block);
+            buf.write_with(|dest| {
+                *dest = *block;
+                width
+            });
         }
-        let num_bytes = self.blocks.len() * N;
+
         LazyTable::from_position_and_encoded_size(
-            NonZeroUsize::new(pos as usize).unwrap(),
-            num_bytes,
+            NonZero::new(pos).unwrap(),
+            width,
+            self.blocks.len(),
         )
     }
 }
 
-impl<I: Idx, T: ParameterizedOverTcx> LazyTable<I, T>
+fn trailing_zeros(x: &[u8]) -> usize {
+    x.iter().rev().take_while(|b| **b == 0).count()
+}
+
+impl<I: Idx, const N: usize, T: FixedSizeEncoding<ByteArray = [u8; N]> + ParameterizedOverTcx>
+    LazyTable<I, T>
 where
-    Option<T>: FixedSizeEncoding,
+    for<'tcx> T::Value<'tcx>: FixedSizeEncoding<ByteArray = [u8; N]>,
 {
     /// Given the metadata, extract out the value at a particular index (if any).
-    #[inline(never)]
-    pub(super) fn get<'a, 'tcx, M: Metadata<'a, 'tcx>, const N: usize>(
-        &self,
-        metadata: M,
-        i: I,
-    ) -> Option<T::Value<'tcx>>
-    where
-        Option<T::Value<'tcx>>: FixedSizeEncoding<ByteArray = [u8; N]>,
-    {
-        debug!("LazyTable::lookup: index={:?} len={:?}", i, self.encoded_size);
+    pub(super) fn get<'a, 'tcx, M: Metadata<'a, 'tcx>>(&self, metadata: M, i: I) -> T::Value<'tcx> {
+        // Access past the end of the table returns a Default
+        if i.index() >= self.len {
+            return Default::default();
+        }
 
-        let start = self.position.get();
-        let bytes = &metadata.blob()[start..start + self.encoded_size];
-        let (bytes, []) = bytes.as_chunks::<N>() else { panic!() };
-        let bytes = bytes.get(i.index())?;
-        FixedSizeEncoding::from_bytes(bytes)
+        let width = self.width;
+        let start = self.position.get() + (width * i.index());
+        let end = start + width;
+        let bytes = &metadata.blob()[start..end];
+
+        if let Ok(fixed) = bytes.try_into() {
+            FixedSizeEncoding::from_bytes(fixed)
+        } else {
+            let mut fixed = [0u8; N];
+            fixed[..width].copy_from_slice(bytes);
+            FixedSizeEncoding::from_bytes(&fixed)
+        }
     }
 
     /// Size of the table in entries, including possible gaps.
-    pub(super) fn size<const N: usize>(&self) -> usize
-    where
-        for<'tcx> Option<T::Value<'tcx>>: FixedSizeEncoding<ByteArray = [u8; N]>,
-    {
-        self.encoded_size / N
+    pub(super) fn size(&self) -> usize {
+        self.len
     }
 }

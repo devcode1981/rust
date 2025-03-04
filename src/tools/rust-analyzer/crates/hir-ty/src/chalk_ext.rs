@@ -1,32 +1,43 @@
 //! Various extensions traits for Chalk types.
 
-use chalk_ir::{FloatTy, IntTy, Mutability, Scalar, UintTy};
+use chalk_ir::{
+    cast::Cast, FloatTy, IntTy, Mutability, Scalar, TyVariableKind, TypeOutlives, UintTy,
+};
 use hir_def::{
     builtin_type::{BuiltinFloat, BuiltinInt, BuiltinType, BuiltinUint},
     generics::TypeOrConstParamData,
+    lang_item::LangItem,
     type_ref::Rawness,
-    FunctionId, GenericDefId, HasModule, ItemContainerId, Lookup, TraitId,
+    DefWithBodyId, FunctionId, GenericDefId, HasModule, ItemContainerId, Lookup, TraitId,
 };
-use syntax::SmolStr;
 
 use crate::{
     db::HirDatabase, from_assoc_type_id, from_chalk_trait_id, from_foreign_def_id,
-    from_placeholder_idx, to_chalk_trait_id, AdtId, AliasEq, AliasTy, Binders, CallableDefId,
-    CallableSig, FnPointer, ImplTraitId, Interner, Lifetime, ProjectionTy, QuantifiedWhereClause,
-    Substitution, TraitRef, Ty, TyBuilder, TyKind, WhereClause,
+    from_placeholder_idx, generics::generics, to_chalk_trait_id, utils::ClosureSubst, AdtId,
+    AliasEq, AliasTy, Binders, CallableDefId, CallableSig, Canonical, CanonicalVarKinds, ClosureId,
+    DynTy, FnPointer, ImplTraitId, InEnvironment, Interner, Lifetime, ProjectionTy,
+    QuantifiedWhereClause, Substitution, TraitRef, Ty, TyBuilder, TyKind, TypeFlags, WhereClause,
 };
 
 pub trait TyExt {
     fn is_unit(&self) -> bool;
+    fn is_integral(&self) -> bool;
+    fn is_scalar(&self) -> bool;
+    fn is_floating_point(&self) -> bool;
     fn is_never(&self) -> bool;
+    fn is_str(&self) -> bool;
     fn is_unknown(&self) -> bool;
+    fn contains_unknown(&self) -> bool;
     fn is_ty_var(&self) -> bool;
+    fn is_union(&self) -> bool;
 
     fn as_adt(&self) -> Option<(hir_def::AdtId, &Substitution)>;
     fn as_builtin(&self) -> Option<BuiltinType>;
     fn as_tuple(&self) -> Option<&Substitution>;
+    fn as_closure(&self) -> Option<ClosureId>;
     fn as_fn_def(&self, db: &dyn HirDatabase) -> Option<FunctionId>;
     fn as_reference(&self) -> Option<(&Ty, Lifetime, Mutability)>;
+    fn as_raw_ptr(&self) -> Option<(&Ty, Mutability)>;
     fn as_reference_or_ptr(&self) -> Option<(&Ty, Rawness, Mutability)>;
     fn as_generic_def(&self, db: &dyn HirDatabase) -> Option<GenericDefId>;
 
@@ -41,6 +52,7 @@ pub trait TyExt {
 
     fn impl_trait_bounds(&self, db: &dyn HirDatabase) -> Option<Vec<QuantifiedWhereClause>>;
     fn associated_type_parent_trait(&self, db: &dyn HirDatabase) -> Option<TraitId>;
+    fn is_copy(self, db: &dyn HirDatabase, owner: DefWithBodyId) -> bool;
 
     /// FIXME: Get rid of this, it's not a good abstraction
     fn equals_ctor(&self, other: &Ty) -> bool;
@@ -51,16 +63,47 @@ impl TyExt for Ty {
         matches!(self.kind(Interner), TyKind::Tuple(0, _))
     }
 
+    fn is_integral(&self) -> bool {
+        matches!(
+            self.kind(Interner),
+            TyKind::Scalar(Scalar::Int(_) | Scalar::Uint(_))
+                | TyKind::InferenceVar(_, TyVariableKind::Integer)
+        )
+    }
+
+    fn is_scalar(&self) -> bool {
+        matches!(self.kind(Interner), TyKind::Scalar(_))
+    }
+
+    fn is_floating_point(&self) -> bool {
+        matches!(
+            self.kind(Interner),
+            TyKind::Scalar(Scalar::Float(_)) | TyKind::InferenceVar(_, TyVariableKind::Float)
+        )
+    }
+
     fn is_never(&self) -> bool {
         matches!(self.kind(Interner), TyKind::Never)
+    }
+
+    fn is_str(&self) -> bool {
+        matches!(self.kind(Interner), TyKind::Str)
     }
 
     fn is_unknown(&self) -> bool {
         matches!(self.kind(Interner), TyKind::Error)
     }
 
+    fn contains_unknown(&self) -> bool {
+        self.data(Interner).flags.contains(TypeFlags::HAS_ERROR)
+    }
+
     fn is_ty_var(&self) -> bool {
         matches!(self.kind(Interner), TyKind::InferenceVar(_, _))
+    }
+
+    fn is_union(&self) -> bool {
+        matches!(self.adt_id(Interner), Some(AdtId(hir_def::AdtId::UnionId(_))))
     }
 
     fn as_adt(&self) -> Option<(hir_def::AdtId, &Substitution)> {
@@ -76,8 +119,10 @@ impl TyExt for Ty {
             TyKind::Scalar(Scalar::Bool) => Some(BuiltinType::Bool),
             TyKind::Scalar(Scalar::Char) => Some(BuiltinType::Char),
             TyKind::Scalar(Scalar::Float(fty)) => Some(BuiltinType::Float(match fty {
+                FloatTy::F128 => BuiltinFloat::F128,
                 FloatTy::F64 => BuiltinFloat::F64,
                 FloatTy::F32 => BuiltinFloat::F32,
+                FloatTy::F16 => BuiltinFloat::F16,
             })),
             TyKind::Scalar(Scalar::Int(ity)) => Some(BuiltinType::Int(match ity {
                 IntTy::Isize => BuiltinInt::Isize,
@@ -106,15 +151,30 @@ impl TyExt for Ty {
         }
     }
 
+    fn as_closure(&self) -> Option<ClosureId> {
+        match self.kind(Interner) {
+            TyKind::Closure(id, _) => Some(*id),
+            _ => None,
+        }
+    }
+
     fn as_fn_def(&self, db: &dyn HirDatabase) -> Option<FunctionId> {
         match self.callable_def(db) {
             Some(CallableDefId::FunctionId(func)) => Some(func),
             Some(CallableDefId::StructId(_) | CallableDefId::EnumVariantId(_)) | None => None,
         }
     }
+
     fn as_reference(&self) -> Option<(&Ty, Lifetime, Mutability)> {
         match self.kind(Interner) {
             TyKind::Ref(mutability, lifetime, ty) => Some((ty, lifetime.clone(), *mutability)),
+            _ => None,
+        }
+    }
+
+    fn as_raw_ptr(&self) -> Option<(&Ty, Mutability)> {
+        match self.kind(Interner) {
+            TyKind::Raw(mutability, ty) => Some((ty, *mutability)),
             _ => None,
         }
     }
@@ -130,9 +190,10 @@ impl TyExt for Ty {
     fn as_generic_def(&self, db: &dyn HirDatabase) -> Option<GenericDefId> {
         match *self.kind(Interner) {
             TyKind::Adt(AdtId(adt), ..) => Some(adt.into()),
-            TyKind::FnDef(callable, ..) => {
-                Some(db.lookup_intern_callable_def(callable.into()).into())
-            }
+            TyKind::FnDef(callable, ..) => Some(GenericDefId::from_callable(
+                db.upcast(),
+                db.lookup_intern_callable_def(callable.into()),
+            )),
             TyKind::AssociatedType(type_alias, ..) => Some(from_assoc_type_id(type_alias).into()),
             TyKind::Foreign(type_alias, ..) => Some(from_foreign_def_id(type_alias).into()),
             _ => None,
@@ -149,15 +210,8 @@ impl TyExt for Ty {
     fn callable_sig(&self, db: &dyn HirDatabase) -> Option<CallableSig> {
         match self.kind(Interner) {
             TyKind::Function(fn_ptr) => Some(CallableSig::from_fn_ptr(fn_ptr)),
-            TyKind::FnDef(def, parameters) => {
-                let callable_def = db.lookup_intern_callable_def((*def).into());
-                let sig = db.callable_item_signature(callable_def);
-                Some(sig.substitute(Interner, parameters))
-            }
-            TyKind::Closure(.., substs) => {
-                let sig_param = substs.at(Interner, 0).assert_ty_ref(Interner);
-                sig_param.callable_sig(db)
-            }
+            TyKind::FnDef(def, parameters) => Some(CallableSig::from_def(db, *def, parameters)),
+            TyKind::Closure(.., substs) => ClosureSubst(substs).sig_ty().callable_sig(db),
             _ => None,
         }
     }
@@ -168,7 +222,7 @@ impl TyExt for Ty {
             // invariant ensured by `TyLoweringContext::lower_dyn_trait()`.
             // FIXME: dyn types may not have principal trait and we don't want to return auto trait
             // here.
-            TyKind::Dyn(dyn_ty) => dyn_ty.bounds.skip_binders().interned().get(0).and_then(|b| {
+            TyKind::Dyn(dyn_ty) => dyn_ty.bounds.skip_binders().interned().first().and_then(|b| {
                 match b.skip_binders() {
                     WhereClause::Implemented(trait_ref) => Some(trait_ref),
                     _ => None,
@@ -197,9 +251,8 @@ impl TyExt for Ty {
                 match db.lookup_intern_impl_trait_id((*opaque_ty_id).into()) {
                     ImplTraitId::AsyncBlockTypeImplTrait(def, _expr) => {
                         let krate = def.module(db.upcast()).krate();
-                        if let Some(future_trait) = db
-                            .lang_item(krate, SmolStr::new_inline("future_trait"))
-                            .and_then(|item| item.as_trait())
+                        if let Some(future_trait) =
+                            db.lang_item(krate, LangItem::Future).and_then(|item| item.as_trait())
                         {
                             // This is only used by type walking.
                             // Parameters will be walked outside, and projection predicate is not used.
@@ -218,9 +271,15 @@ impl TyExt for Ty {
                     }
                     ImplTraitId::ReturnTypeImplTrait(func, idx) => {
                         db.return_type_impl_traits(func).map(|it| {
-                            let data = (*it)
-                                .as_ref()
-                                .map(|rpit| rpit.impl_traits[idx as usize].bounds.clone());
+                            let data =
+                                (*it).as_ref().map(|rpit| rpit.impl_traits[idx].bounds.clone());
+                            data.substitute(Interner, &subst).into_value_and_skipped_binders().0
+                        })
+                    }
+                    ImplTraitId::TypeAliasImplTrait(alias, idx) => {
+                        db.type_alias_impl_traits(alias).map(|it| {
+                            let data =
+                                (*it).as_ref().map(|rpit| rpit.impl_traits[idx].bounds.clone());
                             data.substitute(Interner, &subst).into_value_and_skipped_binders().0
                         })
                     }
@@ -231,9 +290,15 @@ impl TyExt for Ty {
                 {
                     ImplTraitId::ReturnTypeImplTrait(func, idx) => {
                         db.return_type_impl_traits(func).map(|it| {
-                            let data = (*it)
-                                .as_ref()
-                                .map(|rpit| rpit.impl_traits[idx as usize].bounds.clone());
+                            let data =
+                                (*it).as_ref().map(|rpit| rpit.impl_traits[idx].bounds.clone());
+                            data.substitute(Interner, &opaque_ty.substitution)
+                        })
+                    }
+                    ImplTraitId::TypeAliasImplTrait(alias, idx) => {
+                        db.type_alias_impl_traits(alias).map(|it| {
+                            let data =
+                                (*it).as_ref().map(|rpit| rpit.impl_traits[idx].bounds.clone());
                             data.substitute(Interner, &opaque_ty.substitution)
                         })
                     }
@@ -246,7 +311,7 @@ impl TyExt for Ty {
             TyKind::Placeholder(idx) => {
                 let id = from_placeholder_idx(db, *idx);
                 let generic_params = db.generic_params(id.parent);
-                let param_data = &generic_params.type_or_consts[id.local_id];
+                let param_data = &generic_params[id.local_id];
                 match param_data {
                     TypeOrConstParamData::TypeParamData(p) => match p.provenance {
                         hir_def::generics::TypeParamProvenance::ArgumentImplTrait => {
@@ -255,7 +320,7 @@ impl TyExt for Ty {
                                 .generic_predicates(id.parent)
                                 .iter()
                                 .map(|pred| pred.clone().substitute(Interner, &substs))
-                                .filter(|wc| match &wc.skip_binders() {
+                                .filter(|wc| match wc.skip_binders() {
                                     WhereClause::Implemented(tr) => {
                                         &tr.self_type_parameter(Interner) == self
                                     }
@@ -263,6 +328,9 @@ impl TyExt for Ty {
                                         alias: AliasTy::Projection(proj),
                                         ty: _,
                                     }) => &proj.self_type_parameter(db) == self,
+                                    WhereClause::TypeOutlives(TypeOutlives { ty, lifetime: _ }) => {
+                                        ty == self
+                                    }
                                     _ => false,
                                 })
                                 .collect::<Vec<_>>();
@@ -297,6 +365,21 @@ impl TyExt for Ty {
             }
             _ => None,
         }
+    }
+
+    fn is_copy(self, db: &dyn HirDatabase, owner: DefWithBodyId) -> bool {
+        let crate_id = owner.module(db.upcast()).krate();
+        let Some(copy_trait) = db.lang_item(crate_id, LangItem::Copy).and_then(|it| it.as_trait())
+        else {
+            return false;
+        };
+        let trait_ref = TyBuilder::trait_ref(db, copy_trait).push(self).build();
+        let env = db.trait_environment_for_body(owner);
+        let goal = Canonical {
+            value: InEnvironment::new(&env.env, trait_ref.cast(Interner)),
+            binders: CanonicalVarKinds::empty(Interner),
+        };
+        db.trait_solve(crate_id, None, goal).is_some()
     }
 
     fn equals_ctor(&self, other: &Ty) -> bool {
@@ -338,10 +421,13 @@ pub trait ProjectionTyExt {
 
 impl ProjectionTyExt for ProjectionTy {
     fn trait_ref(&self, db: &dyn HirDatabase) -> TraitRef {
-        TraitRef {
-            trait_id: to_chalk_trait_id(self.trait_(db)),
-            substitution: self.substitution.clone(),
-        }
+        // FIXME: something like `Split` trait from chalk-solve might be nice.
+        let generics = generics(db.upcast(), from_assoc_type_id(self.associated_ty_id).into());
+        let substitution = Substitution::from_iter(
+            Interner,
+            self.substitution.iter(Interner).skip(generics.len_self()),
+        );
+        TraitRef { trait_id: to_chalk_trait_id(self.trait_(db)), substitution }
     }
 
     fn trait_(&self, db: &dyn HirDatabase) -> TraitId {
@@ -353,6 +439,31 @@ impl ProjectionTyExt for ProjectionTy {
 
     fn self_type_parameter(&self, db: &dyn HirDatabase) -> Ty {
         self.trait_ref(db).self_type_parameter(Interner)
+    }
+}
+
+pub trait DynTyExt {
+    fn principal(&self) -> Option<Binders<Binders<&TraitRef>>>;
+    fn principal_id(&self) -> Option<chalk_ir::TraitId<Interner>>;
+}
+
+impl DynTyExt for DynTy {
+    fn principal(&self) -> Option<Binders<Binders<&TraitRef>>> {
+        self.bounds.as_ref().filter_map(|bounds| {
+            bounds.interned().first().and_then(|b| {
+                b.as_ref().filter_map(|b| match b {
+                    crate::WhereClause::Implemented(trait_ref) => Some(trait_ref),
+                    _ => None,
+                })
+            })
+        })
+    }
+
+    fn principal_id(&self) -> Option<chalk_ir::TraitId<Interner>> {
+        self.bounds.skip_binders().interned().first().and_then(|b| match b.skip_binders() {
+            crate::WhereClause::Implemented(trait_ref) => Some(trait_ref.trait_id),
+            _ => None,
+        })
     }
 }
 

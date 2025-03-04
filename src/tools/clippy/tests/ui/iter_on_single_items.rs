@@ -1,14 +1,19 @@
-// run-rustfix
 #![warn(clippy::iter_on_single_items)]
 #![allow(clippy::iter_next_slice, clippy::redundant_clone)]
 
 fn array() {
     assert_eq!([123].into_iter().next(), Some(123));
+    //~^ iter_on_single_items
     assert_eq!([123].iter_mut().next(), Some(&mut 123));
+    //~^ iter_on_single_items
     assert_eq!([123].iter().next(), Some(&123));
+    //~^ iter_on_single_items
     assert_eq!(Some(123).into_iter().next(), Some(123));
+    //~^ iter_on_single_items
     assert_eq!(Some(123).iter_mut().next(), Some(&mut 123));
+    //~^ iter_on_single_items
     assert_eq!(Some(123).iter().next(), Some(&123));
+    //~^ iter_on_single_items
 
     // Don't trigger on non-iter methods
     let _: Option<String> = Some("test".to_string()).clone();

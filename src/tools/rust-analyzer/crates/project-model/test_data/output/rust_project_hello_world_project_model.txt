@@ -1,0 +1,37 @@
+{
+    0: CrateData {
+        root_file_id: FileId(
+            1,
+        ),
+        edition: Edition2018,
+        version: None,
+        display_name: Some(
+            CrateDisplayName {
+                crate_name: CrateName(
+                    "hello_world",
+                ),
+                canonical_name: "hello_world",
+            },
+        ),
+        cfg_options: CfgOptions(
+            [
+                "rust_analyzer",
+                "test",
+                "true",
+            ],
+        ),
+        potential_cfg_options: None,
+        env: Env {
+            entries: {},
+        },
+        dependencies: [],
+        origin: Local {
+            repo: None,
+            name: Some(
+                "hello_world",
+            ),
+        },
+        is_proc_macro: false,
+        proc_macro_cwd: None,
+    },
+}

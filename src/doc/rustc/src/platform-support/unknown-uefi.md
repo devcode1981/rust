@@ -1,6 +1,6 @@
 # `*-unknown-uefi`
 
-**Tier: 3**
+**Tier: 2**
 
 Unified Extensible Firmware Interface (UEFI) targets for application, driver,
 and core UEFI binaries.
@@ -19,8 +19,8 @@ Available targets:
 ## Requirements
 
 All UEFI targets can be used as `no-std` environments via cross-compilation.
-Support for `std` is missing, but actively worked on. `alloc` is supported if
-an allocator is provided by the user. No host tools are supported.
+Support for `std` is present, but incomplete and extremely new. `alloc` is supported if
+an allocator is provided by the user or if using std. No host tools are supported.
 
 The UEFI environment resembles the environment for Microsoft Windows, with some
 minor differences. Therefore, cross-compiling for UEFI works with the same
@@ -51,7 +51,7 @@ single stack.
 By default, the UEFI targets use the `link`-flavor of the LLVM linker `lld` to
 link binaries into the final PE32+ file suffixed with `*.efi`. The PE subsystem
 is set to `EFI_APPLICATION`, but can be modified by passing `/subsystem:<...>`
-to the linker. Similarly, the entry-point is to to `efi_main` but can be
+to the linker. Similarly, the entry-point is set to `efi_main` but can be
 changed via `/entry:<...>`. The panic-strategy is set to `abort`,
 
 The UEFI specification is available online for free:
@@ -72,28 +72,30 @@ target = ["x86_64-unknown-uefi"]
 
 ## Building Rust programs
 
-Rust does not yet ship pre-compiled artifacts for this target. To compile for
-this target, you will either need to build Rust with the target enabled (see
-"Building rust for UEFI targets" above), or build your own copy of `core` by
-using `build-std`, `cargo-buildx`, or similar.
-
-A native build with the unstable `build-std`-feature can be achieved via:
+Starting with Rust 1.67, precompiled artifacts are provided via
+`rustup`. For example, to use `x86_64-unknown-uefi`:
 
 ```sh
-cargo +nightly build \
-    -Zbuild-std=core,compiler_builtins \
-    -Zbuild-std-features=compiler-builtins-mem \
-    --target x86_64-unknown-uefi
+# install cross-compile toolchain
+rustup target add x86_64-unknown-uefi
+# target flag may be used with any cargo or rustc command
+cargo build --target x86_64-unknown-uefi
 ```
 
-Alternatively, you can install `cargo-xbuild` via
-`cargo install --force cargo-xbuild` and build for the UEFI targets via:
+### Building a driver
 
-```sh
-cargo \
-    +nightly \
-    xbuild \
-    --target x86_64-unknown-uefi
+There are three types of UEFI executables: application, boot service
+driver, and runtime driver. All of Rust's UEFI targets default to
+producing applications. To build a driver instead, pass a
+[`subsystem`][linker-subsystem] linker flag with a value of
+`efi_boot_service_driver` or `efi_runtime_driver`.
+
+Example:
+
+```toml
+# In .cargo/config.toml:
+[build]
+rustflags = ["-C", "link-args=/subsystem:efi_runtime_driver"]
 ```
 
 ## Testing
@@ -102,7 +104,7 @@ UEFI applications can be copied into the ESP on any UEFI system and executed
 via the firmware boot menu. The qemu suite allows emulating UEFI systems and
 executing UEFI applications as well. See its documentation for details.
 
-The [uefi-run](https://github.com/Richard-W/uefi-run) rust tool is a simple
+The [uefi-run] rust tool is a simple
 wrapper around `qemu` that can spawn UEFI applications in qemu. You can install
 it via `cargo install uefi-run` and execute qemu applications as
 `uefi-run ./application.efi`.
@@ -137,7 +139,7 @@ There are 3 common ways to compile native C code for UEFI targets:
   targets. Be wary of any includes that are not specifically suitable for UEFI
   targets (especially the C standard library includes are not always
   compatible). Freestanding compilations are recommended to avoid
-  incompatibilites.
+  incompatibilities.
 
 ## Ecosystem
 
@@ -146,19 +148,19 @@ have been developed to provide access to UEFI protocols and make UEFI
 programming more ergonomic in rust. The following list is a short overview (in
 alphabetical ordering):
 
-- **efi**: *Ergonomic Rust bindings for writing UEFI applications*. Provides
+- **[efi][efi-crate]**: *Ergonomic Rust bindings for writing UEFI applications*. Provides
   _rustified_ access to UEFI protocols, implements allocators and a safe
   environment to write UEFI applications.
-- **r-efi**: *UEFI Reference Specification Protocol Constants and Definitions*.
+- **[r-efi]**: *UEFI Reference Specification Protocol Constants and Definitions*.
   A pure transpose of the UEFI specification into rust. This provides the raw
   definitions from the specification, without any extended helpers or
   _rustification_. It serves as baseline to implement any more elaborate rust
   UEFI layers.
-- **uefi-rs**: *Safe and easy-to-use wrapper for building UEFI apps*. An
+- **[uefi-rs]**: *Safe and easy-to-use wrapper for building UEFI apps*. An
   elaborate library providing safe abstractions for UEFI protocols and
   features. It implements allocators and provides an execution environment to
   UEFI applications written in rust.
-- **uefi-run**: *Run UEFI applications*. A small wrapper around _qemu_ to spawn
+- **[uefi-run]**: *Run UEFI applications*. A small wrapper around _qemu_ to spawn
   UEFI applications in an emulated `x86_64` machine.
 
 ## Example: Freestanding
@@ -167,18 +169,10 @@ The following code is a valid UEFI application returning immediately upon
 execution with an exit code of 0. A panic handler is provided. This is executed
 by rust on panic. For simplicity, we simply end up in an infinite loop.
 
-Note that as of rust-1.31.0, all features used here are stabilized. No unstable
-features are required, nor do we rely on nightly compilers. However, if you do
-not compile rustc for the UEFI targets, you need a nightly compiler to support
-the `-Z build-std` flag.
-
 This example can be compiled as binary crate via `cargo`:
 
 ```sh
-cargo +nightly build \
-    -Zbuild-std=core,compiler_builtins \
-    -Zbuild-std-features=compiler-builtins-mem \
-    --target x86_64-unknown-uefi
+cargo build --target x86_64-unknown-uefi
 ```
 
 ```rust,ignore (platform-specific,eh-personality-is-unstable)
@@ -252,3 +246,90 @@ pub extern "C" fn main(_h: efi::Handle, st: *mut efi::SystemTable) -> efi::Statu
     efi::Status::SUCCESS
 }
 ```
+
+## Rust std for UEFI
+This section contains information on how to use std on UEFI.
+
+### Build std
+The building std part is pretty much the same as the official [docs](https://rustc-dev-guide.rust-lang.org/getting-started.html).
+The linker that should be used is `rust-lld`. Here is a sample `config.toml`:
+```toml
+[rust]
+lld = true
+```
+Then just build using `x.py`:
+```sh
+./x.py build --target x86_64-unknown-uefi --stage 1
+```
+Alternatively, it is possible to use the `build-std` feature. However, you must use a toolchain which has the UEFI std patches.
+Then just build the project using the following command:
+```sh
+cargo build --target x86_64-unknown-uefi -Zbuild-std=std,panic_abort
+```
+
+### Implemented features
+#### alloc
+- Implemented using `EFI_BOOT_SERVICES.AllocatePool()` and `EFI_BOOT_SERVICES.FreePool()`.
+- Passes all the tests.
+- Currently uses `EfiLoaderData` as the `EFI_ALLOCATE_POOL->PoolType`.
+#### cmath
+- Provided by compiler-builtins.
+#### env
+- Just some global constants.
+#### locks
+- The provided locks should work on all standard single-threaded UEFI implementations.
+#### os_str
+- While the strings in UEFI should be valid UCS-2, in practice, many implementations just do not care and use UTF-16 strings.
+- Thus, the current implementation supports full UTF-16 strings.
+#### stdio
+- Uses `Simple Text Input Protocol` and `Simple Text Output Protocol`.
+- Note: UEFI uses CRLF for new line. This means Enter key is registered as CR instead of LF.
+#### args
+- Uses `EFI_LOADED_IMAGE_PROTOCOL->LoadOptions`
+
+## Example: Hello World With std
+The following code features a valid UEFI application, including `stdio` and `alloc` (`OsString` and `Vec`):
+
+This example can be compiled as binary crate via `cargo` using the toolchain
+compiled from the above source (named custom):
+
+```sh
+cargo +custom build --target x86_64-unknown-uefi
+```
+
+```rust,ignore (platform-specific)
+#![feature(uefi_std)]
+
+use r_efi::{efi, protocols::simple_text_output};
+use std::{
+  ffi::OsString,
+  os::uefi::{env, ffi::OsStrExt}
+};
+
+pub fn main() {
+  println!("Starting Rust Application...");
+
+  // Use System Table Directly
+  let st = env::system_table().as_ptr() as *mut efi::SystemTable;
+  let mut s: Vec<u16> = OsString::from("Hello World!\n").encode_wide().collect();
+  s.push(0);
+  let r =
+      unsafe {
+        let con_out: *mut simple_text_output::Protocol = (*st).con_out;
+        let output_string: extern "efiapi" fn(_: *mut simple_text_output::Protocol, *mut u16) -> efi::Status = (*con_out).output_string;
+        output_string(con_out, s.as_ptr() as *mut efi::Char16)
+      };
+  assert!(!r.is_error())
+}
+```
+
+### BootServices
+The current implementation of std makes `BootServices` unavailable once `ExitBootServices` is called. Refer to [Runtime Drivers](https://edk2-docs.gitbook.io/edk-ii-uefi-driver-writer-s-guide/7_driver_entry_point/711_runtime_drivers) for more information regarding how to handle switching from using physical addresses to using virtual addresses.
+
+Note: It should be noted that it is up to the user to drop all allocated memory before `ExitBootServices` is called.
+
+[efi-crate]: https://github.com/gurry/efi
+[linker-subsystem]: https://learn.microsoft.com/en-us/cpp/build/reference/subsystem
+[r-efi]: https://github.com/r-efi/r-efi
+[uefi-rs]: https://github.com/rust-osdev/uefi-rs
+[uefi-run]: https://github.com/Richard-W/uefi-run

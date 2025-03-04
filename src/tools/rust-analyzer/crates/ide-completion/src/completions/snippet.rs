@@ -1,10 +1,9 @@
 //! This file provides snippet completions, like `pd` => `eprintln!(...)`.
 
-use hir::Documentation;
-use ide_db::{imports::insert_use::ImportScope, SnippetCap};
+use ide_db::{documentation::Documentation, imports::insert_use::ImportScope, SnippetCap};
 
 use crate::{
-    context::{ExprCtx, ItemListKind, PathCompletionCtx, Qualified},
+    context::{ItemListKind, PathCompletionCtx, PathExprCtx, Qualified},
     item::Builder,
     CompletionContext, CompletionItem, CompletionItemKind, Completions, SnippetScope,
 };
@@ -13,7 +12,7 @@ pub(crate) fn complete_expr_snippet(
     acc: &mut Completions,
     ctx: &CompletionContext<'_>,
     path_ctx: &PathCompletionCtx,
-    &ExprCtx { in_block_expr, .. }: &ExprCtx,
+    &PathExprCtx { in_block_expr, .. }: &PathExprCtx,
 ) {
     if !matches!(path_ctx.qualified, Qualified::No) {
         return;
@@ -32,8 +31,8 @@ pub(crate) fn complete_expr_snippet(
     }
 
     if in_block_expr {
-        snippet(ctx, cap, "pd", "eprintln!(\"$0 = {:?}\", $0);").add_to(acc);
-        snippet(ctx, cap, "ppd", "eprintln!(\"$0 = {:#?}\", $0);").add_to(acc);
+        snippet(ctx, cap, "pd", "eprintln!(\"$0 = {:?}\", $0);").add_to(acc, ctx.db);
+        snippet(ctx, cap, "ppd", "eprintln!(\"$0 = {:#?}\", $0);").add_to(acc, ctx.db);
         let item = snippet(
             ctx,
             cap,
@@ -45,7 +44,7 @@ macro_rules! $1 {
     };
 }",
         );
-        item.add_to(acc);
+        item.add_to(acc, ctx.db);
     }
 }
 
@@ -88,7 +87,7 @@ mod tests {
 }",
         );
         item.lookup_by("tmod");
-        item.add_to(acc);
+        item.add_to(acc, ctx.db);
 
         let mut item = snippet(
             ctx,
@@ -101,7 +100,7 @@ fn ${1:feature}() {
 }",
         );
         item.lookup_by("tfn");
-        item.add_to(acc);
+        item.add_to(acc, ctx.db);
 
         let item = snippet(
             ctx,
@@ -114,12 +113,13 @@ macro_rules! $1 {
     };
 }",
         );
-        item.add_to(acc);
+        item.add_to(acc, ctx.db);
     }
 }
 
 fn snippet(ctx: &CompletionContext<'_>, cap: SnippetCap, label: &str, snippet: &str) -> Builder {
-    let mut item = CompletionItem::new(CompletionItemKind::Snippet, ctx.source_range(), label);
+    let mut item =
+        CompletionItem::new(CompletionItemKind::Snippet, ctx.source_range(), label, ctx.edition);
     item.insert_snippet(cap, snippet);
     item
 }
@@ -130,9 +130,7 @@ fn add_custom_completions(
     cap: SnippetCap,
     scope: SnippetScope,
 ) -> Option<()> {
-    if ImportScope::find_insert_use_container(&ctx.token.parent()?, &ctx.sema).is_none() {
-        return None;
-    }
+    ImportScope::find_insert_use_container(&ctx.token.parent()?, &ctx.sema)?;
     ctx.config.prefix_snippets().filter(|(_, snip)| snip.scope == scope).for_each(
         |(trigger, snip)| {
             let imports = match snip.imports(ctx) {
@@ -141,12 +139,12 @@ fn add_custom_completions(
             };
             let body = snip.snippet();
             let mut builder = snippet(ctx, cap, trigger, &body);
-            builder.documentation(Documentation::new(format!("```rust\n{}\n```", body)));
+            builder.documentation(Documentation::new(format!("```rust\n{body}\n```")));
             for import in imports.into_iter() {
                 builder.add_import(import);
             }
             builder.set_detail(snip.description.clone());
-            builder.add_to(acc);
+            builder.add_to(acc, ctx.db);
         },
     );
     None

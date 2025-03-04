@@ -4,8 +4,8 @@ use syn::parse::{Parse, ParseStream, Result};
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::{
-    braced, parenthesized, parse_macro_input, parse_quote, token, AttrStyle, Attribute, Block,
-    Error, Expr, Ident, Pat, ReturnType, Token, Type,
+    AttrStyle, Attribute, Block, Error, Expr, Ident, Pat, ReturnType, Token, Type, braced,
+    parenthesized, parse_macro_input, parse_quote, token,
 };
 
 mod kw {
@@ -15,7 +15,7 @@ mod kw {
 /// Ensures only doc comment attributes are used
 fn check_attributes(attrs: Vec<Attribute>) -> Result<Vec<Attribute>> {
     let inner = |attr: Attribute| {
-        if !attr.path.is_ident("doc") {
+        if !attr.path().is_ident("doc") {
             Err(Error::new(attr.span(), "attributes not supported on queries"))
         } else if attr.style != AttrStyle::Outer {
             Err(Error::new(
@@ -48,7 +48,7 @@ impl Parse for Query {
         let name: Ident = input.parse()?;
         let arg_content;
         parenthesized!(arg_content in input);
-        let key = arg_content.parse()?;
+        let key = Pat::parse_single(&arg_content)?;
         arg_content.parse::<Token![:]>()?;
         let arg = arg_content.parse()?;
         let result = input.parse()?;
@@ -97,6 +97,9 @@ struct QueryModifiers {
     /// A cycle error results in a delay_bug call
     cycle_delay_bug: Option<Ident>,
 
+    /// A cycle error results in a stashed cycle error that can be unstashed and canceled later
+    cycle_stash: Option<Ident>,
+
     /// Don't hash the result, instead just mark a query red if it runs
     no_hash: Option<Ident>,
 
@@ -112,8 +115,20 @@ struct QueryModifiers {
     /// Use a separate query provider for local and extern crates
     separate_provide_extern: Option<Ident>,
 
-    /// Always remap the ParamEnv's constness before hashing.
-    remap_env_constness: Option<Ident>,
+    /// Generate a `feed` method to set the query's value from another query.
+    feedable: Option<Ident>,
+
+    /// When this query is called via `tcx.ensure_ok()`, it returns
+    /// `Result<(), ErrorGuaranteed>` instead of `()`. If the query needs to
+    /// be executed, and that execution returns an error, the error result is
+    /// returned to the caller.
+    ///
+    /// If execution is skipped, a synthetic `Ok(())` is returned, on the
+    /// assumption that a query with all-green inputs must have succeeded.
+    ///
+    /// Can only be applied to queries with a return value of
+    /// `Result<_, ErrorGuaranteed>`.
+    return_result_from_ensure_ok: Option<Ident>,
 }
 
 fn parse_query_modifiers(input: ParseStream<'_>) -> Result<QueryModifiers> {
@@ -122,12 +137,14 @@ fn parse_query_modifiers(input: ParseStream<'_>) -> Result<QueryModifiers> {
     let mut desc = None;
     let mut fatal_cycle = None;
     let mut cycle_delay_bug = None;
+    let mut cycle_stash = None;
     let mut no_hash = None;
     let mut anon = None;
     let mut eval_always = None;
     let mut depth_limit = None;
     let mut separate_provide_extern = None;
-    let mut remap_env_constness = None;
+    let mut feedable = None;
+    let mut return_result_from_ensure_ok = None;
 
     while !input.is_empty() {
         let modifier: Ident = input.parse()?;
@@ -154,7 +171,7 @@ fn parse_query_modifiers(input: ParseStream<'_>) -> Result<QueryModifiers> {
             } else {
                 None
             };
-            let list = attr_content.parse_terminated(Expr::parse)?;
+            let list = attr_content.parse_terminated(Expr::parse, Token![,])?;
             try_insert!(desc = (tcx, list));
         } else if modifier == "cache_on_disk_if" {
             // Parse a cache modifier like:
@@ -162,7 +179,7 @@ fn parse_query_modifiers(input: ParseStream<'_>) -> Result<QueryModifiers> {
             let args = if input.peek(token::Paren) {
                 let args;
                 parenthesized!(args in input);
-                let tcx = args.parse()?;
+                let tcx = Pat::parse_single(&args)?;
                 Some(tcx)
             } else {
                 None
@@ -175,6 +192,8 @@ fn parse_query_modifiers(input: ParseStream<'_>) -> Result<QueryModifiers> {
             try_insert!(fatal_cycle = modifier);
         } else if modifier == "cycle_delay_bug" {
             try_insert!(cycle_delay_bug = modifier);
+        } else if modifier == "cycle_stash" {
+            try_insert!(cycle_stash = modifier);
         } else if modifier == "no_hash" {
             try_insert!(no_hash = modifier);
         } else if modifier == "anon" {
@@ -185,8 +204,10 @@ fn parse_query_modifiers(input: ParseStream<'_>) -> Result<QueryModifiers> {
             try_insert!(depth_limit = modifier);
         } else if modifier == "separate_provide_extern" {
             try_insert!(separate_provide_extern = modifier);
-        } else if modifier == "remap_env_constness" {
-            try_insert!(remap_env_constness = modifier);
+        } else if modifier == "feedable" {
+            try_insert!(feedable = modifier);
+        } else if modifier == "return_result_from_ensure_ok" {
+            try_insert!(return_result_from_ensure_ok = modifier);
         } else {
             return Err(Error::new(modifier.span(), "unknown query modifier"));
         }
@@ -200,12 +221,14 @@ fn parse_query_modifiers(input: ParseStream<'_>) -> Result<QueryModifiers> {
         desc,
         fatal_cycle,
         cycle_delay_bug,
+        cycle_stash,
         no_hash,
         anon,
         eval_always,
         depth_limit,
         separate_provide_extern,
-        remap_env_constness,
+        feedable,
+        return_result_from_ensure_ok,
     })
 }
 
@@ -232,7 +255,7 @@ fn doc_comment_from_desc(list: &Punctuated<Expr, token::Comma>) -> Result<Attrib
             .unwrap();
         },
     );
-    let doc_string = format!("[query description - consider adding a doc-comment!] {}", doc_string);
+    let doc_string = format!("[query description - consider adding a doc-comment!] {doc_string}");
     Ok(parse_quote! { #[doc = #doc_string] })
 }
 
@@ -253,7 +276,7 @@ fn add_query_desc_cached_impl(
         quote! {
             #[allow(unused_variables, unused_braces, rustc::pass_by_value)]
             #[inline]
-            pub fn #name<'tcx>(#tcx: TyCtxt<'tcx>, #key: &crate::ty::query::query_keys::#name<'tcx>) -> bool {
+            pub fn #name<'tcx>(#tcx: TyCtxt<'tcx>, #key: &crate::query::queries::#name::Key<'tcx>) -> bool {
                 #expr
             }
         }
@@ -262,7 +285,7 @@ fn add_query_desc_cached_impl(
             // we're taking `key` by reference, but some rustc types usually prefer being passed by value
             #[allow(rustc::pass_by_value)]
             #[inline]
-            pub fn #name<'tcx>(_: TyCtxt<'tcx>, _: &crate::ty::query::query_keys::#name<'tcx>) -> bool {
+            pub fn #name<'tcx>(_: TyCtxt<'tcx>, _: &crate::query::queries::#name::Key<'tcx>) -> bool {
                 false
             }
         }
@@ -273,7 +296,7 @@ fn add_query_desc_cached_impl(
 
     let desc = quote! {
         #[allow(unused_variables)]
-        pub fn #name<'tcx>(tcx: TyCtxt<'tcx>, key: crate::ty::query::query_keys::#name<'tcx>) -> String {
+        pub fn #name<'tcx>(tcx: TyCtxt<'tcx>, key: crate::query::queries::#name::Key<'tcx>) -> String {
             let (#tcx, #key) = (tcx, key);
             ::rustc_middle::ty::print::with_no_trimmed_paths!(
                 format!(#desc)
@@ -290,12 +313,24 @@ fn add_query_desc_cached_impl(
     });
 }
 
-pub fn rustc_queries(input: TokenStream) -> TokenStream {
+pub(super) fn rustc_queries(input: TokenStream) -> TokenStream {
     let queries = parse_macro_input!(input as List<Query>);
 
     let mut query_stream = quote! {};
     let mut query_description_stream = quote! {};
     let mut query_cached_stream = quote! {};
+    let mut feedable_queries = quote! {};
+    let mut errors = quote! {};
+
+    macro_rules! assert {
+        ( $cond:expr, $span:expr, $( $tt:tt )+ ) => {
+            if !$cond {
+                errors.extend(
+                    Error::new($span, format!($($tt)+)).into_compile_error(),
+                );
+            }
+        }
+    }
 
     for query in queries.0 {
         let Query { name, arg, modifiers, .. } = &query;
@@ -319,12 +354,13 @@ pub fn rustc_queries(input: TokenStream) -> TokenStream {
             fatal_cycle,
             arena_cache,
             cycle_delay_bug,
+            cycle_stash,
             no_hash,
             anon,
             eval_always,
             depth_limit,
             separate_provide_extern,
-            remap_env_constness,
+            return_result_from_ensure_ok,
         );
 
         if modifiers.cache.is_some() {
@@ -350,6 +386,23 @@ pub fn rustc_queries(input: TokenStream) -> TokenStream {
             [#attribute_stream] fn #name(#arg) #result,
         });
 
+        if let Some(feedable) = &modifiers.feedable {
+            assert!(
+                modifiers.anon.is_none(),
+                feedable.span(),
+                "Query {name} cannot be both `feedable` and `anon`."
+            );
+            assert!(
+                modifiers.eval_always.is_none(),
+                feedable.span(),
+                "Query {name} cannot be both `feedable` and `eval_always`."
+            );
+            feedable_queries.extend(quote! {
+                #(#doc_comments)*
+                [#attribute_stream] fn #name(#arg) #result,
+            });
+        }
+
         add_query_desc_cached_impl(&query, &mut query_description_stream, &mut query_cached_stream);
     }
 
@@ -363,7 +416,11 @@ pub fn rustc_queries(input: TokenStream) -> TokenStream {
                 }
             }
         }
-
+        macro_rules! rustc_feedable_queries {
+            ( $macro:ident! ) => {
+                $macro!(#feedable_queries);
+            }
+        }
         pub mod descs {
             use super::*;
             #query_description_stream
@@ -372,5 +429,6 @@ pub fn rustc_queries(input: TokenStream) -> TokenStream {
             use super::*;
             #query_cached_stream
         }
+        #errors
     })
 }

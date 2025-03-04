@@ -1,22 +1,33 @@
 [package]
 name = "base-db"
 version = "0.0.0"
-description = "TBD"
-license = "MIT OR Apache-2.0"
-edition = "2021"
-rust-version = "1.57"
+repository.workspace = true
+description = "Basic database traits for rust-analyzer. The concrete DB is defined by `ide` (aka `ra_ap_ide`)."
+
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
 
 [lib]
-doctest = false
 
 [dependencies]
-salsa = "0.17.0-pre.2"
-rustc-hash = "1.1.0"
+lz4_flex = { version = "0.11", default-features = false }
 
-syntax = { path = "../syntax", version = "0.0.0" }
-stdx = { path = "../stdx", version = "0.0.0" }
-cfg = { path = "../cfg", version = "0.0.0" }
-profile = { path = "../profile", version = "0.0.0" }
-tt = { path = "../tt", version = "0.0.0" }
-test-utils = { path = "../test-utils", version = "0.0.0" }
-vfs = { path = "../vfs", version = "0.0.0" }
+la-arena.workspace = true
+ra-salsa.workspace = true
+rustc-hash.workspace = true
+triomphe.workspace = true
+semver.workspace = true
+tracing.workspace = true
+
+# local deps
+cfg.workspace = true
+stdx.workspace = true
+syntax.workspace = true
+vfs.workspace = true
+span.workspace = true
+intern.workspace = true
+
+[lints]
+workspace = true

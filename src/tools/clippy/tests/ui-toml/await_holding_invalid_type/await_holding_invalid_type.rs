@@ -3,12 +3,16 @@ use std::net::Ipv4Addr;
 
 async fn bad() -> u32 {
     let _x = String::from("hello");
+    //~^ await_holding_invalid_type
     baz().await
 }
 
 async fn bad_reason() -> u32 {
-    let _x = Ipv4Addr::new(127, 0, 0, 1);
-    baz().await
+    let x = Ipv4Addr::new(127, 0, 0, 1);
+    //~^ await_holding_invalid_type
+    let y = baz().await;
+    let _x = x;
+    y
 }
 
 async fn good() -> u32 {
@@ -29,6 +33,7 @@ async fn baz() -> u32 {
 fn block_bad() -> impl std::future::Future<Output = u32> {
     async move {
         let _x = String::from("hi!");
+        //~^ await_holding_invalid_type
         baz().await
     }
 }

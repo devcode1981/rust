@@ -1,7 +1,20 @@
-#![allow(unused_variables)]
-
+#![allow(unused_variables, dead_code)]
+//@no-rustfix
 fn takes_an_immutable_reference(a: &i32) {}
 fn takes_a_mutable_reference(a: &mut i32) {}
+
+mod issue11268 {
+    macro_rules! x {
+        ($f:expr) => {
+            $f(&mut 1);
+        };
+    }
+
+    fn f() {
+        x!(super::takes_an_immutable_reference);
+        x!(super::takes_a_mutable_reference);
+    }
+}
 
 struct MyStruct;
 
@@ -15,12 +28,16 @@ impl MyStruct {
 fn main() {
     // Functions
     takes_an_immutable_reference(&mut 42);
+    //~^ unnecessary_mut_passed
+
     let as_ptr: fn(&i32) = takes_an_immutable_reference;
     as_ptr(&mut 42);
+    //~^ unnecessary_mut_passed
 
     // Methods
     let my_struct = MyStruct;
     my_struct.takes_an_immutable_reference(&mut 42);
+    //~^ unnecessary_mut_passed
 
     // No error
 

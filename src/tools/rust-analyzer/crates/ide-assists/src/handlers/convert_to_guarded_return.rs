@@ -1,6 +1,9 @@
 use std::iter::once;
 
-use ide_db::syntax_helpers::node_ext::{is_pattern_cond, single_let};
+use ide_db::{
+    syntax_helpers::node_ext::{is_pattern_cond, single_let},
+    ty_filter::TryEnum,
+};
 use syntax::{
     ast::{
         self,
@@ -8,13 +11,13 @@ use syntax::{
         make,
     },
     ted, AstNode,
-    SyntaxKind::{FN, LOOP_EXPR, WHILE_EXPR, WHITESPACE},
+    SyntaxKind::{FN, FOR_EXPR, LOOP_EXPR, WHILE_EXPR, WHITESPACE},
     T,
 };
 
 use crate::{
     assist_context::{AssistContext, Assists},
-    utils::invert_boolean_expression,
+    utils::invert_boolean_expression_legacy,
     AssistId, AssistKind,
 };
 
@@ -41,32 +44,39 @@ use crate::{
 // }
 // ```
 pub(crate) fn convert_to_guarded_return(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
-    let if_expr: ast::IfExpr = ctx.find_node_at_offset()?;
+    if let Some(let_stmt) = ctx.find_node_at_offset() {
+        let_stmt_to_guarded_return(let_stmt, acc, ctx)
+    } else if let Some(if_expr) = ctx.find_node_at_offset() {
+        if_expr_to_guarded_return(if_expr, acc, ctx)
+    } else {
+        None
+    }
+}
+
+fn if_expr_to_guarded_return(
+    if_expr: ast::IfExpr,
+    acc: &mut Assists,
+    ctx: &AssistContext<'_>,
+) -> Option<()> {
     if if_expr.else_branch().is_some() {
         return None;
     }
 
     let cond = if_expr.condition()?;
 
+    let if_token_range = if_expr.if_token()?.text_range();
+    let if_cond_range = cond.syntax().text_range();
+
+    let cursor_in_range =
+        if_token_range.cover(if_cond_range).contains_range(ctx.selection_trimmed());
+    if !cursor_in_range {
+        return None;
+    }
+
     // Check if there is an IfLet that we can handle.
     let (if_let_pat, cond_expr) = if is_pattern_cond(cond.clone()) {
         let let_ = single_let(cond)?;
-        match let_.pat() {
-            Some(ast::Pat::TupleStructPat(pat)) if pat.fields().count() == 1 => {
-                let path = pat.path()?;
-                if path.qualifier().is_some() {
-                    return None;
-                }
-
-                let bound_ident = pat.fields().next().unwrap();
-                if !ast::IdentPat::can_cast(bound_ident.syntax().kind()) {
-                    return None;
-                }
-
-                (Some((path, bound_ident)), let_.expr()?)
-            }
-            _ => return None, // Unsupported IfLet.
-        }
+        (Some(let_.pat()?), let_.expr()?)
     } else {
         (None, cond)
     };
@@ -97,16 +107,23 @@ pub(crate) fn convert_to_guarded_return(acc: &mut Assists, ctx: &AssistContext<'
     let parent_container = parent_block.syntax().parent()?;
 
     let early_expression: ast::Expr = match parent_container.kind() {
-        WHILE_EXPR | LOOP_EXPR => make::expr_continue(None),
+        WHILE_EXPR | LOOP_EXPR | FOR_EXPR => make::expr_continue(None),
         FN => make::expr_return(None),
         _ => return None,
     };
 
-    if then_block.syntax().first_child_or_token().map(|t| t.kind() == T!['{']).is_none() {
-        return None;
-    }
+    then_block.syntax().first_child_or_token().map(|t| t.kind() == T!['{'])?;
 
     then_block.syntax().last_child_or_token().filter(|t| t.kind() == T!['}'])?;
+
+    let then_block_items = then_block.dedent(IndentLevel(1)).clone_for_update();
+
+    let end_of_then = then_block_items.syntax().last_child_or_token()?;
+    let end_of_then = if end_of_then.prev_sibling_or_token().map(|n| n.kind()) == Some(WHITESPACE) {
+        end_of_then.prev_sibling_or_token()?
+    } else {
+        end_of_then
+    };
 
     let target = if_expr.syntax().text_range();
     acc.add(
@@ -122,51 +139,23 @@ pub(crate) fn convert_to_guarded_return(acc: &mut Assists, ctx: &AssistContext<'
                     let new_expr = {
                         let then_branch =
                             make::block_expr(once(make::expr_stmt(early_expression).into()), None);
-                        let cond = invert_boolean_expression(cond_expr);
+                        let cond = invert_boolean_expression_legacy(cond_expr);
                         make::expr_if(cond, then_branch, None).indent(if_indent_level)
                     };
                     new_expr.syntax().clone_for_update()
                 }
-                Some((path, bound_ident)) => {
+                Some(pat) => {
                     // If-let.
-                    let match_expr = {
-                        let happy_arm = {
-                            let pat = make::tuple_struct_pat(
-                                path,
-                                once(make::ext::simple_ident_pat(make::name("it")).into()),
-                            );
-                            let expr = {
-                                let path = make::ext::ident_path("it");
-                                make::expr_path(path)
-                            };
-                            make::match_arm(once(pat.into()), None, expr)
-                        };
-
-                        let sad_arm = make::match_arm(
-                            // FIXME: would be cool to use `None` or `Err(_)` if appropriate
-                            once(make::wildcard_pat().into()),
-                            None,
-                            early_expression,
-                        );
-
-                        make::expr_match(cond_expr, make::match_arm_list(vec![happy_arm, sad_arm]))
-                    };
-
-                    let let_stmt = make::let_stmt(bound_ident, None, Some(match_expr));
-                    let let_stmt = let_stmt.indent(if_indent_level);
-                    let_stmt.syntax().clone_for_update()
+                    let let_else_stmt = make::let_else_stmt(
+                        pat,
+                        None,
+                        cond_expr,
+                        ast::make::tail_only_block_expr(early_expression),
+                    );
+                    let let_else_stmt = let_else_stmt.indent(if_indent_level);
+                    let_else_stmt.syntax().clone_for_update()
                 }
             };
-
-            let then_block_items = then_block.dedent(IndentLevel(1)).clone_for_update();
-
-            let end_of_then = then_block_items.syntax().last_child_or_token().unwrap();
-            let end_of_then =
-                if end_of_then.prev_sibling_or_token().map(|n| n.kind()) == Some(WHITESPACE) {
-                    end_of_then.prev_sibling_or_token().unwrap()
-                } else {
-                    end_of_then
-                };
 
             let then_statements = replacement
                 .children_with_tokens()
@@ -180,6 +169,65 @@ pub(crate) fn convert_to_guarded_return(acc: &mut Assists, ctx: &AssistContext<'
                 .collect();
 
             ted::replace_with_many(if_expr.syntax(), then_statements)
+        },
+    )
+}
+
+fn let_stmt_to_guarded_return(
+    let_stmt: ast::LetStmt,
+    acc: &mut Assists,
+    ctx: &AssistContext<'_>,
+) -> Option<()> {
+    let pat = let_stmt.pat()?;
+    let expr = let_stmt.initializer()?;
+
+    let let_token_range = let_stmt.let_token()?.text_range();
+    let let_pattern_range = pat.syntax().text_range();
+    let cursor_in_range =
+        let_token_range.cover(let_pattern_range).contains_range(ctx.selection_trimmed());
+
+    if !cursor_in_range {
+        return None;
+    }
+
+    let try_enum =
+        ctx.sema.type_of_expr(&expr).and_then(|ty| TryEnum::from_ty(&ctx.sema, &ty.adjusted()))?;
+
+    let happy_pattern = try_enum.happy_pattern(pat);
+    let target = let_stmt.syntax().text_range();
+
+    let early_expression: ast::Expr = {
+        let parent_block =
+            let_stmt.syntax().parent()?.ancestors().find_map(ast::BlockExpr::cast)?;
+        let parent_container = parent_block.syntax().parent()?;
+
+        match parent_container.kind() {
+            WHILE_EXPR | LOOP_EXPR | FOR_EXPR => make::expr_continue(None),
+            FN => make::expr_return(None),
+            _ => return None,
+        }
+    };
+
+    acc.add(
+        AssistId("convert_to_guarded_return", AssistKind::RefactorRewrite),
+        "Convert to guarded return",
+        target,
+        |edit| {
+            let let_stmt = edit.make_mut(let_stmt);
+            let let_indent_level = IndentLevel::from_node(let_stmt.syntax());
+
+            let replacement = {
+                let let_else_stmt = make::let_else_stmt(
+                    happy_pattern,
+                    let_stmt.ty(),
+                    expr,
+                    ast::make::tail_only_block_expr(early_expression),
+                );
+                let let_else_stmt = let_else_stmt.indent(let_indent_level);
+                let_else_stmt.syntax().clone_for_update()
+            };
+
+            ted::replace(let_stmt.syntax(), replacement)
         },
     )
 }
@@ -238,10 +286,7 @@ fn main(n: Option<String>) {
             r#"
 fn main(n: Option<String>) {
     bar();
-    let n = match n {
-        Some(it) => it,
-        _ => return,
-    };
+    let Some(n) = n else { return };
     foo(n);
 
     // comment
@@ -264,10 +309,7 @@ fn main() {
 "#,
             r#"
 fn main() {
-    let x = match Err(92) {
-        Ok(it) => it,
-        _ => return,
-    };
+    let Ok(x) = Err(92) else { return };
     foo(x);
 }
 "#,
@@ -292,10 +334,7 @@ fn main(n: Option<String>) {
             r#"
 fn main(n: Option<String>) {
     bar();
-    let n = match n {
-        Some(it) => it,
-        _ => return,
-    };
+    let Some(n) = n else { return };
     foo(n);
 
     // comment
@@ -323,10 +362,7 @@ fn main(n: Option<String>) {
             r#"
 fn main(n: Option<String>) {
     bar();
-    let mut n = match n {
-        Some(it) => it,
-        _ => return,
-    };
+    let Some(mut n) = n else { return };
     foo(n);
 
     // comment
@@ -354,10 +390,7 @@ fn main(n: Option<&str>) {
             r#"
 fn main(n: Option<&str>) {
     bar();
-    let ref n = match n {
-        Some(it) => it,
-        _ => return,
-    };
+    let Some(ref n) = n else { return };
     foo(n);
 
     // comment
@@ -412,10 +445,7 @@ fn main() {
             r#"
 fn main() {
     while true {
-        let n = match n {
-            Some(it) => it,
-            _ => continue,
-        };
+        let Some(n) = n else { continue };
         foo(n);
         bar();
     }
@@ -469,13 +499,146 @@ fn main() {
             r#"
 fn main() {
     loop {
-        let n = match n {
-            Some(it) => it,
-            _ => continue,
-        };
+        let Some(n) = n else { continue };
         foo(n);
         bar();
     }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn convert_let_inside_for() {
+        check_assist(
+            convert_to_guarded_return,
+            r#"
+fn main() {
+    for n in ns {
+        if$0 let Some(n) = n {
+            foo(n);
+            bar();
+        }
+    }
+}
+"#,
+            r#"
+fn main() {
+    for n in ns {
+        let Some(n) = n else { continue };
+        foo(n);
+        bar();
+    }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn convert_let_stmt_inside_fn() {
+        check_assist(
+            convert_to_guarded_return,
+            r#"
+//- minicore: option
+fn foo() -> Option<i32> {
+    None
+}
+
+fn main() {
+    let x$0 = foo();
+}
+"#,
+            r#"
+fn foo() -> Option<i32> {
+    None
+}
+
+fn main() {
+    let Some(x) = foo() else { return };
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn convert_let_stmt_inside_loop() {
+        check_assist(
+            convert_to_guarded_return,
+            r#"
+//- minicore: option
+fn foo() -> Option<i32> {
+    None
+}
+
+fn main() {
+    loop {
+        let x$0 = foo();
+    }
+}
+"#,
+            r#"
+fn foo() -> Option<i32> {
+    None
+}
+
+fn main() {
+    loop {
+        let Some(x) = foo() else { continue };
+    }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn convert_arbitrary_if_let_patterns() {
+        check_assist(
+            convert_to_guarded_return,
+            r#"
+fn main() {
+    $0if let None = Some(92) {
+        foo();
+    }
+}
+"#,
+            r#"
+fn main() {
+    let None = Some(92) else { return };
+    foo();
+}
+"#,
+        );
+
+        check_assist(
+            convert_to_guarded_return,
+            r#"
+fn main() {
+    $0if let [1, x] = [1, 92] {
+        foo(x);
+    }
+}
+"#,
+            r#"
+fn main() {
+    let [1, x] = [1, 92] else { return };
+    foo(x);
+}
+"#,
+        );
+
+        check_assist(
+            convert_to_guarded_return,
+            r#"
+fn main() {
+    $0if let (Some(x), None) = (Some(92), None) {
+        foo(x);
+    }
+}
+"#,
+            r#"
+fn main() {
+    let (Some(x), None) = (Some(92), None) else { return };
+    foo(x);
 }
 "#,
         );
@@ -542,7 +705,7 @@ fn main() {
     }
 
     #[test]
-    fn ignore_statements_aftert_if() {
+    fn ignore_statements_after_if() {
         check_assist_not_applicable(
             convert_to_guarded_return,
             r#"
@@ -567,6 +730,37 @@ fn main() {
             foo();
         }
     }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn ignore_inside_if_stmt() {
+        check_assist_not_applicable(
+            convert_to_guarded_return,
+            r#"
+fn main() {
+    if false {
+        foo()$0;
+    }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn ignore_inside_let_initializer() {
+        check_assist_not_applicable(
+            convert_to_guarded_return,
+            r#"
+//- minicore: option
+fn foo() -> Option<i32> {
+    None
+}
+
+fn main() {
+    let x = foo()$0;
 }
 "#,
         );

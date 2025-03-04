@@ -1,15 +1,38 @@
-use crate::{Diagnostic, DiagnosticsContext};
+use crate::{Diagnostic, DiagnosticCode, DiagnosticsContext, Severity};
 
 // Diagnostic: macro-error
 //
 // This diagnostic is shown for macro expansion errors.
+
+// Diagnostic: attribute-expansion-disabled
+//
+// This diagnostic is shown for attribute proc macros when attribute expansions have been disabled.
+
+// Diagnostic: proc-macro-disabled
+//
+// This diagnostic is shown for proc macros that have been specifically disabled via `rust-analyzer.procMacro.ignored`.
 pub(crate) fn macro_error(ctx: &DiagnosticsContext<'_>, d: &hir::MacroError) -> Diagnostic {
     // Use more accurate position if available.
-    let display_range = d
-        .precise_location
-        .unwrap_or_else(|| ctx.sema.diagnostics_display_range(d.node.clone()).range);
+    let display_range = ctx.resolve_precise_location(&d.node, d.precise_location);
+    Diagnostic::new(
+        DiagnosticCode::Ra(d.kind, if d.error { Severity::Error } else { Severity::WeakWarning }),
+        d.message.clone(),
+        display_range,
+    )
+}
 
-    Diagnostic::new("macro-error", d.message.clone(), display_range).experimental()
+// Diagnostic: macro-def-error
+//
+// This diagnostic is shown for macro expansion errors.
+pub(crate) fn macro_def_error(ctx: &DiagnosticsContext<'_>, d: &hir::MacroDefError) -> Diagnostic {
+    // Use more accurate position if available.
+    let display_range =
+        ctx.resolve_precise_location(&d.node.map(|it| it.syntax_node_ptr()), d.name);
+    Diagnostic::new(
+        DiagnosticCode::Ra("macro-def-error", Severity::Error),
+        d.message.clone(),
+        display_range,
+    )
 }
 
 #[cfg(test)]
@@ -30,19 +53,19 @@ macro_rules! include { () => {} }
 macro_rules! compile_error { () => {} }
 
   include!("doesntexist");
-//^^^^^^^ error: failed to load file `doesntexist`
+         //^^^^^^^^^^^^^ error: failed to load file `doesntexist`
 
   compile_error!("compile_error macro works");
 //^^^^^^^^^^^^^ error: compile_error macro works
+
+  compile_error! { "compile_error macro braced works" }
+//^^^^^^^^^^^^^ error: compile_error macro braced works
             "#,
         );
     }
 
     #[test]
     fn eager_macro_concat() {
-        // FIXME: this is incorrectly handling `$crate`, resulting in a wrong diagnostic.
-        // See: https://github.com/rust-lang/rust-analyzer/issues/10300
-
         check_diagnostics(
             r#"
 //- /lib.rs crate:lib deps:core
@@ -60,7 +83,6 @@ macro_rules! m {
 
 fn f() {
     m!();
-  //^^^^ error: unresolved macro `$crate::private::concat!`
 }
 
 //- /core.rs crate:core
@@ -83,7 +105,7 @@ pub macro panic {
 
         // FIXME: This is a false-positive, the file is actually linked in via
         // `include!` macro
-        config.disabled.insert("unlinked-file".to_string());
+        config.disabled.insert("unlinked-file".to_owned());
 
         check_diagnostics_with_config(
             config,
@@ -111,7 +133,7 @@ macro_rules! env { () => {} }
 macro_rules! concat { () => {} }
 
   include!(concat!(env!("OUT_DIR"), "/out.rs"));
-//^^^^^^^ error: `OUT_DIR` not set, enable "build scripts" to fix
+                      //^^^^^^^^^ error: `OUT_DIR` not set, build scripts may have failed to run
 "#,
         );
     }
@@ -137,6 +159,7 @@ struct S;
     fn macro_diag_builtin() {
         check_diagnostics(
             r#"
+//- minicore: fmt
 #[rustc_builtin_macro]
 macro_rules! env {}
 
@@ -145,23 +168,25 @@ macro_rules! include {}
 
 #[rustc_builtin_macro]
 macro_rules! compile_error {}
-
 #[rustc_builtin_macro]
-macro_rules! format_args { () => {} }
+macro_rules! concat {}
 
 fn main() {
     // Test a handful of built-in (eager) macros:
 
     include!(invalid);
-  //^^^^^^^ error: could not convert tokens
+           //^^^^^^^ error: expected string literal
     include!("does not exist");
-  //^^^^^^^ error: failed to load file `does not exist`
+           //^^^^^^^^^^^^^^^^ error: failed to load file `does not exist`
+
+    include!(concat!("does ", "not ", "exist"));
+                  //^^^^^^^^^^^^^^^^^^^^^^^^^^ error: failed to load file `does not exist`
 
     env!(invalid);
-  //^^^ error: could not convert tokens
+       //^^^^^^^ error: expected string literal
 
     env!("OUT_DIR");
-  //^^^ error: `OUT_DIR` not set, enable "build scripts" to fix
+       //^^^^^^^^^ error: `OUT_DIR` not set, build scripts may have failed to run
 
     compile_error!("compile_error works");
   //^^^^^^^^^^^^^ error: compile_error works
@@ -169,7 +194,7 @@ fn main() {
     // Lazy:
 
     format_args!();
-  //^^^^^^^^^^^ error: no rule matches input tokens
+  //^^^^^^^^^^^ error: Syntax Error in Expansion: expected expression
 }
 "#,
         );
@@ -186,11 +211,12 @@ fn f() {
     m!();
 
     m!(hi);
-  //^ error: leftover tokens
+    //^ error: leftover tokens
 }
       "#,
         );
     }
+
     #[test]
     fn dollar_crate_in_builtin_macro() {
         check_diagnostics(
@@ -214,5 +240,81 @@ fn f() {
 } //^^^^^^^^ error: leftover tokens
 "#,
         )
+    }
+
+    #[test]
+    fn def_diagnostic() {
+        check_diagnostics(
+            r#"
+macro_rules! foo {
+           //^^^ error: expected subtree
+    f => {};
+}
+
+fn f() {
+    foo!();
+  //^^^ error: macro definition has parse errors
+
+}
+"#,
+        )
+    }
+
+    #[test]
+    fn expansion_syntax_diagnostic() {
+        check_diagnostics(
+            r#"
+macro_rules! foo {
+    () => { struct; };
+}
+
+fn f() {
+    foo!();
+  //^^^ error: Syntax Error in Expansion: expected a name
+}
+"#,
+        )
+    }
+
+    #[test]
+    fn include_does_not_break_diagnostics() {
+        check_diagnostics(
+            r#"
+//- minicore: include
+//- /lib.rs crate:lib
+include!("include-me.rs");
+//- /include-me.rs
+/// long doc that pushes the diagnostic range beyond the first file's text length
+  #[err]
+//^^^^^^error: unresolved macro `err`
+mod prim_never {}
+"#,
+        );
+    }
+
+    #[test]
+    fn no_stack_overflow_for_missing_binding() {
+        check_diagnostics(
+            r#"
+#[macro_export]
+macro_rules! boom {
+    (
+        $($code:literal),+,
+        $(param: $param:expr,)?
+    ) => {{
+        let _ = $crate::boom!(@param $($param)*);
+    }};
+    (@param) => { () };
+    (@param $param:expr) => { $param };
+}
+
+fn it_works() {
+    // NOTE: there is an error, but RA crashes before showing it
+    boom!("RAND", param: c7.clone());
+               // ^^^^^ error: expected literal
+}
+
+        "#,
+        );
     }
 }

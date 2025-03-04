@@ -31,13 +31,24 @@ impl core::ops::Mul<i32> for Vec1 {
 
 #[allow(clippy::no_effect)]
 #[warn(clippy::erasing_op)]
-fn main() {
-    let x: u8 = 0;
-
+fn test(x: u8) {
     x * 0;
+    //~^ erasing_op
+
     0 & x;
+    //~^ erasing_op
+
     0 / x;
+    //~^ erasing_op
+
     0 * Meter; // no error: Output type is different from the non-zero argument
     0 * Vec1 { x: 5 };
+    //~^ erasing_op
+
     Vec1 { x: 5 } * 0;
+    //~^ erasing_op
+}
+
+fn main() {
+    test(0)
 }

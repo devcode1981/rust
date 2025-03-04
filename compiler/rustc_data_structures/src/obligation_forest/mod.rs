@@ -69,13 +69,16 @@
 //! step, we compress the vector to remove completed and error nodes, which
 //! aren't needed anymore.
 
-use crate::fx::{FxHashMap, FxHashSet};
-
 use std::cell::Cell;
 use std::collections::hash_map::Entry;
 use std::fmt::Debug;
 use std::hash;
 use std::marker::PhantomData;
+
+use thin_vec::ThinVec;
+use tracing::debug;
+
+use crate::fx::{FxHashMap, FxHashSet};
 
 mod graphviz;
 
@@ -95,12 +98,19 @@ pub trait ForestObligation: Clone + Debug {
 pub trait ObligationProcessor {
     type Obligation: ForestObligation;
     type Error: Debug;
-    type OUT: OutcomeTrait<
-        Obligation = Self::Obligation,
-        Error = Error<Self::Obligation, Self::Error>,
-    >;
+    type OUT: OutcomeTrait<Obligation = Self::Obligation, Error = Error<Self::Obligation, Self::Error>>;
 
-    fn needs_process_obligation(&self, obligation: &Self::Obligation) -> bool;
+    /// Implementations can provide a fast-path to obligation-processing
+    /// by counting the prefix of the passed iterator for which
+    /// `needs_process_obligation` would return false.
+    fn skippable_obligations<'a>(
+        &'a self,
+        _it: impl Iterator<Item = &'a Self::Obligation>,
+    ) -> usize {
+        0
+    }
+
+    fn needs_process_obligation(&self, _obligation: &Self::Obligation) -> bool;
 
     fn process_obligation(
         &mut self,
@@ -132,15 +142,12 @@ pub trait ObligationProcessor {
 #[derive(Debug)]
 pub enum ProcessResult<O, E> {
     Unchanged,
-    Changed(Vec<O>),
+    Changed(ThinVec<O>),
     Error(E),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 struct ObligationTreeId(usize);
-
-type ObligationTreeIdGenerator =
-    std::iter::Map<std::ops::RangeFrom<usize>, fn(usize) -> ObligationTreeId>;
 
 pub struct ObligationForest<O: ForestObligation> {
     /// The list of obligations. In between calls to [Self::process_obligations],
@@ -304,18 +311,25 @@ pub struct Error<O, E> {
     pub backtrace: Vec<O>,
 }
 
-impl<O: ForestObligation> ObligationForest<O> {
-    pub fn new() -> ObligationForest<O> {
-        ObligationForest {
-            nodes: vec![],
-            done_cache: Default::default(),
-            active_cache: Default::default(),
-            reused_node_vec: vec![],
-            obligation_tree_id_generator: (0..).map(ObligationTreeId),
-            error_cache: Default::default(),
+mod helper {
+    use super::*;
+    pub type ObligationTreeIdGenerator = impl Iterator<Item = ObligationTreeId>;
+    impl<O: ForestObligation> ObligationForest<O> {
+        pub fn new() -> ObligationForest<O> {
+            ObligationForest {
+                nodes: vec![],
+                done_cache: Default::default(),
+                active_cache: Default::default(),
+                reused_node_vec: vec![],
+                obligation_tree_id_generator: (0..).map(ObligationTreeId),
+                error_cache: Default::default(),
+            }
         }
     }
+}
+use helper::*;
 
+impl<O: ForestObligation> ObligationForest<O> {
     /// Returns the total number of nodes in the forest that have not
     /// yet been fully resolved.
     pub fn len(&self) -> usize {
@@ -360,7 +374,7 @@ impl<O: ForestObligation> ObligationForest<O> {
                     && self
                         .error_cache
                         .get(&obligation_tree_id)
-                        .map_or(false, |errors| errors.contains(v.key()));
+                        .is_some_and(|errors| errors.contains(v.key()));
 
                 if already_failed {
                     Err(())
@@ -389,15 +403,20 @@ impl<O: ForestObligation> ObligationForest<O> {
     }
 
     /// Returns the set of obligations that are in a pending state.
-    pub fn map_pending_obligations<P, F>(&self, f: F) -> Vec<P>
+    pub fn map_pending_obligations<P, F, R>(&self, f: F) -> R
     where
         F: Fn(&O) -> P,
+        R: FromIterator<P>,
     {
         self.nodes
             .iter()
             .filter(|node| node.state.get() == NodeState::Pending)
             .map(|node| f(&node.obligation))
             .collect()
+    }
+
+    pub fn has_pending_obligations(&self) -> bool {
+        self.nodes.iter().any(|node| node.state.get() == NodeState::Pending)
     }
 
     fn insert_into_error_cache(&mut self, index: usize) {
@@ -420,6 +439,10 @@ impl<O: ForestObligation> ObligationForest<O> {
         loop {
             let mut has_changed = false;
 
+            // This is the super fast path for cheap-to-check conditions.
+            let mut index =
+                processor.skippable_obligations(self.nodes.iter().map(|n| &n.obligation));
+
             // Note that the loop body can append new nodes, and those new nodes
             // will then be processed by subsequent iterations of the loop.
             //
@@ -428,8 +451,8 @@ impl<O: ForestObligation> ObligationForest<O> {
             // `for index in 0..self.nodes.len() { ... }` because the range would
             // be computed with the initial length, and we would miss the appended
             // nodes. Therefore we use a `while` loop.
-            let mut index = 0;
             while let Some(node) = self.nodes.get_mut(index) {
+                // This is the moderately fast path when the prefix skipping above didn't work out.
                 if node.state.get() != NodeState::Pending
                     || !processor.needs_process_obligation(&node.obligation)
                 {
@@ -443,6 +466,7 @@ impl<O: ForestObligation> ObligationForest<O> {
                 // out of sync with `nodes`. It's not very common, but it does
                 // happen, and code in `compress` has to allow for it.
 
+                // This code is much less hot.
                 match processor.process_obligation(&mut node.obligation) {
                     ProcessResult::Unchanged => {
                         // No change in state.

@@ -20,7 +20,7 @@ use crate::assist_context::{AssistContext, Assists};
 // Replaces a `try` expression with a `match` expression.
 //
 // ```
-// # //- minicore:option
+// # //- minicore: try, option
 // fn handle() {
 //     let pat = Some(true)$0?;
 // }
@@ -71,19 +71,17 @@ pub(crate) fn replace_try_expr_with_match(
             };
 
             let happy_arm = make::match_arm(
-                iter::once(
-                    try_enum.happy_pattern(make::ident_pat(false, false, make::name("it")).into()),
-                ),
+                try_enum.happy_pattern(make::ident_pat(false, false, make::name("it")).into()),
                 None,
                 make::expr_path(make::ext::ident_path("it")),
             );
-            let sad_arm = make::match_arm(iter::once(sad_pat), None, sad_expr);
+            let sad_arm = make::match_arm(sad_pat, None, sad_expr);
 
             let match_arm_list = make::match_arm_list([happy_arm, sad_arm]);
 
             let expr_match = make::expr_match(expr, match_arm_list)
                 .indent(IndentLevel::from_node(qm_kw_parent.syntax()));
-            edit.replace_ast::<ast::Expr>(qm_kw_parent.into(), expr_match);
+            edit.replace_ast::<ast::Expr>(qm_kw_parent.into(), expr_match.into());
         },
     )
 }
@@ -111,7 +109,7 @@ mod tests {
         check_assist(
             replace_try_expr_with_match,
             r#"
-//- minicore:option
+//- minicore: try, option
 fn test() {
     let pat = Some(true)$0?;
 }
@@ -132,7 +130,7 @@ fn test() {
         check_assist(
             replace_try_expr_with_match,
             r#"
-//- minicore:result
+//- minicore: try, from, result
 fn test() {
     let pat = Ok(true)$0?;
 }

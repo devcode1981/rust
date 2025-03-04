@@ -1,5 +1,6 @@
-use hir::TypeInfo;
-use std::{collections::HashMap, iter::successors};
+use hir::Type;
+use ide_db::FxHashMap;
+use std::iter::successors;
 use syntax::{
     algo::neighbor,
     ast::{self, AstNode, HasName},
@@ -33,7 +34,7 @@ use crate::{AssistContext, AssistId, AssistKind, Assists, TextRange};
 // }
 // ```
 pub(crate) fn merge_match_arms(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
-    let current_arm = ctx.find_node_at_offset::<ast::MatchArm>()?;
+    let current_arm = ctx.find_node_at_trimmed_offset::<ast::MatchArm>()?;
     // Don't try to handle arms with guards for now - can add support for this later
     if current_arm.guard().is_some() {
         return None;
@@ -41,12 +42,21 @@ pub(crate) fn merge_match_arms(acc: &mut Assists, ctx: &AssistContext<'_>) -> Op
     let current_expr = current_arm.expr()?;
     let current_text_range = current_arm.syntax().text_range();
     let current_arm_types = get_arm_types(ctx, &current_arm);
+    let multi_arm_selection = !ctx.has_empty_selection()
+        && ctx.selection_trimmed().end() > current_arm.syntax().text_range().end();
 
     // We check if the following match arms match this one. We could, but don't,
     // compare to the previous match arm as well.
     let arms_to_merge = successors(Some(current_arm), |it| neighbor(it, Direction::Next))
         .take_while(|arm| match arm.expr() {
             Some(expr) if arm.guard().is_none() => {
+                // don't include match arms that start after our selection
+                if multi_arm_selection
+                    && arm.syntax().text_range().start() >= ctx.selection_trimmed().end()
+                {
+                    return false;
+                }
+
                 let same_text = expr.syntax().text() == current_expr.syntax().text();
                 if !same_text {
                     return false;
@@ -78,7 +88,7 @@ pub(crate) fn merge_match_arms(acc: &mut Assists, ctx: &AssistContext<'_>) -> Op
                     .join(" | ")
             };
 
-            let arm = format!("{} => {},", pats, current_expr.syntax().text());
+            let arm = format!("{pats} => {current_expr},");
 
             if let [first, .., last] = &*arms_to_merge {
                 let start = first.syntax().text_range().start();
@@ -95,7 +105,7 @@ fn contains_placeholder(a: &ast::MatchArm) -> bool {
 }
 
 fn are_same_types(
-    current_arm_types: &HashMap<String, Option<TypeInfo>>,
+    current_arm_types: &FxHashMap<String, Option<Type>>,
     arm: &ast::MatchArm,
     ctx: &AssistContext<'_>,
 ) -> bool {
@@ -103,7 +113,7 @@ fn are_same_types(
     for (other_arm_type_name, other_arm_type) in arm_types {
         match (current_arm_types.get(&other_arm_type_name), other_arm_type) {
             (Some(Some(current_arm_type)), Some(other_arm_type))
-                if other_arm_type.original == current_arm_type.original => {}
+                if other_arm_type == *current_arm_type => {}
             _ => return false,
         }
     }
@@ -114,44 +124,44 @@ fn are_same_types(
 fn get_arm_types(
     context: &AssistContext<'_>,
     arm: &ast::MatchArm,
-) -> HashMap<String, Option<TypeInfo>> {
-    let mut mapping: HashMap<String, Option<TypeInfo>> = HashMap::new();
+) -> FxHashMap<String, Option<Type>> {
+    let mut mapping: FxHashMap<String, Option<Type>> = FxHashMap::default();
 
     fn recurse(
-        map: &mut HashMap<String, Option<TypeInfo>>,
+        map: &mut FxHashMap<String, Option<Type>>,
         ctx: &AssistContext<'_>,
         pat: &Option<ast::Pat>,
     ) {
         if let Some(local_pat) = pat {
-            match pat {
-                Some(ast::Pat::TupleStructPat(tuple)) => {
+            match local_pat {
+                ast::Pat::TupleStructPat(tuple) => {
                     for field in tuple.fields() {
                         recurse(map, ctx, &Some(field));
                     }
                 }
-                Some(ast::Pat::TuplePat(tuple)) => {
+                ast::Pat::TuplePat(tuple) => {
                     for field in tuple.fields() {
                         recurse(map, ctx, &Some(field));
                     }
                 }
-                Some(ast::Pat::RecordPat(record)) => {
+                ast::Pat::RecordPat(record) => {
                     if let Some(field_list) = record.record_pat_field_list() {
                         for field in field_list.fields() {
                             recurse(map, ctx, &field.pat());
                         }
                     }
                 }
-                Some(ast::Pat::ParenPat(parentheses)) => {
+                ast::Pat::ParenPat(parentheses) => {
                     recurse(map, ctx, &parentheses.pat());
                 }
-                Some(ast::Pat::SlicePat(slice)) => {
+                ast::Pat::SlicePat(slice) => {
                     for slice_pat in slice.pats() {
                         recurse(map, ctx, &Some(slice_pat));
                     }
                 }
-                Some(ast::Pat::IdentPat(ident_pat)) => {
+                ast::Pat::IdentPat(ident_pat) => {
                     if let Some(name) = ident_pat.name() {
-                        let pat_type = ctx.sema.type_of_pat(local_pat);
+                        let pat_type = ctx.sema.type_of_binding_in_pat(ident_pat);
                         map.insert(name.text().to_string(), pat_type);
                     }
                 }
@@ -295,6 +305,96 @@ fn main() {
 }
 "#,
         )
+    }
+
+    #[test]
+    fn merge_match_arms_selection_has_leading_whitespace() {
+        check_assist(
+            merge_match_arms,
+            r#"
+#[derive(Debug)]
+enum X { A, B, C }
+
+fn main() {
+    match X::A {
+    $0    X::A => 0,
+        X::B => 0,$0
+        X::C => 1,
+    }
+}
+"#,
+            r#"
+#[derive(Debug)]
+enum X { A, B, C }
+
+fn main() {
+    match X::A {
+        X::A | X::B => 0,
+        X::C => 1,
+    }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn merge_match_arms_stops_at_end_of_selection() {
+        check_assist(
+            merge_match_arms,
+            r#"
+#[derive(Debug)]
+enum X { A, B, C }
+
+fn main() {
+    match X::A {
+    $0    X::A => 0,
+        X::B => 0,
+        $0X::C => 0,
+    }
+}
+"#,
+            r#"
+#[derive(Debug)]
+enum X { A, B, C }
+
+fn main() {
+    match X::A {
+        X::A | X::B => 0,
+        X::C => 0,
+    }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn merge_match_arms_works_despite_accidental_selection() {
+        check_assist(
+            merge_match_arms,
+            r#"
+#[derive(Debug)]
+enum X { A, B, C }
+
+fn main() {
+    match X::A {
+        X::$0A$0 => 0,
+        X::B => 0,
+        X::C => 1,
+    }
+}
+"#,
+            r#"
+#[derive(Debug)]
+enum X { A, B, C }
+
+fn main() {
+    match X::A {
+        X::A | X::B => 0,
+        X::C => 1,
+    }
+}
+"#,
+        );
     }
 
     #[test]

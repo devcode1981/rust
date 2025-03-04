@@ -1,4 +1,6 @@
-//@compile-flags: -Zmiri-disable-weak-memory-emulation -Zmiri-preemption-rate=0
+//@compile-flags: -Zmiri-disable-weak-memory-emulation -Zmiri-preemption-rate=0 -Zmiri-disable-stacked-borrows
+// Avoid accidental synchronization via address reuse inside `thread::spawn`.
+//@compile-flags: -Zmiri-address-reuse-cross-thread-rate=0
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::spawn;
@@ -25,6 +27,7 @@ pub fn main() {
     //  4. load acquire : 3
     unsafe {
         let j1 = spawn(move || {
+            let c = c; // capture `c`, not just its field.
             *c.0 = 1;
             SYNC.store(1, Ordering::Release);
         });
@@ -37,8 +40,9 @@ pub fn main() {
         });
 
         let j3 = spawn(move || {
+            let c = c; // capture `c`, not just its field.
             if SYNC.load(Ordering::Acquire) == 3 {
-                *c.0 //~ ERROR: Data race detected between Read on thread `<unnamed>` and Write on thread `<unnamed>`
+                *c.0 //~ ERROR: Data race detected between (1) non-atomic write on thread `unnamed-1` and (2) non-atomic read on thread `unnamed-3`
             } else {
                 0
             }

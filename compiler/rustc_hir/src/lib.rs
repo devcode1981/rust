@@ -2,25 +2,19 @@
 //!
 //! [rustc dev guide]: https://rustc-dev-guide.rust-lang.org/hir.html
 
+// tidy-alphabetical-start
+#![allow(internal_features)]
 #![feature(associated_type_defaults)]
+#![feature(box_patterns)]
 #![feature(closure_track_caller)]
-#![feature(const_btree_len)]
-#![feature(once_cell)]
-#![feature(min_specialization)]
+#![feature(debug_closure_helpers)]
+#![feature(exhaustive_patterns)]
+#![feature(let_chains)]
 #![feature(never_type)]
 #![feature(rustc_attrs)]
-#![recursion_limit = "256"]
-#![deny(rustc::untranslatable_diagnostic)]
-#![deny(rustc::diagnostic_outside_of_impl)]
-
-#[macro_use]
-extern crate rustc_macros;
-
-#[macro_use]
-extern crate tracing;
-
-#[macro_use]
-extern crate rustc_data_structures;
+#![feature(variant_count)]
+#![warn(unreachable_pub)]
+// tidy-alphabetical-end
 
 extern crate self as rustc_hir;
 
@@ -29,7 +23,6 @@ pub mod def;
 pub mod def_path_hash_map;
 pub mod definitions;
 pub mod diagnostic_items;
-pub mod errors;
 pub use rustc_span::def_id;
 mod hir;
 pub mod hir_id;
@@ -43,6 +36,7 @@ pub mod weak_lang_items;
 #[cfg(test)]
 mod tests;
 
+#[doc(no_inline)]
 pub use hir::*;
 pub use hir_id::*;
 pub use lang_items::{LangItem, LanguageItems};

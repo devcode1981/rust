@@ -14,12 +14,15 @@ impl Foo {
     fn is_u32(&self) {}
     fn to_i32(self) {}
     fn from_i32(self) {}
+    //~^ wrong_self_convention
 
     pub fn as_i64(self) {}
     pub fn into_i64(self) {}
     pub fn is_i64(self) {}
     pub fn to_i64(self) {}
     pub fn from_i64(self) {}
+    //~^ wrong_self_convention
+
     // check whether the lint can be allowed at the function level
     #[allow(clippy::wrong_self_convention)]
     pub fn from_cake(self) {}
@@ -32,20 +35,38 @@ struct Bar;
 
 impl Bar {
     fn as_i32(self) {}
+    //~^ wrong_self_convention
+
     fn as_u32(&self) {}
     fn into_i32(&self) {}
+    //~^ wrong_self_convention
+
     fn into_u32(self) {}
     fn is_i32(self) {}
+    //~^ wrong_self_convention
+
     fn is_u32(&self) {}
     fn to_i32(self) {}
+    //~^ wrong_self_convention
+
     fn to_u32(&self) {}
     fn from_i32(self) {}
+    //~^ wrong_self_convention
 
     pub fn as_i64(self) {}
+    //~^ wrong_self_convention
+
     pub fn into_i64(&self) {}
+    //~^ wrong_self_convention
+
     pub fn is_i64(self) {}
+    //~^ wrong_self_convention
+
     pub fn to_i64(self) {}
+    //~^ wrong_self_convention
+
     pub fn from_i64(self) {}
+    //~^ wrong_self_convention
 
     // test for false positives
     fn as_(self) {}
@@ -91,15 +112,23 @@ mod issue4037 {
 mod issue6307 {
     trait T: Sized {
         fn as_i32(self) {}
+        //~^ wrong_self_convention
+
         fn as_u32(&self) {}
         fn into_i32(self) {}
         fn into_i32_ref(&self) {}
+        //~^ wrong_self_convention
+
         fn into_u32(self) {}
         fn is_i32(self) {}
+        //~^ wrong_self_convention
+
         fn is_u32(&self) {}
         fn to_i32(self) {}
         fn to_u32(&self) {}
         fn from_i32(self) {}
+        //~^ wrong_self_convention
+
         // check whether the lint can be allowed at the function level
         #[allow(clippy::wrong_self_convention)]
         fn from_cake(self) {}
@@ -115,15 +144,23 @@ mod issue6307 {
 
     trait U {
         fn as_i32(self);
+        //~^ wrong_self_convention
+
         fn as_u32(&self);
         fn into_i32(self);
         fn into_i32_ref(&self);
+        //~^ wrong_self_convention
+
         fn into_u32(self);
         fn is_i32(self);
+        //~^ wrong_self_convention
+
         fn is_u32(&self);
         fn to_i32(self);
         fn to_u32(&self);
         fn from_i32(self);
+        //~^ wrong_self_convention
+
         // check whether the lint can be allowed at the function level
         #[allow(clippy::wrong_self_convention)]
         fn from_cake(self);
@@ -142,12 +179,16 @@ mod issue6307 {
         fn as_u32(&self);
         fn into_i32(self);
         fn into_i32_ref(&self);
+        //~^ wrong_self_convention
+
         fn into_u32(self);
         fn is_i32(self);
         fn is_u32(&self);
         fn to_i32(self);
         fn to_u32(&self);
         fn from_i32(self);
+        //~^ wrong_self_convention
+
         // check whether the lint can be allowed at the function level
         #[allow(clippy::wrong_self_convention)]
         fn from_cake(self);
@@ -172,6 +213,8 @@ mod issue6727 {
         }
         // trigger lint
         fn to_u64_v2(&self) -> u64 {
+            //~^ wrong_self_convention
+
             1
         }
     }
@@ -181,6 +224,8 @@ mod issue6727 {
     impl FooNoCopy {
         // trigger lint
         fn to_u64(self) -> u64 {
+            //~^ wrong_self_convention
+
             2
         }
         fn to_u64_v2(&self) -> u64 {

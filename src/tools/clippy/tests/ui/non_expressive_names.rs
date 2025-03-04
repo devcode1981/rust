@@ -25,9 +25,12 @@ impl MaybeInst {
 }
 
 fn underscores_and_numbers() {
-    let _1 = 1; //~ERROR Consider a more descriptive name
-    let ____1 = 1; //~ERROR Consider a more descriptive name
-    let __1___2 = 12; //~ERROR Consider a more descriptive name
+    let _1 = 1;
+    //~^ just_underscores_and_digits
+    let ____1 = 1;
+    //~^ just_underscores_and_digits
+    let __1___2 = 12;
+    //~^ just_underscores_and_digits
     let _1_ok = 1;
 }
 
@@ -49,8 +52,11 @@ struct Bar;
 impl Bar {
     fn bar() {
         let _1 = 1;
+        //~^ just_underscores_and_digits
         let ____1 = 1;
+        //~^ just_underscores_and_digits
         let __1___2 = 12;
+        //~^ just_underscores_and_digits
         let _1_ok = 1;
     }
 }

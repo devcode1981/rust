@@ -8,18 +8,23 @@
 #![doc(issue_tracker_base_url = "https://github.com/rust-lang/rust/issues/")]
 #![panic_runtime]
 #![allow(unused_features)]
+#![feature(asm_experimental_arch)]
 #![feature(core_intrinsics)]
 #![feature(panic_runtime)]
 #![feature(std_internals)]
 #![feature(staged_api)]
 #![feature(rustc_attrs)]
-#![feature(c_unwind)]
+#![allow(internal_features)]
+#![deny(unsafe_op_in_unsafe_fn)]
 
 #[cfg(target_os = "android")]
 mod android;
 
+#[cfg(target_os = "zkvm")]
+mod zkvm;
+
 use core::any::Any;
-use core::panic::BoxMeUp;
+use core::panic::PanicPayload;
 
 #[rustc_std_internal_symbol]
 #[allow(improper_ctypes_definitions)]
@@ -29,27 +34,37 @@ pub unsafe extern "C" fn __rust_panic_cleanup(_: *mut u8) -> *mut (dyn Any + Sen
 
 // "Leak" the payload and shim to the relevant abort on the platform in question.
 #[rustc_std_internal_symbol]
-pub unsafe fn __rust_start_panic(_payload: *mut &mut dyn BoxMeUp) -> u32 {
+pub unsafe fn __rust_start_panic(_payload: &mut dyn PanicPayload) -> u32 {
     // Android has the ability to attach a message as part of the abort.
     #[cfg(target_os = "android")]
-    android::android_set_abort_message(_payload);
+    unsafe {
+        android::android_set_abort_message(_payload);
+    }
+    #[cfg(target_os = "zkvm")]
+    unsafe {
+        zkvm::zkvm_set_abort_message(_payload);
+    }
 
-    abort();
+    unsafe {
+        abort();
+    }
 
     cfg_if::cfg_if! {
         if #[cfg(any(unix, target_os = "solid_asp3"))] {
             unsafe fn abort() -> ! {
-                libc::abort();
+                unsafe { libc::abort(); }
             }
         } else if #[cfg(any(target_os = "hermit",
-                            all(target_vendor = "fortanix", target_env = "sgx")
+                            all(target_vendor = "fortanix", target_env = "sgx"),
+                            target_os = "xous",
+                            target_os = "uefi",
         ))] {
             unsafe fn abort() -> ! {
                 // call std::sys::abort_internal
-                extern "C" {
+                unsafe extern "C" {
                     pub fn __rust_abort() -> !;
                 }
-                __rust_abort();
+                unsafe { __rust_abort(); }
             }
         } else if #[cfg(all(windows, not(miri)))] {
             // On Windows, use the processor-specific __fastfail mechanism. In Windows 8
@@ -61,22 +76,37 @@ pub unsafe fn __rust_start_panic(_payload: *mut &mut dyn BoxMeUp) -> u32 {
             //
             // https://docs.microsoft.com/en-us/cpp/intrinsics/fastfail
             //
-            // Note: this is the same implementation as in libstd's `abort_internal`
+            // Note: this is the same implementation as in std's `abort_internal`
             unsafe fn abort() -> ! {
                 #[allow(unused)]
                 const FAST_FAIL_FATAL_APP_EXIT: usize = 7;
                 cfg_if::cfg_if! {
                     if #[cfg(any(target_arch = "x86", target_arch = "x86_64"))] {
-                        core::arch::asm!("int $$0x29", in("ecx") FAST_FAIL_FATAL_APP_EXIT);
+                        unsafe {
+                            core::arch::asm!("int $$0x29", in("ecx") FAST_FAIL_FATAL_APP_EXIT, options(noreturn, nostack));
+                        }
                     } else if #[cfg(all(target_arch = "arm", target_feature = "thumb-mode"))] {
-                        core::arch::asm!(".inst 0xDEFB", in("r0") FAST_FAIL_FATAL_APP_EXIT);
-                    } else if #[cfg(target_arch = "aarch64")] {
-                        core::arch::asm!("brk 0xF003", in("x0") FAST_FAIL_FATAL_APP_EXIT);
+                        unsafe {
+                            core::arch::asm!(".inst 0xDEFB", in("r0") FAST_FAIL_FATAL_APP_EXIT, options(noreturn, nostack));
+                        }
+                    } else if #[cfg(any(target_arch = "aarch64", target_arch = "arm64ec"))] {
+                        unsafe {
+                            core::arch::asm!("brk 0xF003", in("x0") FAST_FAIL_FATAL_APP_EXIT, options(noreturn, nostack));
+                        }
                     } else {
                         core::intrinsics::abort();
                     }
                 }
-                core::intrinsics::unreachable();
+            }
+        } else if #[cfg(target_os = "teeos")] {
+            mod teeos {
+                unsafe extern "C" {
+                    pub fn TEE_Panic(code: u32) -> !;
+                }
+            }
+
+            unsafe fn abort() -> ! {
+                unsafe { teeos::TEE_Panic(1); }
             }
         } else {
             unsafe fn abort() -> ! {
@@ -89,7 +119,7 @@ pub unsafe fn __rust_start_panic(_payload: *mut &mut dyn BoxMeUp) -> u32 {
 // This... is a bit of an oddity. The tl;dr; is that this is required to link
 // correctly, the longer explanation is below.
 //
-// Right now the binaries of libcore/libstd that we ship are all compiled with
+// Right now the binaries of core/std that we ship are all compiled with
 // `-C panic=unwind`. This is done to ensure that the binaries are maximally
 // compatible with as many situations as possible. The compiler, however,
 // requires a "personality function" for all functions compiled with `-C
@@ -109,7 +139,7 @@ pub unsafe fn __rust_start_panic(_payload: *mut &mut dyn BoxMeUp) -> u32 {
 // library just defines this symbol so there's at least some personality
 // somewhere.
 //
-// Essentially this symbol is just defined to get wired up to libcore/libstd
+// Essentially this symbol is just defined to get wired up to core/std
 // binaries, but it should never be called as we don't link in an unwinding
 // runtime at all.
 pub mod personalities {

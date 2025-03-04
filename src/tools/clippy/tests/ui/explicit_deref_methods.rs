@@ -1,12 +1,14 @@
-// run-rustfix
 #![warn(clippy::explicit_deref_methods)]
-#![allow(unused_variables)]
+#![allow(unused_variables, unused_must_use)]
 #![allow(
     clippy::borrow_deref_ref,
-    clippy::clone_double_ref,
+    suspicious_double_ref_op,
+    noop_method_call,
     clippy::explicit_auto_deref,
     clippy::needless_borrow,
-    clippy::uninlined_format_args
+    clippy::no_effect,
+    clippy::uninlined_format_args,
+    clippy::unnecessary_literal_unwrap
 )]
 
 use std::ops::{Deref, DerefMut};
@@ -28,35 +30,73 @@ impl Deref for CustomVec {
     }
 }
 
+struct Aaa;
+
+impl Deref for Aaa {
+    type Target = ();
+
+    fn deref(&self) -> &Self::Target {
+        todo!();
+    }
+}
+
+impl DerefMut for Aaa {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        todo!();
+    }
+}
+
 fn main() {
     let a: &mut String = &mut String::from("foo");
 
     // these should require linting
 
     let b: &str = a.deref();
+    //~^ explicit_deref_methods
 
     let b: &mut str = a.deref_mut();
+    //~^ explicit_deref_methods
 
     // both derefs should get linted here
     let b: String = format!("{}, {}", a.deref(), a.deref());
+    //~^ explicit_deref_methods
+    //~| explicit_deref_methods
 
     println!("{}", a.deref());
+    //~^ explicit_deref_methods
 
     #[allow(clippy::match_single_binding)]
     match a.deref() {
+        //~^ explicit_deref_methods
         _ => (),
     }
 
     let b: String = concat(a.deref());
+    //~^ explicit_deref_methods
 
     let b = just_return(a).deref();
+    //~^ explicit_deref_methods
 
     let b: String = concat(just_return(a).deref());
+    //~^ explicit_deref_methods
 
     let b: &str = a.deref().deref();
+    //~^ explicit_deref_methods
 
     let opt_a = Some(a.clone());
     let b = opt_a.unwrap().deref();
+    //~^ explicit_deref_methods
+
+    // make sure `Aaa::deref` instead of `aaa.deref()` is not linted, as well as fully qualified
+    // syntax
+
+    Aaa::deref(&Aaa);
+    Aaa::deref_mut(&mut Aaa);
+    <Aaa as Deref>::deref(&Aaa);
+    <Aaa as DerefMut>::deref_mut(&mut Aaa);
+    let mut aaa = Aaa;
+    Aaa::deref(&aaa);
+    Aaa::deref_mut(&mut aaa);
 
     // following should not require linting
 
@@ -83,6 +123,7 @@ fn main() {
     let b: &str = expr_deref!(a);
 
     let b: &str = expr_deref!(a.deref());
+    //~^ explicit_deref_methods
 
     // The struct does not implement Deref trait
     #[derive(Copy, Clone)]

@@ -29,17 +29,62 @@ fn main() {
 
     // these should throw warnings
     write!(v, "Hello {}", "world");
+    //~^ write_literal
+
     writeln!(v, "Hello {} {}", world, "world");
+    //~^ write_literal
+
     writeln!(v, "Hello {}", "world");
+    //~^ write_literal
+
     writeln!(v, "{} {:.4}", "a literal", 5);
+    //~^ write_literal
 
     // positional args don't change the fact
     // that we're using a literal -- this should
     // throw a warning
     writeln!(v, "{0} {1}", "hello", "world");
+    //~^ write_literal
+
     writeln!(v, "{1} {0}", "hello", "world");
+    //~^ write_literal
 
     // named args shouldn't change anything either
     writeln!(v, "{foo} {bar}", foo = "hello", bar = "world");
+    //~^ write_literal
+
     writeln!(v, "{bar} {foo}", foo = "hello", bar = "world");
+    //~^ write_literal
+
+    // #10128
+    writeln!(v, "{0} {1} {2}", "hello", 2, "world");
+    //~^ write_literal
+
+    writeln!(v, "{2} {1} {0}", "hello", 2, "world");
+    //~^ write_literal
+
+    writeln!(v, "{0} {1} {2}, {bar}", "hello", 2, 3, bar = 4);
+    //~^ write_literal
+
+    writeln!(v, "{0} {1} {2}, {3} {4}", "hello", 2, 3, "world", 4);
+    //~^ write_literal
+}
+
+fn issue_13959() {
+    let mut v = Vec::new();
+    writeln!(v, "{}", r#"""#);
+    //~^ write_literal
+    writeln!(
+        v,
+        "{}",
+        r#"
+        //~^ write_literal
+        foo
+        \
+        \\
+        "
+        \"
+        bar
+"#
+    );
 }

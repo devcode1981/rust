@@ -1,9 +1,12 @@
 #![deny(clippy::trait_duplication_in_bounds)]
+#![allow(clippy::multiple_bound_locations)]
 
 use std::collections::BTreeMap;
 use std::ops::{Add, AddAssign, Div, DivAssign, Mul, MulAssign, Sub, SubAssign};
 
 fn bad_foo<T: Clone + Default, Z: Copy>(arg0: T, arg1: Z)
+//~^ trait_duplication_in_bounds
+//~| trait_duplication_in_bounds
 where
     T: Clone,
     T: Default,
@@ -33,6 +36,7 @@ trait T: Default {
     fn f()
     where
         Self: Default;
+    //~^ trait_duplication_in_bounds
 }
 
 trait U: Default {
@@ -47,15 +51,21 @@ trait ZZ: Default {
     fn f()
     where
         Self: Default + Clone;
+    //~^ trait_duplication_in_bounds
 }
 
 trait BadTrait: Default + Clone {
     fn f()
     where
         Self: Default + Clone;
+    //~^ trait_duplication_in_bounds
+    //~| trait_duplication_in_bounds
+
     fn g()
     where
         Self: Default;
+    //~^ trait_duplication_in_bounds
+
     fn h()
     where
         Self: Copy;
@@ -91,6 +101,7 @@ trait FooIter: Iterator<Item = Foo> {
     fn bar()
     where
         Self: Iterator<Item = Foo>,
+        //~^ trait_duplication_in_bounds
     {
     }
 }

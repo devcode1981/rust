@@ -1,4 +1,6 @@
-//@compile-flags: -Zmiri-disable-isolation -Zmiri-disable-weak-memory-emulation -Zmiri-preemption-rate=0
+//@compile-flags: -Zmiri-disable-weak-memory-emulation -Zmiri-preemption-rate=0 -Zmiri-disable-stacked-borrows
+// Avoid accidental synchronization via address reuse inside `thread::spawn`.
+//@compile-flags: -Zmiri-address-reuse-cross-thread-rate=0
 
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicPtr, Ordering};
@@ -28,6 +30,7 @@ pub fn main() {
     //  5. write-value
     unsafe {
         let j1 = spawn(move || {
+            let ptr = ptr; // avoid field capturing
             // Concurrent allocate the memory.
             // Uses relaxed semantics to not generate
             // a release sequence.
@@ -39,13 +42,14 @@ pub fn main() {
 
             sleep(Duration::from_millis(200));
 
-            stack_var = 1usize; //~ ERROR: Data race detected between Write on thread `<unnamed>` and Write on thread `<unnamed>`
+            stack_var = 1usize; //~ ERROR: Data race detected between (1) non-atomic write on thread `unnamed-2` and (2) non-atomic write on thread `unnamed-1`
 
             // read to silence errors
             stack_var
         });
 
         let j2 = spawn(move || {
+            let ptr = ptr; // avoid field capturing
             let pointer = &*ptr.0;
             *pointer.load(Ordering::Acquire) = 3;
         });

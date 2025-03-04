@@ -1,62 +1,116 @@
-use crate::mir::graph_cyclic_cache::GraphIsCyclicCache;
-use crate::mir::predecessors::{PredecessorCache, Predecessors};
-use crate::mir::switch_sources::{SwitchSourceCache, SwitchSources};
-use crate::mir::traversal::PostorderCache;
-use crate::mir::{BasicBlock, BasicBlockData, Successors, START_BLOCK};
+use std::sync::OnceLock;
 
+use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::graph;
-use rustc_data_structures::graph::dominators::{dominators, Dominators};
-use rustc_index::vec::IndexVec;
+use rustc_data_structures::graph::dominators::{Dominators, dominators};
+use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
+use rustc_index::{IndexSlice, IndexVec};
+use rustc_macros::{HashStable, TyDecodable, TyEncodable, TypeFoldable, TypeVisitable};
+use rustc_serialize::{Decodable, Decoder, Encodable, Encoder};
+use smallvec::SmallVec;
+
+use crate::mir::traversal::Postorder;
+use crate::mir::{BasicBlock, BasicBlockData, START_BLOCK, Terminator, TerminatorKind};
 
 #[derive(Clone, TyEncodable, TyDecodable, Debug, HashStable, TypeFoldable, TypeVisitable)]
 pub struct BasicBlocks<'tcx> {
     basic_blocks: IndexVec<BasicBlock, BasicBlockData<'tcx>>,
-    predecessor_cache: PredecessorCache,
-    switch_source_cache: SwitchSourceCache,
-    is_cyclic: GraphIsCyclicCache,
-    postorder_cache: PostorderCache,
+    cache: Cache,
+}
+
+// Typically 95%+ of basic blocks have 4 or fewer predecessors.
+type Predecessors = IndexVec<BasicBlock, SmallVec<[BasicBlock; 4]>>;
+
+/// Each `(target, switch)` entry in the map contains a list of switch values
+/// that lead to a `target` block from a `switch` block.
+///
+/// Note: this type is currently never instantiated, because it's only used for
+/// `BasicBlocks::switch_sources`, which is only called by backwards analyses
+/// that do `SwitchInt` handling, and we don't have any of those, not even in
+/// tests. See #95120 and #94576.
+type SwitchSources = FxHashMap<(BasicBlock, BasicBlock), SmallVec<[SwitchTargetValue; 1]>>;
+
+#[derive(Debug, Clone, Copy)]
+pub enum SwitchTargetValue {
+    // A normal switch value.
+    Normal(u128),
+    // The final "otherwise" fallback value.
+    Otherwise,
+}
+
+#[derive(Clone, Default, Debug)]
+struct Cache {
+    predecessors: OnceLock<Predecessors>,
+    switch_sources: OnceLock<SwitchSources>,
+    reverse_postorder: OnceLock<Vec<BasicBlock>>,
+    dominators: OnceLock<Dominators<BasicBlock>>,
 }
 
 impl<'tcx> BasicBlocks<'tcx> {
     #[inline]
     pub fn new(basic_blocks: IndexVec<BasicBlock, BasicBlockData<'tcx>>) -> Self {
-        BasicBlocks {
-            basic_blocks,
-            predecessor_cache: PredecessorCache::new(),
-            switch_source_cache: SwitchSourceCache::new(),
-            is_cyclic: GraphIsCyclicCache::new(),
-            postorder_cache: PostorderCache::new(),
-        }
+        BasicBlocks { basic_blocks, cache: Cache::default() }
     }
 
-    /// Returns true if control-flow graph contains a cycle reachable from the `START_BLOCK`.
-    #[inline]
-    pub fn is_cfg_cyclic(&self) -> bool {
-        self.is_cyclic.is_cyclic(self)
-    }
-
-    #[inline]
-    pub fn dominators(&self) -> Dominators<BasicBlock> {
-        dominators(&self)
+    pub fn dominators(&self) -> &Dominators<BasicBlock> {
+        self.cache.dominators.get_or_init(|| dominators(self))
     }
 
     /// Returns predecessors for each basic block.
     #[inline]
     pub fn predecessors(&self) -> &Predecessors {
-        self.predecessor_cache.compute(&self.basic_blocks)
+        self.cache.predecessors.get_or_init(|| {
+            let mut preds = IndexVec::from_elem(SmallVec::new(), &self.basic_blocks);
+            for (bb, data) in self.basic_blocks.iter_enumerated() {
+                if let Some(term) = &data.terminator {
+                    for succ in term.successors() {
+                        preds[succ].push(bb);
+                    }
+                }
+            }
+            preds
+        })
     }
 
-    /// Returns basic blocks in a postorder.
+    /// Returns basic blocks in a reverse postorder.
+    ///
+    /// See [`traversal::reverse_postorder`]'s docs to learn what is preorder traversal.
+    ///
+    /// [`traversal::reverse_postorder`]: crate::mir::traversal::reverse_postorder
     #[inline]
-    pub fn postorder(&self) -> &[BasicBlock] {
-        self.postorder_cache.compute(&self.basic_blocks)
+    pub fn reverse_postorder(&self) -> &[BasicBlock] {
+        self.cache.reverse_postorder.get_or_init(|| {
+            let mut rpo: Vec<_> = Postorder::new(&self.basic_blocks, START_BLOCK, None).collect();
+            rpo.reverse();
+            rpo
+        })
     }
 
-    /// `switch_sources()[&(target, switch)]` returns a list of switch
-    /// values that lead to a `target` block from a `switch` block.
+    /// Returns info about switch values that lead from one block to another
+    /// block. See `SwitchSources`.
     #[inline]
     pub fn switch_sources(&self) -> &SwitchSources {
-        self.switch_source_cache.compute(&self.basic_blocks)
+        self.cache.switch_sources.get_or_init(|| {
+            let mut switch_sources: SwitchSources = FxHashMap::default();
+            for (bb, data) in self.basic_blocks.iter_enumerated() {
+                if let Some(Terminator {
+                    kind: TerminatorKind::SwitchInt { targets, .. }, ..
+                }) = &data.terminator
+                {
+                    for (value, target) in targets.iter() {
+                        switch_sources
+                            .entry((target, bb))
+                            .or_default()
+                            .push(SwitchTargetValue::Normal(value));
+                    }
+                    switch_sources
+                        .entry((targets.otherwise(), bb))
+                        .or_default()
+                        .push(SwitchTargetValue::Otherwise);
+                }
+            }
+            switch_sources
+        })
     }
 
     /// Returns mutable reference to basic blocks. Invalidates CFG cache.
@@ -88,60 +142,65 @@ impl<'tcx> BasicBlocks<'tcx> {
     /// All other methods that allow you to mutate the basic blocks also call this method
     /// themselves, thereby avoiding any risk of accidentally cache invalidation.
     pub fn invalidate_cfg_cache(&mut self) {
-        self.predecessor_cache.invalidate();
-        self.switch_source_cache.invalidate();
-        self.is_cyclic.invalidate();
-        self.postorder_cache.invalidate();
+        self.cache = Cache::default();
     }
 }
 
 impl<'tcx> std::ops::Deref for BasicBlocks<'tcx> {
-    type Target = IndexVec<BasicBlock, BasicBlockData<'tcx>>;
+    type Target = IndexSlice<BasicBlock, BasicBlockData<'tcx>>;
 
     #[inline]
-    fn deref(&self) -> &IndexVec<BasicBlock, BasicBlockData<'tcx>> {
+    fn deref(&self) -> &IndexSlice<BasicBlock, BasicBlockData<'tcx>> {
         &self.basic_blocks
     }
 }
 
 impl<'tcx> graph::DirectedGraph for BasicBlocks<'tcx> {
     type Node = BasicBlock;
-}
 
-impl<'tcx> graph::WithNumNodes for BasicBlocks<'tcx> {
     #[inline]
     fn num_nodes(&self) -> usize {
         self.basic_blocks.len()
     }
 }
 
-impl<'tcx> graph::WithStartNode for BasicBlocks<'tcx> {
+impl<'tcx> graph::StartNode for BasicBlocks<'tcx> {
     #[inline]
     fn start_node(&self) -> Self::Node {
         START_BLOCK
     }
 }
 
-impl<'tcx> graph::WithSuccessors for BasicBlocks<'tcx> {
+impl<'tcx> graph::Successors for BasicBlocks<'tcx> {
     #[inline]
-    fn successors(&self, node: Self::Node) -> <Self as graph::GraphSuccessors<'_>>::Iter {
+    fn successors(&self, node: Self::Node) -> impl Iterator<Item = Self::Node> {
         self.basic_blocks[node].terminator().successors()
     }
 }
 
-impl<'a, 'b> graph::GraphSuccessors<'b> for BasicBlocks<'a> {
-    type Item = BasicBlock;
-    type Iter = Successors<'b>;
-}
-
-impl<'tcx, 'graph> graph::GraphPredecessors<'graph> for BasicBlocks<'tcx> {
-    type Item = BasicBlock;
-    type Iter = std::iter::Copied<std::slice::Iter<'graph, BasicBlock>>;
-}
-
-impl<'tcx> graph::WithPredecessors for BasicBlocks<'tcx> {
+impl<'tcx> graph::Predecessors for BasicBlocks<'tcx> {
     #[inline]
-    fn predecessors(&self, node: Self::Node) -> <Self as graph::GraphPredecessors<'_>>::Iter {
+    fn predecessors(&self, node: Self::Node) -> impl Iterator<Item = Self::Node> {
         self.predecessors()[node].iter().copied()
     }
+}
+
+// Done here instead of in `structural_impls.rs` because `Cache` is private, as is `basic_blocks`.
+TrivialTypeTraversalImpls! { Cache }
+
+impl<S: Encoder> Encodable<S> for Cache {
+    #[inline]
+    fn encode(&self, _s: &mut S) {}
+}
+
+impl<D: Decoder> Decodable<D> for Cache {
+    #[inline]
+    fn decode(_: &mut D) -> Self {
+        Default::default()
+    }
+}
+
+impl<CTX> HashStable<CTX> for Cache {
+    #[inline]
+    fn hash_stable(&self, _: &mut CTX, _: &mut StableHasher) {}
 }

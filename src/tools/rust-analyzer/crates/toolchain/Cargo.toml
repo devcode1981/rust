@@ -1,13 +1,19 @@
 [package]
 name = "toolchain"
 version = "0.0.0"
-description = "TBD"
-license = "MIT OR Apache-2.0"
-edition = "2021"
-rust-version = "1.57"
+repository.workspace = true
+description = "Discovery of `cargo` & `rustc` executables for rust-analyzer."
+
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
 
 [lib]
-doctest = false
 
 [dependencies]
 home = "0.5.4"
+camino.workspace = true
+
+[lints]
+workspace = true

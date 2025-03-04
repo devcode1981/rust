@@ -1,68 +1,61 @@
-use crate::check::intrinsicck::InlineAsmCtxt;
-
-use super::compare_method::check_type_bounds;
-use super::compare_method::{compare_impl_method, compare_ty_impl};
-use super::*;
-use rustc_attr as attr;
-use rustc_errors::{Applicability, ErrorGuaranteed, MultiSpan};
-use rustc_hir as hir;
-use rustc_hir::def::{DefKind, Res};
-use rustc_hir::def_id::{DefId, LocalDefId};
-use rustc_hir::intravisit::Visitor;
-use rustc_hir::{ItemKind, Node, PathSegment};
-use rustc_infer::infer::outlives::env::OutlivesEnvironment;
-use rustc_infer::infer::{DefiningAnchor, RegionVariableOrigin, TyCtxtInferExt};
-use rustc_infer::traits::Obligation;
-use rustc_lint::builtin::REPR_TRANSPARENT_EXTERNAL_PRIVATE_FIELDS;
-use rustc_middle::hir::nested_filter;
-use rustc_middle::middle::stability::EvalResult;
-use rustc_middle::ty::layout::{LayoutError, MAX_SIMD_LANES};
-use rustc_middle::ty::subst::GenericArgKind;
-use rustc_middle::ty::util::{Discr, IntTypeExt};
-use rustc_middle::ty::{
-    self, ParamEnv, ToPredicate, Ty, TyCtxt, TypeSuperVisitable, TypeVisitable,
-};
-use rustc_session::lint::builtin::{UNINHABITED_STATIC, UNSUPPORTED_CALLING_CONVENTIONS};
-use rustc_span::symbol::sym;
-use rustc_span::{self, Span};
-use rustc_target::spec::abi::Abi;
-use rustc_trait_selection::traits::error_reporting::TypeErrCtxtExt as _;
-use rustc_trait_selection::traits::{self, ObligationCtxt};
-
+use std::cell::LazyCell;
 use std::ops::ControlFlow;
 
-pub fn check_abi(tcx: TyCtxt<'_>, hir_id: hir::HirId, span: Span, abi: Abi) {
-    match tcx.sess.target.is_abi_supported(abi) {
-        Some(true) => (),
-        Some(false) => {
-            struct_span_err!(
-                tcx.sess,
-                span,
-                E0570,
-                "`{abi}` is not a supported ABI for the current target",
-            )
-            .emit();
-        }
-        None => {
-            tcx.struct_span_lint_hir(
-                UNSUPPORTED_CALLING_CONVENTIONS,
-                hir_id,
-                span,
-                "use of calling convention not supported on this target",
-                |lint| lint,
-            );
-        }
-    }
+use rustc_abi::FieldIdx;
+use rustc_attr_parsing::AttributeKind;
+use rustc_attr_parsing::ReprAttr::ReprPacked;
+use rustc_data_structures::unord::{UnordMap, UnordSet};
+use rustc_errors::MultiSpan;
+use rustc_errors::codes::*;
+use rustc_hir::def::{CtorKind, DefKind};
+use rustc_hir::{LangItem, Node, intravisit};
+use rustc_infer::infer::{RegionVariableOrigin, TyCtxtInferExt};
+use rustc_infer::traits::{Obligation, ObligationCauseCode};
+use rustc_lint_defs::builtin::{
+    REPR_TRANSPARENT_EXTERNAL_PRIVATE_FIELDS, UNSUPPORTED_FN_PTR_CALLING_CONVENTIONS,
+};
+use rustc_middle::hir::nested_filter;
+use rustc_middle::middle::resolve_bound_vars::ResolvedArg;
+use rustc_middle::middle::stability::EvalResult;
+use rustc_middle::ty::error::TypeErrorToStringExt;
+use rustc_middle::ty::fold::{BottomUpFolder, fold_regions};
+use rustc_middle::ty::layout::{LayoutError, MAX_SIMD_LANES};
+use rustc_middle::ty::util::{Discr, IntTypeExt};
+use rustc_middle::ty::{
+    AdtDef, GenericArgKind, RegionKind, TypeSuperVisitable, TypeVisitable, TypeVisitableExt,
+};
+use rustc_session::lint::builtin::UNINHABITED_STATIC;
+use rustc_trait_selection::error_reporting::InferCtxtErrorExt;
+use rustc_trait_selection::error_reporting::traits::on_unimplemented::OnUnimplementedDirective;
+use rustc_trait_selection::traits;
+use rustc_trait_selection::traits::query::evaluate_obligation::InferCtxtExt;
+use rustc_type_ir::fold::TypeFoldable;
+use tracing::{debug, instrument};
+use ty::TypingMode;
+use {rustc_attr_parsing as attr, rustc_hir as hir};
 
-    // This ABI is only allowed on function pointers
-    if abi == Abi::CCmseNonSecureCall {
-        struct_span_err!(
-            tcx.sess,
+use super::compare_impl_item::check_type_bounds;
+use super::*;
+
+pub fn check_abi(tcx: TyCtxt<'_>, span: Span, abi: ExternAbi) {
+    if !tcx.sess.target.is_abi_supported(abi) {
+        struct_span_code_err!(
+            tcx.dcx(),
             span,
-            E0781,
-            "the `\"C-cmse-nonsecure-call\"` ABI is only allowed on function pointers"
+            E0570,
+            "`{abi}` is not a supported ABI for the current target",
         )
         .emit();
+    }
+}
+
+pub fn check_abi_fn_ptr(tcx: TyCtxt<'_>, hir_id: hir::HirId, span: Span, abi: ExternAbi) {
+    if !tcx.sess.target.is_abi_supported(abi) {
+        tcx.node_span_lint(UNSUPPORTED_FN_PTR_CALLING_CONVENTIONS, hir_id, span, |lint| {
+            lint.primary_message(format!(
+                "the calling convention {abi} is not supported on this target"
+            ));
+        });
     }
 }
 
@@ -75,136 +68,146 @@ fn check_struct(tcx: TyCtxt<'_>, def_id: LocalDefId) {
         check_simd(tcx, span, def_id);
     }
 
-    check_transparent(tcx, span, def);
+    check_transparent(tcx, def);
     check_packed(tcx, span, def);
+    check_unsafe_fields(tcx, def_id);
 }
 
 fn check_union(tcx: TyCtxt<'_>, def_id: LocalDefId) {
     let def = tcx.adt_def(def_id);
     let span = tcx.def_span(def_id);
     def.destructor(tcx); // force the destructor to be evaluated
-    check_transparent(tcx, span, def);
+    check_transparent(tcx, def);
     check_union_fields(tcx, span, def_id);
     check_packed(tcx, span, def);
 }
 
+fn allowed_union_or_unsafe_field<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    ty: Ty<'tcx>,
+    typing_env: ty::TypingEnv<'tcx>,
+    span: Span,
+) -> bool {
+    // HACK (not that bad of a hack don't worry): Some codegen tests don't even define proper
+    // impls for `Copy`. Let's short-circuit here for this validity check, since a lot of them
+    // use unions. We should eventually fix all the tests to define that lang item or use
+    // minicore stubs.
+    if ty.is_trivially_pure_clone_copy() {
+        return true;
+    }
+    // If `BikeshedGuaranteedNoDrop` is not defined in a `#[no_core]` test, fall back to `Copy`.
+    // This is an underapproximation of `BikeshedGuaranteedNoDrop`,
+    let def_id = tcx
+        .lang_items()
+        .get(LangItem::BikeshedGuaranteedNoDrop)
+        .unwrap_or_else(|| tcx.require_lang_item(LangItem::Copy, Some(span)));
+    let Ok(ty) = tcx.try_normalize_erasing_regions(typing_env, ty) else {
+        tcx.dcx().span_delayed_bug(span, "could not normalize field type");
+        return true;
+    };
+    let (infcx, param_env) = tcx.infer_ctxt().build_with_typing_env(typing_env);
+    infcx.predicate_must_hold_modulo_regions(&Obligation::new(
+        tcx,
+        ObligationCause::dummy_with_span(span),
+        param_env,
+        ty::TraitRef::new(tcx, def_id, [ty]),
+    ))
+}
+
 /// Check that the fields of the `union` do not need dropping.
 fn check_union_fields(tcx: TyCtxt<'_>, span: Span, item_def_id: LocalDefId) -> bool {
-    let item_type = tcx.type_of(item_def_id);
-    if let ty::Adt(def, substs) = item_type.kind() {
-        assert!(def.is_union());
+    let def = tcx.adt_def(item_def_id);
+    assert!(def.is_union());
 
-        fn allowed_union_field<'tcx>(
-            ty: Ty<'tcx>,
-            tcx: TyCtxt<'tcx>,
-            param_env: ty::ParamEnv<'tcx>,
-            span: Span,
-        ) -> bool {
-            // We don't just accept all !needs_drop fields, due to semver concerns.
-            match ty.kind() {
-                ty::Ref(..) => true, // references never drop (even mutable refs, which are non-Copy and hence fail the later check)
-                ty::Tuple(tys) => {
-                    // allow tuples of allowed types
-                    tys.iter().all(|ty| allowed_union_field(ty, tcx, param_env, span))
-                }
-                ty::Array(elem, _len) => {
-                    // Like `Copy`, we do *not* special-case length 0.
-                    allowed_union_field(*elem, tcx, param_env, span)
-                }
-                _ => {
-                    // Fallback case: allow `ManuallyDrop` and things that are `Copy`.
-                    ty.ty_adt_def().is_some_and(|adt_def| adt_def.is_manually_drop())
-                        || ty.is_copy_modulo_regions(tcx.at(span), param_env)
-                }
-            }
+    let typing_env = ty::TypingEnv::non_body_analysis(tcx, item_def_id);
+    let args = ty::GenericArgs::identity_for_item(tcx, item_def_id);
+
+    for field in &def.non_enum_variant().fields {
+        if !allowed_union_or_unsafe_field(tcx, field.ty(tcx, args), typing_env, span) {
+            let (field_span, ty_span) = match tcx.hir_get_if_local(field.did) {
+                // We are currently checking the type this field came from, so it must be local.
+                Some(Node::Field(field)) => (field.span, field.ty.span),
+                _ => unreachable!("mir field has to correspond to hir field"),
+            };
+            tcx.dcx().emit_err(errors::InvalidUnionField {
+                field_span,
+                sugg: errors::InvalidUnionFieldSuggestion {
+                    lo: ty_span.shrink_to_lo(),
+                    hi: ty_span.shrink_to_hi(),
+                },
+                note: (),
+            });
+            return false;
         }
-
-        let param_env = tcx.param_env(item_def_id);
-        for field in &def.non_enum_variant().fields {
-            let field_ty = field.ty(tcx, substs);
-
-            if !allowed_union_field(field_ty, tcx, param_env, span) {
-                let (field_span, ty_span) = match tcx.hir().get_if_local(field.did) {
-                    // We are currently checking the type this field came from, so it must be local.
-                    Some(Node::Field(field)) => (field.span, field.ty.span),
-                    _ => unreachable!("mir field has to correspond to hir field"),
-                };
-                struct_span_err!(
-                    tcx.sess,
-                    field_span,
-                    E0740,
-                    "unions cannot contain fields that may need dropping"
-                )
-                .note(
-                    "a type is guaranteed not to need dropping \
-                    when it implements `Copy`, or when it is the special `ManuallyDrop<_>` type",
-                )
-                .multipart_suggestion_verbose(
-                    "when the type does not implement `Copy`, \
-                    wrap it inside a `ManuallyDrop<_>` and ensure it is manually dropped",
-                    vec![
-                        (ty_span.shrink_to_lo(), "std::mem::ManuallyDrop<".into()),
-                        (ty_span.shrink_to_hi(), ">".into()),
-                    ],
-                    Applicability::MaybeIncorrect,
-                )
-                .emit();
-                return false;
-            } else if field_ty.needs_drop(tcx, param_env) {
-                // This should never happen. But we can get here e.g. in case of name resolution errors.
-                tcx.sess.delay_span_bug(span, "we should never accept maybe-dropping union fields");
-            }
-        }
-    } else {
-        span_bug!(span, "unions must be ty::Adt, but got {:?}", item_type.kind());
     }
+
     true
 }
 
+/// Check that the unsafe fields do not need dropping.
+fn check_unsafe_fields(tcx: TyCtxt<'_>, item_def_id: LocalDefId) {
+    let span = tcx.def_span(item_def_id);
+    let def = tcx.adt_def(item_def_id);
+
+    let typing_env = ty::TypingEnv::non_body_analysis(tcx, item_def_id);
+    let args = ty::GenericArgs::identity_for_item(tcx, item_def_id);
+
+    for field in def.all_fields() {
+        if !field.safety.is_unsafe() {
+            continue;
+        }
+
+        if !allowed_union_or_unsafe_field(tcx, field.ty(tcx, args), typing_env, span) {
+            let hir::Node::Field(field) = tcx.hir_node_by_def_id(field.did.expect_local()) else {
+                unreachable!("field has to correspond to hir field")
+            };
+            let ty_span = field.ty.span;
+            tcx.dcx().emit_err(errors::InvalidUnsafeField {
+                field_span: field.span,
+                sugg: errors::InvalidUnsafeFieldSuggestion {
+                    lo: ty_span.shrink_to_lo(),
+                    hi: ty_span.shrink_to_hi(),
+                },
+                note: (),
+            });
+        }
+    }
+}
+
 /// Check that a `static` is inhabited.
-fn check_static_inhabited<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) {
+fn check_static_inhabited(tcx: TyCtxt<'_>, def_id: LocalDefId) {
     // Make sure statics are inhabited.
     // Other parts of the compiler assume that there are no uninhabited places. In principle it
     // would be enough to check this for `extern` statics, as statics with an initializer will
     // have UB during initialization if they are uninhabited, but there also seems to be no good
     // reason to allow any statics to be uninhabited.
-    let ty = tcx.type_of(def_id);
+    let ty = tcx.type_of(def_id).instantiate_identity();
     let span = tcx.def_span(def_id);
-    let layout = match tcx.layout_of(ParamEnv::reveal_all().and(ty)) {
+    let layout = match tcx.layout_of(ty::TypingEnv::fully_monomorphized().as_query_input(ty)) {
         Ok(l) => l,
         // Foreign statics that overflow their allowed size should emit an error
         Err(LayoutError::SizeOverflow(_))
-            if {
-                let node = tcx.hir().get_by_def_id(def_id);
-                matches!(
-                    node,
-                    hir::Node::ForeignItem(hir::ForeignItem {
-                        kind: hir::ForeignItemKind::Static(..),
-                        ..
-                    })
-                )
-            } =>
+            if matches!(tcx.def_kind(def_id), DefKind::Static{ .. }
+                if tcx.def_kind(tcx.local_parent(def_id)) == DefKind::ForeignMod) =>
         {
-            tcx.sess
-                .struct_span_err(span, "extern static is too large for the current architecture")
-                .emit();
+            tcx.dcx().emit_err(errors::TooLargeStatic { span });
             return;
         }
         // Generic statics are rejected, but we still reach this case.
         Err(e) => {
-            tcx.sess.delay_span_bug(span, &e.to_string());
+            tcx.dcx().span_delayed_bug(span, format!("{e:?}"));
             return;
         }
     };
-    if layout.abi.is_uninhabited() {
-        tcx.struct_span_lint_hir(
+    if layout.is_uninhabited() {
+        tcx.node_span_lint(
             UNINHABITED_STATIC,
-            tcx.hir().local_def_id_to_hir_id(def_id),
+            tcx.local_def_id_to_hir_id(def_id),
             span,
-            "static of uninhabited type",
             |lint| {
+                lint.primary_message("static of uninhabited type");
                 lint
-                .note("uninhabited statics cannot be initialized, and any access would be an immediate error")
+                .note("uninhabited statics cannot be initialized, and any access would be an immediate error");
             },
         );
     }
@@ -212,12 +215,8 @@ fn check_static_inhabited<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) {
 
 /// Checks that an opaque type does not contain cycles and does not use `Self` or `T::Foo`
 /// projections that would result in "inheriting lifetimes".
-fn check_opaque<'tcx>(tcx: TyCtxt<'tcx>, id: hir::ItemId) {
-    let item = tcx.hir().item(id);
-    let hir::ItemKind::OpaqueTy(hir::OpaqueTy { origin, .. }) = item.kind else {
-        tcx.sess.delay_span_bug(tcx.hir().span(id.hir_id()), "expected opaque item");
-        return;
-    };
+fn check_opaque(tcx: TyCtxt<'_>, def_id: LocalDefId) {
+    let hir::OpaqueTy { origin, .. } = *tcx.hir().expect_opaque_ty(def_id);
 
     // HACK(jynelson): trying to infer the type of `impl trait` breaks documenting
     // `async-std` (and `pub async fn` in general).
@@ -227,176 +226,31 @@ fn check_opaque<'tcx>(tcx: TyCtxt<'tcx>, id: hir::ItemId) {
         return;
     }
 
-    let substs = InternalSubsts::identity_for_item(tcx, item.def_id.to_def_id());
-    let span = tcx.def_span(item.def_id.def_id);
-
-    check_opaque_for_inheriting_lifetimes(tcx, item.def_id.def_id, span);
-    if tcx.type_of(item.def_id.def_id).references_error() {
+    if tcx.type_of(def_id).instantiate_identity().references_error() {
         return;
     }
-    if check_opaque_for_cycles(tcx, item.def_id.def_id, substs, span, &origin).is_err() {
+    if check_opaque_for_cycles(tcx, def_id).is_err() {
         return;
     }
-    check_opaque_meets_bounds(tcx, item.def_id.def_id, substs, span, &origin);
-}
-/// Checks that an opaque type does not use `Self` or `T::Foo` projections that would result
-/// in "inheriting lifetimes".
-#[instrument(level = "debug", skip(tcx, span))]
-pub(super) fn check_opaque_for_inheriting_lifetimes<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    def_id: LocalDefId,
-    span: Span,
-) {
-    let item = tcx.hir().expect_item(def_id);
-    debug!(?item, ?span);
 
-    struct FoundParentLifetime;
-    struct FindParentLifetimeVisitor<'tcx>(&'tcx ty::Generics);
-    impl<'tcx> ty::visit::TypeVisitor<'tcx> for FindParentLifetimeVisitor<'tcx> {
-        type BreakTy = FoundParentLifetime;
-
-        fn visit_region(&mut self, r: ty::Region<'tcx>) -> ControlFlow<Self::BreakTy> {
-            debug!("FindParentLifetimeVisitor: r={:?}", r);
-            if let ty::ReEarlyBound(ty::EarlyBoundRegion { index, .. }) = *r {
-                if index < self.0.parent_count as u32 {
-                    return ControlFlow::Break(FoundParentLifetime);
-                } else {
-                    return ControlFlow::CONTINUE;
-                }
-            }
-
-            r.super_visit_with(self)
-        }
-
-        fn visit_const(&mut self, c: ty::Const<'tcx>) -> ControlFlow<Self::BreakTy> {
-            if let ty::ConstKind::Unevaluated(..) = c.kind() {
-                // FIXME(#72219) We currently don't detect lifetimes within substs
-                // which would violate this check. Even though the particular substitution is not used
-                // within the const, this should still be fixed.
-                return ControlFlow::CONTINUE;
-            }
-            c.super_visit_with(self)
-        }
-    }
-
-    struct ProhibitOpaqueVisitor<'tcx> {
-        tcx: TyCtxt<'tcx>,
-        opaque_identity_ty: Ty<'tcx>,
-        generics: &'tcx ty::Generics,
-        selftys: Vec<(Span, Option<String>)>,
-    }
-
-    impl<'tcx> ty::visit::TypeVisitor<'tcx> for ProhibitOpaqueVisitor<'tcx> {
-        type BreakTy = Ty<'tcx>;
-
-        fn visit_ty(&mut self, t: Ty<'tcx>) -> ControlFlow<Self::BreakTy> {
-            debug!("check_opaque_for_inheriting_lifetimes: (visit_ty) t={:?}", t);
-            if t == self.opaque_identity_ty {
-                ControlFlow::CONTINUE
-            } else {
-                t.super_visit_with(&mut FindParentLifetimeVisitor(self.generics))
-                    .map_break(|FoundParentLifetime| t)
-            }
-        }
-    }
-
-    impl<'tcx> Visitor<'tcx> for ProhibitOpaqueVisitor<'tcx> {
-        type NestedFilter = nested_filter::OnlyBodies;
-
-        fn nested_visit_map(&mut self) -> Self::Map {
-            self.tcx.hir()
-        }
-
-        fn visit_ty(&mut self, arg: &'tcx hir::Ty<'tcx>) {
-            match arg.kind {
-                hir::TyKind::Path(hir::QPath::Resolved(None, path)) => match &path.segments {
-                    [PathSegment { res: Res::SelfTyParam { .. }, .. }] => {
-                        let impl_ty_name = None;
-                        self.selftys.push((path.span, impl_ty_name));
-                    }
-                    [PathSegment { res: Res::SelfTyAlias { alias_to: def_id, .. }, .. }] => {
-                        let impl_ty_name = Some(self.tcx.def_path_str(*def_id));
-                        self.selftys.push((path.span, impl_ty_name));
-                    }
-                    _ => {}
-                },
-                _ => {}
-            }
-            hir::intravisit::walk_ty(self, arg);
-        }
-    }
-
-    if let ItemKind::OpaqueTy(hir::OpaqueTy {
-        origin: hir::OpaqueTyOrigin::AsyncFn(..) | hir::OpaqueTyOrigin::FnReturn(..),
-        ..
-    }) = item.kind
-    {
-        let mut visitor = ProhibitOpaqueVisitor {
-            opaque_identity_ty: tcx.mk_opaque(
-                def_id.to_def_id(),
-                InternalSubsts::identity_for_item(tcx, def_id.to_def_id()),
-            ),
-            generics: tcx.generics_of(def_id),
-            tcx,
-            selftys: vec![],
-        };
-        let prohibit_opaque = tcx
-            .explicit_item_bounds(def_id)
-            .iter()
-            .try_for_each(|(predicate, _)| predicate.visit_with(&mut visitor));
-        debug!(
-            "check_opaque_for_inheriting_lifetimes: prohibit_opaque={:?}, visitor.opaque_identity_ty={:?}, visitor.generics={:?}",
-            prohibit_opaque, visitor.opaque_identity_ty, visitor.generics
-        );
-
-        if let Some(ty) = prohibit_opaque.break_value() {
-            visitor.visit_item(&item);
-            let is_async = match item.kind {
-                ItemKind::OpaqueTy(hir::OpaqueTy { origin, .. }) => {
-                    matches!(origin, hir::OpaqueTyOrigin::AsyncFn(..))
-                }
-                _ => unreachable!(),
-            };
-
-            let mut err = struct_span_err!(
-                tcx.sess,
-                span,
-                E0760,
-                "`{}` return type cannot contain a projection or `Self` that references lifetimes from \
-                 a parent scope",
-                if is_async { "async fn" } else { "impl Trait" },
-            );
-
-            for (span, name) in visitor.selftys {
-                err.span_suggestion(
-                    span,
-                    "consider spelling out the type instead",
-                    name.unwrap_or_else(|| format!("{:?}", ty)),
-                    Applicability::MaybeIncorrect,
-                );
-            }
-            err.emit();
-        }
-    }
+    let _ = check_opaque_meets_bounds(tcx, def_id, origin);
 }
 
 /// Checks that an opaque type does not contain cycles.
 pub(super) fn check_opaque_for_cycles<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: LocalDefId,
-    substs: SubstsRef<'tcx>,
-    span: Span,
-    origin: &hir::OpaqueTyOrigin,
 ) -> Result<(), ErrorGuaranteed> {
-    if tcx.try_expand_impl_trait_type(def_id.to_def_id(), substs).is_err() {
-        let reported = match origin {
-            hir::OpaqueTyOrigin::AsyncFn(..) => async_opaque_type_cycle_error(tcx, span),
-            _ => opaque_type_cycle_error(tcx, def_id, span),
-        };
-        Err(reported)
-    } else {
-        Ok(())
+    let args = GenericArgs::identity_for_item(tcx, def_id);
+
+    // First, try to look at any opaque expansion cycles, considering coroutine fields
+    // (even though these aren't necessarily true errors).
+    if tcx.try_expand_impl_trait_type(def_id.to_def_id(), args).is_err() {
+        let reported = opaque_type_cycle_error(tcx, def_id);
+        return Err(reported);
     }
+
+    Ok(())
 }
 
 /// Check that the concrete type behind `impl Trait` actually implements `Trait`.
@@ -418,45 +272,98 @@ pub(super) fn check_opaque_for_cycles<'tcx>(
 fn check_opaque_meets_bounds<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: LocalDefId,
-    substs: SubstsRef<'tcx>,
-    span: Span,
-    origin: &hir::OpaqueTyOrigin,
-) {
-    let hir_id = tcx.hir().local_def_id_to_hir_id(def_id);
-    let defining_use_anchor = match *origin {
-        hir::OpaqueTyOrigin::FnReturn(did) | hir::OpaqueTyOrigin::AsyncFn(did) => did,
-        hir::OpaqueTyOrigin::TyAlias => def_id,
+    origin: hir::OpaqueTyOrigin<LocalDefId>,
+) -> Result<(), ErrorGuaranteed> {
+    let (span, definition_def_id) =
+        if let Some((span, def_id)) = best_definition_site_of_opaque(tcx, def_id, origin) {
+            (span, Some(def_id))
+        } else {
+            (tcx.def_span(def_id), None)
+        };
+
+    let defining_use_anchor = match origin {
+        hir::OpaqueTyOrigin::FnReturn { parent, .. }
+        | hir::OpaqueTyOrigin::AsyncFn { parent, .. }
+        | hir::OpaqueTyOrigin::TyAlias { parent, .. } => parent,
     };
     let param_env = tcx.param_env(defining_use_anchor);
 
-    let infcx = tcx
-        .infer_ctxt()
-        .with_opaque_type_inference(DefiningAnchor::Bind(defining_use_anchor))
-        .build();
-    let ocx = ObligationCtxt::new(&infcx);
-    let opaque_ty = tcx.mk_opaque(def_id.to_def_id(), substs);
+    // FIXME(#132279): Once `PostBorrowckAnalysis` is supported in the old solver, this branch should be removed.
+    let infcx = tcx.infer_ctxt().build(if tcx.next_trait_solver_globally() {
+        TypingMode::post_borrowck_analysis(tcx, defining_use_anchor)
+    } else {
+        TypingMode::analysis_in_body(tcx, defining_use_anchor)
+    });
+    let ocx = ObligationCtxt::new_with_diagnostics(&infcx);
 
-    // `ReErased` regions appear in the "parent_substs" of closures/generators.
+    let args = match origin {
+        hir::OpaqueTyOrigin::FnReturn { parent, .. }
+        | hir::OpaqueTyOrigin::AsyncFn { parent, .. }
+        | hir::OpaqueTyOrigin::TyAlias { parent, .. } => GenericArgs::identity_for_item(
+            tcx, parent,
+        )
+        .extend_to(tcx, def_id.to_def_id(), |param, _| {
+            tcx.map_opaque_lifetime_to_parent_lifetime(param.def_id.expect_local()).into()
+        }),
+    };
+
+    let opaque_ty = Ty::new_opaque(tcx, def_id.to_def_id(), args);
+
+    // `ReErased` regions appear in the "parent_args" of closures/coroutines.
     // We're ignoring them here and replacing them with fresh region variables.
-    // See tests in ui/type-alias-impl-trait/closure_{parent_substs,wf_outlives}.rs.
+    // See tests in ui/type-alias-impl-trait/closure_{parent_args,wf_outlives}.rs.
     //
     // FIXME: Consider wrapping the hidden type in an existential `Binder` and instantiating it
     // here rather than using ReErased.
-    let hidden_ty = tcx.bound_type_of(def_id.to_def_id()).subst(tcx, substs);
-    let hidden_ty = tcx.fold_regions(hidden_ty, |re, _dbi| match re.kind() {
+    let hidden_ty = tcx.type_of(def_id.to_def_id()).instantiate(tcx, args);
+    let hidden_ty = fold_regions(tcx, hidden_ty, |re, _dbi| match re.kind() {
         ty::ReErased => infcx.next_region_var(RegionVariableOrigin::MiscVariable(span)),
         _ => re,
     });
 
-    let misc_cause = traits::ObligationCause::misc(span, hir_id);
+    // HACK: We eagerly instantiate some bounds to report better errors for them...
+    // This isn't necessary for correctness, since we register these bounds when
+    // equating the opaque below, but we should clean this up in the new solver.
+    for (predicate, pred_span) in
+        tcx.explicit_item_bounds(def_id).iter_instantiated_copied(tcx, args)
+    {
+        let predicate = predicate.fold_with(&mut BottomUpFolder {
+            tcx,
+            ty_op: |ty| if ty == opaque_ty { hidden_ty } else { ty },
+            lt_op: |lt| lt,
+            ct_op: |ct| ct,
+        });
 
-    match infcx.at(&misc_cause, param_env).eq(opaque_ty, hidden_ty) {
-        Ok(infer_ok) => ocx.register_infer_ok_obligations(infer_ok),
-        Err(ty_err) => {
-            tcx.sess.delay_span_bug(
+        ocx.register_obligation(Obligation::new(
+            tcx,
+            ObligationCause::new(
                 span,
-                &format!("could not unify `{hidden_ty}` with revealed type:\n{ty_err}"),
+                def_id,
+                ObligationCauseCode::OpaqueTypeBound(pred_span, definition_def_id),
+            ),
+            param_env,
+            predicate,
+        ));
+    }
+
+    let misc_cause = ObligationCause::misc(span, def_id);
+    // FIXME: We should just register the item bounds here, rather than equating.
+    // FIXME(const_trait_impl): When we do that, please make sure to also register
+    // the `~const` bounds.
+    match ocx.eq(&misc_cause, param_env, opaque_ty, hidden_ty) {
+        Ok(()) => {}
+        Err(ty_err) => {
+            // Some types may be left "stranded" if they can't be reached
+            // from a lowered rustc_middle bound but they're mentioned in the HIR.
+            // This will happen, e.g., when a nested opaque is inside of a non-
+            // existent associated type, like `impl Trait<Missing = impl Trait>`.
+            // See <tests/ui/impl-trait/stranded-opaque.rs>.
+            let ty_err = ty_err.to_string(tcx);
+            let guar = tcx.dcx().span_delayed_bug(
+                span,
+                format!("could not unify `{hidden_ty}` with revealed type:\n{ty_err}"),
             );
+            return Err(guar);
         }
     }
 
@@ -464,96 +371,432 @@ fn check_opaque_meets_bounds<'tcx>(
     // Defining use functions may have more bounds than the opaque type, which is ok, as long as the
     // hidden type is well formed even without those bounds.
     let predicate =
-        ty::Binder::dummy(ty::PredicateKind::WellFormed(hidden_ty.into())).to_predicate(tcx);
-    ocx.register_obligation(Obligation::new(misc_cause, param_env, predicate));
+        ty::Binder::dummy(ty::PredicateKind::Clause(ty::ClauseKind::WellFormed(hidden_ty.into())));
+    ocx.register_obligation(Obligation::new(tcx, misc_cause.clone(), param_env, predicate));
 
     // Check that all obligations are satisfied by the implementation's
     // version.
     let errors = ocx.select_all_or_error();
     if !errors.is_empty() {
-        infcx.err_ctxt().report_fulfillment_errors(&errors, None, false);
+        let guar = infcx.err_ctxt().report_fulfillment_errors(errors);
+        return Err(guar);
     }
-    match origin {
-        // Checked when type checking the function containing them.
-        hir::OpaqueTyOrigin::FnReturn(..) | hir::OpaqueTyOrigin::AsyncFn(..) => {}
-        // Can have different predicates to their defining use
-        hir::OpaqueTyOrigin::TyAlias => {
-            let outlives_environment = OutlivesEnvironment::new(param_env);
-            infcx.check_region_obligations_and_report_errors(
-                defining_use_anchor,
-                &outlives_environment,
-            );
+
+    let wf_tys = ocx.assumed_wf_types_and_report_errors(param_env, defining_use_anchor)?;
+    ocx.resolve_regions_and_report_errors(defining_use_anchor, param_env, wf_tys)?;
+
+    if infcx.next_trait_solver() {
+        Ok(())
+    } else if let hir::OpaqueTyOrigin::FnReturn { .. } | hir::OpaqueTyOrigin::AsyncFn { .. } =
+        origin
+    {
+        // HACK: this should also fall through to the hidden type check below, but the original
+        // implementation had a bug where equivalent lifetimes are not identical. This caused us
+        // to reject existing stable code that is otherwise completely fine. The real fix is to
+        // compare the hidden types via our type equivalence/relation infra instead of doing an
+        // identity check.
+        let _ = infcx.take_opaque_types();
+        Ok(())
+    } else {
+        // Check that any hidden types found during wf checking match the hidden types that `type_of` sees.
+        for (mut key, mut ty) in infcx.take_opaque_types() {
+            ty.ty = infcx.resolve_vars_if_possible(ty.ty);
+            key = infcx.resolve_vars_if_possible(key);
+            sanity_check_found_hidden_type(tcx, key, ty)?;
         }
+        Ok(())
     }
-    // Clean up after ourselves
-    let _ = infcx.inner.borrow_mut().opaque_type_storage.take_opaque_types();
 }
 
-fn check_item_type<'tcx>(tcx: TyCtxt<'tcx>, id: hir::ItemId) {
-    debug!(
-        "check_item_type(it.def_id={:?}, it.name={})",
-        id.def_id,
-        tcx.def_path_str(id.def_id.to_def_id())
-    );
-    let _indenter = indenter();
-    match tcx.def_kind(id.def_id) {
-        DefKind::Static(..) => {
-            tcx.ensure().typeck(id.def_id.def_id);
-            maybe_check_static_with_link_section(tcx, id.def_id.def_id);
-            check_static_inhabited(tcx, id.def_id.def_id);
+fn best_definition_site_of_opaque<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    opaque_def_id: LocalDefId,
+    origin: hir::OpaqueTyOrigin<LocalDefId>,
+) -> Option<(Span, LocalDefId)> {
+    struct TaitConstraintLocator<'tcx> {
+        opaque_def_id: LocalDefId,
+        tcx: TyCtxt<'tcx>,
+    }
+    impl<'tcx> TaitConstraintLocator<'tcx> {
+        fn check(&self, item_def_id: LocalDefId) -> ControlFlow<(Span, LocalDefId)> {
+            if !self.tcx.has_typeck_results(item_def_id) {
+                return ControlFlow::Continue(());
+            }
+
+            if let Some(hidden_ty) =
+                self.tcx.mir_borrowck(item_def_id).concrete_opaque_types.get(&self.opaque_def_id)
+            {
+                ControlFlow::Break((hidden_ty.span, item_def_id))
+            } else {
+                ControlFlow::Continue(())
+            }
+        }
+    }
+    impl<'tcx> intravisit::Visitor<'tcx> for TaitConstraintLocator<'tcx> {
+        type NestedFilter = nested_filter::All;
+        type Result = ControlFlow<(Span, LocalDefId)>;
+        fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
+            self.tcx
+        }
+        fn visit_expr(&mut self, ex: &'tcx hir::Expr<'tcx>) -> Self::Result {
+            if let hir::ExprKind::Closure(closure) = ex.kind {
+                self.check(closure.def_id)?;
+            }
+            intravisit::walk_expr(self, ex)
+        }
+        fn visit_item(&mut self, it: &'tcx hir::Item<'tcx>) -> Self::Result {
+            self.check(it.owner_id.def_id)?;
+            intravisit::walk_item(self, it)
+        }
+        fn visit_impl_item(&mut self, it: &'tcx hir::ImplItem<'tcx>) -> Self::Result {
+            self.check(it.owner_id.def_id)?;
+            intravisit::walk_impl_item(self, it)
+        }
+        fn visit_trait_item(&mut self, it: &'tcx hir::TraitItem<'tcx>) -> Self::Result {
+            self.check(it.owner_id.def_id)?;
+            intravisit::walk_trait_item(self, it)
+        }
+        fn visit_foreign_item(&mut self, it: &'tcx hir::ForeignItem<'tcx>) -> Self::Result {
+            intravisit::walk_foreign_item(self, it)
+        }
+    }
+
+    let mut locator = TaitConstraintLocator { tcx, opaque_def_id };
+    match origin {
+        hir::OpaqueTyOrigin::FnReturn { parent, .. }
+        | hir::OpaqueTyOrigin::AsyncFn { parent, .. } => locator.check(parent).break_value(),
+        hir::OpaqueTyOrigin::TyAlias { parent, in_assoc_ty: true } => {
+            let impl_def_id = tcx.local_parent(parent);
+            for assoc in tcx.associated_items(impl_def_id).in_definition_order() {
+                match assoc.kind {
+                    ty::AssocKind::Const | ty::AssocKind::Fn => {
+                        if let ControlFlow::Break(span) = locator.check(assoc.def_id.expect_local())
+                        {
+                            return Some(span);
+                        }
+                    }
+                    ty::AssocKind::Type => {}
+                }
+            }
+
+            None
+        }
+        hir::OpaqueTyOrigin::TyAlias { in_assoc_ty: false, .. } => {
+            let scope = tcx.hir_get_defining_scope(tcx.local_def_id_to_hir_id(opaque_def_id));
+            let found = if scope == hir::CRATE_HIR_ID {
+                tcx.hir_walk_toplevel_module(&mut locator)
+            } else {
+                match tcx.hir_node(scope) {
+                    Node::Item(it) => locator.visit_item(it),
+                    Node::ImplItem(it) => locator.visit_impl_item(it),
+                    Node::TraitItem(it) => locator.visit_trait_item(it),
+                    Node::ForeignItem(it) => locator.visit_foreign_item(it),
+                    other => bug!("{:?} is not a valid scope for an opaque type item", other),
+                }
+            };
+            found.break_value()
+        }
+    }
+}
+
+fn sanity_check_found_hidden_type<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    key: ty::OpaqueTypeKey<'tcx>,
+    mut ty: ty::OpaqueHiddenType<'tcx>,
+) -> Result<(), ErrorGuaranteed> {
+    if ty.ty.is_ty_var() {
+        // Nothing was actually constrained.
+        return Ok(());
+    }
+    if let ty::Alias(ty::Opaque, alias) = ty.ty.kind() {
+        if alias.def_id == key.def_id.to_def_id() && alias.args == key.args {
+            // Nothing was actually constrained, this is an opaque usage that was
+            // only discovered to be opaque after inference vars resolved.
+            return Ok(());
+        }
+    }
+    let strip_vars = |ty: Ty<'tcx>| {
+        ty.fold_with(&mut BottomUpFolder {
+            tcx,
+            ty_op: |t| t,
+            ct_op: |c| c,
+            lt_op: |l| match l.kind() {
+                RegionKind::ReVar(_) => tcx.lifetimes.re_erased,
+                _ => l,
+            },
+        })
+    };
+    // Closures frequently end up containing erased lifetimes in their final representation.
+    // These correspond to lifetime variables that never got resolved, so we patch this up here.
+    ty.ty = strip_vars(ty.ty);
+    // Get the hidden type.
+    let hidden_ty = tcx.type_of(key.def_id).instantiate(tcx, key.args);
+    let hidden_ty = strip_vars(hidden_ty);
+
+    // If the hidden types differ, emit a type mismatch diagnostic.
+    if hidden_ty == ty.ty {
+        Ok(())
+    } else {
+        let span = tcx.def_span(key.def_id);
+        let other = ty::OpaqueHiddenType { ty: hidden_ty, span };
+        Err(ty.build_mismatch_error(&other, tcx)?.emit())
+    }
+}
+
+/// Check that the opaque's precise captures list is valid (if present).
+/// We check this for regular `impl Trait`s and also RPITITs, even though the latter
+/// are technically GATs.
+///
+/// This function is responsible for:
+/// 1. Checking that all type/const params are mention in the captures list.
+/// 2. Checking that all lifetimes that are implicitly captured are mentioned.
+/// 3. Asserting that all parameters mentioned in the captures list are invariant.
+fn check_opaque_precise_captures<'tcx>(tcx: TyCtxt<'tcx>, opaque_def_id: LocalDefId) {
+    let hir::OpaqueTy { bounds, .. } = *tcx.hir_node_by_def_id(opaque_def_id).expect_opaque_ty();
+    let Some(precise_capturing_args) = bounds.iter().find_map(|bound| match *bound {
+        hir::GenericBound::Use(bounds, ..) => Some(bounds),
+        _ => None,
+    }) else {
+        // No precise capturing args; nothing to validate
+        return;
+    };
+
+    let mut expected_captures = UnordSet::default();
+    let mut shadowed_captures = UnordSet::default();
+    let mut seen_params = UnordMap::default();
+    let mut prev_non_lifetime_param = None;
+    for arg in precise_capturing_args {
+        let (hir_id, ident) = match *arg {
+            hir::PreciseCapturingArg::Param(hir::PreciseCapturingNonLifetimeArg {
+                hir_id,
+                ident,
+                ..
+            }) => {
+                if prev_non_lifetime_param.is_none() {
+                    prev_non_lifetime_param = Some(ident);
+                }
+                (hir_id, ident)
+            }
+            hir::PreciseCapturingArg::Lifetime(&hir::Lifetime { hir_id, ident, .. }) => {
+                if let Some(prev_non_lifetime_param) = prev_non_lifetime_param {
+                    tcx.dcx().emit_err(errors::LifetimesMustBeFirst {
+                        lifetime_span: ident.span,
+                        name: ident.name,
+                        other_span: prev_non_lifetime_param.span,
+                    });
+                }
+                (hir_id, ident)
+            }
+        };
+
+        let ident = ident.normalize_to_macros_2_0();
+        if let Some(span) = seen_params.insert(ident, ident.span) {
+            tcx.dcx().emit_err(errors::DuplicatePreciseCapture {
+                name: ident.name,
+                first_span: span,
+                second_span: ident.span,
+            });
+        }
+
+        match tcx.named_bound_var(hir_id) {
+            Some(ResolvedArg::EarlyBound(def_id)) => {
+                expected_captures.insert(def_id.to_def_id());
+
+                // Make sure we allow capturing these lifetimes through `Self` and
+                // `T::Assoc` projection syntax, too. These will occur when we only
+                // see lifetimes are captured after hir-lowering -- this aligns with
+                // the cases that were stabilized with the `impl_trait_projection`
+                // feature -- see <https://github.com/rust-lang/rust/pull/115659>.
+                if let DefKind::LifetimeParam = tcx.def_kind(def_id)
+                    && let Some(def_id) = tcx
+                        .map_opaque_lifetime_to_parent_lifetime(def_id)
+                        .opt_param_def_id(tcx, tcx.parent(opaque_def_id.to_def_id()))
+                {
+                    shadowed_captures.insert(def_id);
+                }
+            }
+            _ => {
+                tcx.dcx().span_delayed_bug(
+                    tcx.hir().span(hir_id),
+                    "parameter should have been resolved",
+                );
+            }
+        }
+    }
+
+    let variances = tcx.variances_of(opaque_def_id);
+    let mut def_id = Some(opaque_def_id.to_def_id());
+    while let Some(generics) = def_id {
+        let generics = tcx.generics_of(generics);
+        def_id = generics.parent;
+
+        for param in &generics.own_params {
+            if expected_captures.contains(&param.def_id) {
+                assert_eq!(
+                    variances[param.index as usize],
+                    ty::Invariant,
+                    "precise captured param should be invariant"
+                );
+                continue;
+            }
+            // If a param is shadowed by a early-bound (duplicated) lifetime, then
+            // it may or may not be captured as invariant, depending on if it shows
+            // up through `Self` or `T::Assoc` syntax.
+            if shadowed_captures.contains(&param.def_id) {
+                continue;
+            }
+
+            match param.kind {
+                ty::GenericParamDefKind::Lifetime => {
+                    let use_span = tcx.def_span(param.def_id);
+                    let opaque_span = tcx.def_span(opaque_def_id);
+                    // Check if the lifetime param was captured but isn't named in the precise captures list.
+                    if variances[param.index as usize] == ty::Invariant {
+                        if let DefKind::OpaqueTy = tcx.def_kind(tcx.parent(param.def_id))
+                            && let Some(def_id) = tcx
+                                .map_opaque_lifetime_to_parent_lifetime(param.def_id.expect_local())
+                                .opt_param_def_id(tcx, tcx.parent(opaque_def_id.to_def_id()))
+                        {
+                            tcx.dcx().emit_err(errors::LifetimeNotCaptured {
+                                opaque_span,
+                                use_span,
+                                param_span: tcx.def_span(def_id),
+                            });
+                        } else {
+                            if tcx.def_kind(tcx.parent(param.def_id)) == DefKind::Trait {
+                                tcx.dcx().emit_err(errors::LifetimeImplicitlyCaptured {
+                                    opaque_span,
+                                    param_span: tcx.def_span(param.def_id),
+                                });
+                            } else {
+                                // If the `use_span` is actually just the param itself, then we must
+                                // have not duplicated the lifetime but captured the original.
+                                // The "effective" `use_span` will be the span of the opaque itself,
+                                // and the param span will be the def span of the param.
+                                tcx.dcx().emit_err(errors::LifetimeNotCaptured {
+                                    opaque_span,
+                                    use_span: opaque_span,
+                                    param_span: use_span,
+                                });
+                            }
+                        }
+                        continue;
+                    }
+                }
+                ty::GenericParamDefKind::Type { .. } => {
+                    if matches!(tcx.def_kind(param.def_id), DefKind::Trait | DefKind::TraitAlias) {
+                        // FIXME(precise_capturing): Structured suggestion for this would be useful
+                        tcx.dcx().emit_err(errors::SelfTyNotCaptured {
+                            trait_span: tcx.def_span(param.def_id),
+                            opaque_span: tcx.def_span(opaque_def_id),
+                        });
+                    } else {
+                        // FIXME(precise_capturing): Structured suggestion for this would be useful
+                        tcx.dcx().emit_err(errors::ParamNotCaptured {
+                            param_span: tcx.def_span(param.def_id),
+                            opaque_span: tcx.def_span(opaque_def_id),
+                            kind: "type",
+                        });
+                    }
+                }
+                ty::GenericParamDefKind::Const { .. } => {
+                    // FIXME(precise_capturing): Structured suggestion for this would be useful
+                    tcx.dcx().emit_err(errors::ParamNotCaptured {
+                        param_span: tcx.def_span(param.def_id),
+                        opaque_span: tcx.def_span(opaque_def_id),
+                        kind: "const",
+                    });
+                }
+            }
+        }
+    }
+}
+
+fn is_enum_of_nonnullable_ptr<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    adt_def: AdtDef<'tcx>,
+    args: GenericArgsRef<'tcx>,
+) -> bool {
+    if adt_def.repr().inhibit_enum_layout_opt() {
+        return false;
+    }
+
+    let [var_one, var_two] = &adt_def.variants().raw[..] else {
+        return false;
+    };
+    let (([], [field]) | ([field], [])) = (&var_one.fields.raw[..], &var_two.fields.raw[..]) else {
+        return false;
+    };
+    matches!(field.ty(tcx, args).kind(), ty::FnPtr(..) | ty::Ref(..))
+}
+
+fn check_static_linkage(tcx: TyCtxt<'_>, def_id: LocalDefId) {
+    if tcx.codegen_fn_attrs(def_id).import_linkage.is_some() {
+        if match tcx.type_of(def_id).instantiate_identity().kind() {
+            ty::RawPtr(_, _) => false,
+            ty::Adt(adt_def, args) => !is_enum_of_nonnullable_ptr(tcx, *adt_def, *args),
+            _ => true,
+        } {
+            tcx.dcx().emit_err(errors::LinkageType { span: tcx.def_span(def_id) });
+        }
+    }
+}
+
+pub(crate) fn check_item_type(tcx: TyCtxt<'_>, def_id: LocalDefId) {
+    match tcx.def_kind(def_id) {
+        DefKind::Static { .. } => {
+            tcx.ensure_ok().typeck(def_id);
+            maybe_check_static_with_link_section(tcx, def_id);
+            check_static_inhabited(tcx, def_id);
+            check_static_linkage(tcx, def_id);
         }
         DefKind::Const => {
-            tcx.ensure().typeck(id.def_id.def_id);
+            tcx.ensure_ok().typeck(def_id);
         }
         DefKind::Enum => {
-            let item = tcx.hir().item(id);
-            let hir::ItemKind::Enum(ref enum_definition, _) = item.kind else {
-                return;
-            };
-            check_enum(tcx, &enum_definition.variants, item.def_id.def_id);
+            check_enum(tcx, def_id);
         }
-        DefKind::Fn => {} // entirely within check_item_body
-        DefKind::Impl => {
-            let it = tcx.hir().item(id);
-            let hir::ItemKind::Impl(ref impl_) = it.kind else {
-                return;
-            };
-            debug!("ItemKind::Impl {} with id {:?}", it.ident, it.def_id);
-            if let Some(impl_trait_ref) = tcx.impl_trait_ref(it.def_id) {
-                check_impl_items_against_trait(
+        DefKind::Fn => {
+            if let Some(i) = tcx.intrinsic(def_id) {
+                intrinsic::check_intrinsic_type(
                     tcx,
-                    it.span,
-                    it.def_id.def_id,
-                    impl_trait_ref,
-                    &impl_.items,
-                );
-                check_on_unimplemented(tcx, it);
+                    def_id,
+                    tcx.def_ident_span(def_id).unwrap(),
+                    i.name,
+                    ExternAbi::Rust,
+                )
+            }
+            // Everything else is checked entirely within check_item_body
+        }
+        DefKind::Impl { of_trait } => {
+            if of_trait && let Some(impl_trait_header) = tcx.impl_trait_header(def_id) {
+                if tcx
+                    .ensure_ok()
+                    .coherent_trait(impl_trait_header.trait_ref.instantiate_identity().def_id)
+                    .is_ok()
+                {
+                    check_impl_items_against_trait(tcx, def_id, impl_trait_header);
+                    check_on_unimplemented(tcx, def_id);
+                }
             }
         }
         DefKind::Trait => {
-            let it = tcx.hir().item(id);
-            let hir::ItemKind::Trait(_, _, _, _, ref items) = it.kind else {
-                return;
-            };
-            check_on_unimplemented(tcx, it);
+            let assoc_items = tcx.associated_items(def_id);
+            check_on_unimplemented(tcx, def_id);
 
-            for item in items.iter() {
-                let item = tcx.hir().trait_item(item.id);
-                match item.kind {
-                    hir::TraitItemKind::Fn(ref sig, _) => {
-                        let abi = sig.header.abi;
-                        fn_maybe_err(tcx, item.ident.span, abi);
+            for &assoc_item in assoc_items.in_definition_order() {
+                match assoc_item.kind {
+                    ty::AssocKind::Fn => {
+                        let abi = tcx.fn_sig(assoc_item.def_id).skip_binder().abi();
+                        forbid_intrinsic_abi(tcx, assoc_item.ident(tcx).span, abi);
                     }
-                    hir::TraitItemKind::Type(.., Some(default)) => {
-                        let assoc_item = tcx.associated_item(item.def_id);
-                        let trait_substs =
-                            InternalSubsts::identity_for_item(tcx, it.def_id.to_def_id());
+                    ty::AssocKind::Type if assoc_item.defaultness(tcx).has_value() => {
+                        let trait_args = GenericArgs::identity_for_item(tcx, def_id);
                         let _: Result<_, rustc_errors::ErrorGuaranteed> = check_type_bounds(
                             tcx,
                             assoc_item,
                             assoc_item,
-                            default.span,
-                            ty::TraitRef { def_id: it.def_id.to_def_id(), substs: trait_substs },
+                            ty::TraitRef::new_from_args(tcx, def_id.to_def_id(), trait_args),
                         );
                     }
                     _ => {}
@@ -561,113 +804,112 @@ fn check_item_type<'tcx>(tcx: TyCtxt<'tcx>, id: hir::ItemId) {
             }
         }
         DefKind::Struct => {
-            check_struct(tcx, id.def_id.def_id);
+            check_struct(tcx, def_id);
         }
         DefKind::Union => {
-            check_union(tcx, id.def_id.def_id);
+            check_union(tcx, def_id);
         }
         DefKind::OpaqueTy => {
-            check_opaque(tcx, id);
-        }
-        DefKind::ImplTraitPlaceholder => {
-            let parent = tcx.impl_trait_in_trait_parent(id.def_id.to_def_id());
-            // Only check the validity of this opaque type if the function has a default body
-            if let hir::Node::TraitItem(hir::TraitItem {
-                kind: hir::TraitItemKind::Fn(_, hir::TraitFn::Provided(_)),
-                ..
-            }) = tcx.hir().get_by_def_id(parent.expect_local())
+            check_opaque_precise_captures(tcx, def_id);
+
+            let origin = tcx.local_opaque_ty_origin(def_id);
+            if let hir::OpaqueTyOrigin::FnReturn { parent: fn_def_id, .. }
+            | hir::OpaqueTyOrigin::AsyncFn { parent: fn_def_id, .. } = origin
+                && let hir::Node::TraitItem(trait_item) = tcx.hir_node_by_def_id(fn_def_id)
+                && let (_, hir::TraitFn::Required(..)) = trait_item.expect_fn()
             {
-                check_opaque(tcx, id);
+                // Skip opaques from RPIT in traits with no default body.
+            } else {
+                check_opaque(tcx, def_id);
             }
         }
         DefKind::TyAlias => {
-            let pty_ty = tcx.type_of(id.def_id);
-            let generics = tcx.generics_of(id.def_id);
-            check_type_params_are_used(tcx, &generics, pty_ty);
+            check_type_alias_type_params_are_used(tcx, def_id);
         }
         DefKind::ForeignMod => {
-            let it = tcx.hir().item(id);
+            let it = tcx.hir().expect_item(def_id);
             let hir::ItemKind::ForeignMod { abi, items } = it.kind else {
                 return;
             };
-            check_abi(tcx, it.hir_id(), it.span, abi);
+            check_abi(tcx, it.span, abi);
 
-            if abi == Abi::RustIntrinsic {
-                for item in items {
-                    let item = tcx.hir().foreign_item(item.id);
-                    intrinsic::check_intrinsic_type(tcx, item);
-                }
-            } else if abi == Abi::PlatformIntrinsic {
-                for item in items {
-                    let item = tcx.hir().foreign_item(item.id);
-                    intrinsic::check_platform_intrinsic_type(tcx, item);
-                }
-            } else {
-                for item in items {
-                    let def_id = item.id.def_id.def_id;
-                    let generics = tcx.generics_of(def_id);
-                    let own_counts = generics.own_counts();
-                    if generics.params.len() - own_counts.lifetimes != 0 {
-                        let (kinds, kinds_pl, egs) = match (own_counts.types, own_counts.consts) {
-                            (_, 0) => ("type", "types", Some("u32")),
-                            // We don't specify an example value, because we can't generate
-                            // a valid value for any type.
-                            (0, _) => ("const", "consts", None),
-                            _ => ("type or const", "types or consts", None),
-                        };
-                        struct_span_err!(
-                            tcx.sess,
+            match abi {
+                ExternAbi::RustIntrinsic => {
+                    for item in items {
+                        intrinsic::check_intrinsic_type(
+                            tcx,
+                            item.id.owner_id.def_id,
                             item.span,
-                            E0044,
-                            "foreign items may not have {kinds} parameters",
-                        )
-                        .span_label(item.span, &format!("can't have {kinds} parameters"))
-                        .help(
-                            // FIXME: once we start storing spans for type arguments, turn this
-                            // into a suggestion.
-                            &format!(
-                                "replace the {} parameters with concrete {}{}",
-                                kinds,
-                                kinds_pl,
-                                egs.map(|egs| format!(" like `{}`", egs)).unwrap_or_default(),
-                            ),
-                        )
-                        .emit();
+                            item.ident.name,
+                            abi,
+                        );
                     }
+                }
 
-                    let item = tcx.hir().foreign_item(item.id);
-                    match item.kind {
-                        hir::ForeignItemKind::Fn(ref fn_decl, _, _) => {
-                            require_c_abi_if_c_variadic(tcx, fn_decl, abi, item.span);
+                _ => {
+                    for item in items {
+                        let def_id = item.id.owner_id.def_id;
+                        let generics = tcx.generics_of(def_id);
+                        let own_counts = generics.own_counts();
+                        if generics.own_params.len() - own_counts.lifetimes != 0 {
+                            let (kinds, kinds_pl, egs) = match (own_counts.types, own_counts.consts)
+                            {
+                                (_, 0) => ("type", "types", Some("u32")),
+                                // We don't specify an example value, because we can't generate
+                                // a valid value for any type.
+                                (0, _) => ("const", "consts", None),
+                                _ => ("type or const", "types or consts", None),
+                            };
+                            struct_span_code_err!(
+                                tcx.dcx(),
+                                item.span,
+                                E0044,
+                                "foreign items may not have {kinds} parameters",
+                            )
+                            .with_span_label(item.span, format!("can't have {kinds} parameters"))
+                            .with_help(
+                                // FIXME: once we start storing spans for type arguments, turn this
+                                // into a suggestion.
+                                format!(
+                                    "replace the {} parameters with concrete {}{}",
+                                    kinds,
+                                    kinds_pl,
+                                    egs.map(|egs| format!(" like `{egs}`")).unwrap_or_default(),
+                                ),
+                            )
+                            .emit();
                         }
-                        hir::ForeignItemKind::Static(..) => {
-                            check_static_inhabited(tcx, def_id);
+
+                        let item = tcx.hir_foreign_item(item.id);
+                        match &item.kind {
+                            hir::ForeignItemKind::Fn(sig, _, _) => {
+                                require_c_abi_if_c_variadic(tcx, sig.decl, abi, item.span);
+                            }
+                            hir::ForeignItemKind::Static(..) => {
+                                check_static_inhabited(tcx, def_id);
+                                check_static_linkage(tcx, def_id);
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
                 }
             }
-        }
-        DefKind::GlobalAsm => {
-            let it = tcx.hir().item(id);
-            let hir::ItemKind::GlobalAsm(asm) = it.kind else { span_bug!(it.span, "DefKind::GlobalAsm but got {:#?}", it) };
-            InlineAsmCtxt::new_global_asm(tcx).check_asm(asm, id.hir_id());
         }
         _ => {}
     }
 }
 
-pub(super) fn check_on_unimplemented(tcx: TyCtxt<'_>, item: &hir::Item<'_>) {
+pub(super) fn check_on_unimplemented(tcx: TyCtxt<'_>, def_id: LocalDefId) {
     // an error would be reported if this fails.
-    let _ = traits::OnUnimplementedDirective::of_item(tcx, item.def_id.to_def_id());
+    let _ = OnUnimplementedDirective::of_item(tcx, def_id.to_def_id());
 }
 
 pub(super) fn check_specialization_validity<'tcx>(
     tcx: TyCtxt<'tcx>,
     trait_def: &ty::TraitDef,
-    trait_item: &ty::AssocItem,
+    trait_item: ty::AssocItem,
     impl_id: DefId,
-    impl_item: &hir::ImplItemRef,
+    impl_item: DefId,
 ) {
     let Ok(ancestors) = trait_def.ancestors(tcx, impl_id) else { return };
     let mut ancestor_impls = ancestors.skip(1).filter_map(|parent| {
@@ -693,7 +935,7 @@ pub(super) fn check_specialization_validity<'tcx>(
             // grandparent. In that case, if parent is a `default impl`, inherited items use the
             // "defaultness" from the grandparent, else they are final.
             None => {
-                if tcx.impl_defaultness(parent_impl.def_id()).is_default() {
+                if tcx.defaultness(parent_impl.def_id()).is_default() {
                     None
                 } else {
                     Some(Err(parent_impl.def_id()))
@@ -707,32 +949,37 @@ pub(super) fn check_specialization_validity<'tcx>(
     let result = opt_result.unwrap_or(Ok(()));
 
     if let Err(parent_impl) = result {
-        report_forbidden_specialization(tcx, impl_item, parent_impl);
+        if !tcx.is_impl_trait_in_trait(impl_item) {
+            report_forbidden_specialization(tcx, impl_item, parent_impl);
+        } else {
+            tcx.dcx().delayed_bug(format!("parent item: {parent_impl:?} not marked as default"));
+        }
     }
 }
 
 fn check_impl_items_against_trait<'tcx>(
     tcx: TyCtxt<'tcx>,
-    full_impl_span: Span,
     impl_id: LocalDefId,
-    impl_trait_ref: ty::TraitRef<'tcx>,
-    impl_item_refs: &[hir::ImplItemRef],
+    impl_trait_header: ty::ImplTraitHeader<'tcx>,
 ) {
+    let trait_ref = impl_trait_header.trait_ref.instantiate_identity();
     // If the trait reference itself is erroneous (so the compilation is going
     // to fail), skip checking the items here -- the `impl_item` table in `tcx`
     // isn't populated for such impls.
-    if impl_trait_ref.references_error() {
+    if trait_ref.references_error() {
         return;
     }
 
+    let impl_item_refs = tcx.associated_item_def_ids(impl_id);
+
     // Negative impls are not expected to have any items
-    match tcx.impl_polarity(impl_id) {
+    match impl_trait_header.polarity {
         ty::ImplPolarity::Reservation | ty::ImplPolarity::Positive => {}
         ty::ImplPolarity::Negative => {
             if let [first_item_ref, ..] = impl_item_refs {
-                let first_item_span = tcx.hir().impl_item(first_item_ref.id).span;
-                struct_span_err!(
-                    tcx.sess,
+                let first_item_span = tcx.def_span(first_item_ref);
+                struct_span_code_err!(
+                    tcx.dcx(),
                     first_item_span,
                     E0749,
                     "negative impls cannot have any items"
@@ -743,52 +990,76 @@ fn check_impl_items_against_trait<'tcx>(
         }
     }
 
-    let trait_def = tcx.trait_def(impl_trait_ref.def_id);
+    let trait_def = tcx.trait_def(trait_ref.def_id);
 
-    for impl_item in impl_item_refs {
-        let ty_impl_item = tcx.associated_item(impl_item.id.def_id);
+    let infcx = tcx.infer_ctxt().ignoring_regions().build(TypingMode::non_body_analysis());
+
+    let ocx = ObligationCtxt::new_with_diagnostics(&infcx);
+    let cause = ObligationCause::misc(tcx.def_span(impl_id), impl_id);
+    let param_env = tcx.param_env(impl_id);
+
+    let self_is_guaranteed_unsized = match tcx
+        .struct_tail_raw(
+            trait_ref.self_ty(),
+            |ty| {
+                ocx.structurally_normalize_ty(&cause, param_env, ty).unwrap_or_else(|_| {
+                    Ty::new_error_with_message(
+                        tcx,
+                        tcx.def_span(impl_id),
+                        "struct tail should be computable",
+                    )
+                })
+            },
+            || (),
+        )
+        .kind()
+    {
+        ty::Dynamic(_, _, ty::DynKind::Dyn) | ty::Slice(_) | ty::Str => true,
+        _ => false,
+    };
+
+    for &impl_item in impl_item_refs {
+        let ty_impl_item = tcx.associated_item(impl_item);
         let ty_trait_item = if let Some(trait_item_id) = ty_impl_item.trait_item_def_id {
             tcx.associated_item(trait_item_id)
         } else {
             // Checked in `associated_item`.
-            tcx.sess.delay_span_bug(impl_item.span, "missing associated item in trait");
+            tcx.dcx().span_delayed_bug(tcx.def_span(impl_item), "missing associated item in trait");
             continue;
         };
-        let impl_item_full = tcx.hir().impl_item(impl_item.id);
-        match impl_item_full.kind {
-            hir::ImplItemKind::Const(..) => {
-                let _ = tcx.compare_assoc_const_impl_item_with_trait_item((
-                    impl_item.id.def_id.def_id,
-                    ty_impl_item.trait_item_def_id.unwrap(),
-                ));
+
+        let res = tcx.ensure_ok().compare_impl_item(impl_item.expect_local());
+
+        if res.is_ok() {
+            match ty_impl_item.kind {
+                ty::AssocKind::Fn => {
+                    compare_impl_item::refine::check_refining_return_position_impl_trait_in_trait(
+                        tcx,
+                        ty_impl_item,
+                        ty_trait_item,
+                        tcx.impl_trait_ref(ty_impl_item.container_id(tcx))
+                            .unwrap()
+                            .instantiate_identity(),
+                    );
+                }
+                ty::AssocKind::Const => {}
+                ty::AssocKind::Type => {}
             }
-            hir::ImplItemKind::Fn(..) => {
-                let opt_trait_span = tcx.hir().span_if_local(ty_trait_item.def_id);
-                compare_impl_method(
-                    tcx,
-                    &ty_impl_item,
-                    &ty_trait_item,
-                    impl_trait_ref,
-                    opt_trait_span,
-                );
-            }
-            hir::ImplItemKind::Type(impl_ty) => {
-                let opt_trait_span = tcx.hir().span_if_local(ty_trait_item.def_id);
-                compare_ty_impl(
-                    tcx,
-                    &ty_impl_item,
-                    impl_ty.span,
-                    &ty_trait_item,
-                    impl_trait_ref,
-                    opt_trait_span,
-                );
-            }
+        }
+
+        if self_is_guaranteed_unsized && tcx.generics_require_sized_self(ty_trait_item.def_id) {
+            tcx.emit_node_span_lint(
+                rustc_lint_defs::builtin::DEAD_CODE,
+                tcx.local_def_id_to_hir_id(ty_impl_item.def_id.expect_local()),
+                tcx.def_span(ty_impl_item.def_id),
+                errors::UselessImplItem,
+            )
         }
 
         check_specialization_validity(
             tcx,
             trait_def,
-            &ty_trait_item,
+            ty_trait_item,
             impl_id.to_def_id(),
             impl_item,
         );
@@ -801,21 +1072,27 @@ fn check_impl_items_against_trait<'tcx>(
         let mut must_implement_one_of: Option<&[Ident]> =
             trait_def.must_implement_one_of.as_deref();
 
-        for &trait_item_id in tcx.associated_item_def_ids(impl_trait_ref.def_id) {
-            let is_implemented = ancestors
-                .leaf_def(tcx, trait_item_id)
-                .map_or(false, |node_item| node_item.item.defaultness(tcx).has_value());
+        for &trait_item_id in tcx.associated_item_def_ids(trait_ref.def_id) {
+            let leaf_def = ancestors.leaf_def(tcx, trait_item_id);
 
-            if !is_implemented && tcx.impl_defaultness(impl_id).is_final() {
+            let is_implemented = leaf_def
+                .as_ref()
+                .is_some_and(|node_item| node_item.item.defaultness(tcx).has_value());
+
+            if !is_implemented
+                && tcx.defaultness(impl_id).is_final()
+                // unsized types don't need to implement methods that have `Self: Sized` bounds.
+                && !(self_is_guaranteed_unsized && tcx.generics_require_sized_self(trait_item_id))
+            {
                 missing_items.push(tcx.associated_item(trait_item_id));
             }
 
             // true if this item is specifically implemented in this impl
-            let is_implemented_here = ancestors
-                .leaf_def(tcx, trait_item_id)
-                .map_or(false, |node_item| !node_item.defining_node.is_from_trait());
+            let is_implemented_here =
+                leaf_def.as_ref().is_some_and(|node_item| !node_item.defining_node.is_from_trait());
 
             if !is_implemented_here {
+                let full_impl_span = tcx.hir().span_with_body(tcx.local_def_id_to_hir_id(impl_id));
                 match tcx.eval_default_body_stability(trait_item_id, full_impl_span) {
                     EvalResult::Deny { feature, reason, issue, .. } => default_body_is_unstable(
                         tcx,
@@ -839,16 +1116,46 @@ fn check_impl_items_against_trait<'tcx>(
                     }
                 }
             }
+
+            if let Some(leaf_def) = &leaf_def
+                && !leaf_def.is_final()
+                && let def_id = leaf_def.item.def_id
+                && tcx.impl_method_has_trait_impl_trait_tys(def_id)
+            {
+                let def_kind = tcx.def_kind(def_id);
+                let descr = tcx.def_kind_descr(def_kind, def_id);
+                let (msg, feature) = if tcx.asyncness(def_id).is_async() {
+                    (
+                        format!("async {descr} in trait cannot be specialized"),
+                        "async functions in traits",
+                    )
+                } else {
+                    (
+                        format!(
+                            "{descr} with return-position `impl Trait` in trait cannot be specialized"
+                        ),
+                        "return position `impl Trait` in traits",
+                    )
+                };
+                tcx.dcx()
+                    .struct_span_err(tcx.def_span(def_id), msg)
+                    .with_note(format!(
+                        "specialization behaves in inconsistent and surprising ways with \
+                        {feature}, and for now is disallowed"
+                    ))
+                    .emit();
+            }
         }
 
         if !missing_items.is_empty() {
-            missing_items_err(tcx, tcx.def_span(impl_id), &missing_items, full_impl_span);
+            let full_impl_span = tcx.hir().span_with_body(tcx.local_def_id_to_hir_id(impl_id));
+            missing_items_err(tcx, impl_id, &missing_items, full_impl_span);
         }
 
         if let Some(missing_items) = must_implement_one_of {
             let attr_span = tcx
-                .get_attr(impl_trait_ref.def_id, sym::rustc_must_implement_one_of)
-                .map(|attr| attr.span);
+                .get_attr(trait_ref.def_id, sym::rustc_must_implement_one_of)
+                .map(|attr| attr.span());
 
             missing_items_must_implement_one_of_err(
                 tcx,
@@ -860,36 +1167,49 @@ fn check_impl_items_against_trait<'tcx>(
     }
 }
 
-pub fn check_simd(tcx: TyCtxt<'_>, sp: Span, def_id: LocalDefId) {
-    let t = tcx.type_of(def_id);
-    if let ty::Adt(def, substs) = t.kind()
+fn check_simd(tcx: TyCtxt<'_>, sp: Span, def_id: LocalDefId) {
+    let t = tcx.type_of(def_id).instantiate_identity();
+    if let ty::Adt(def, args) = t.kind()
         && def.is_struct()
     {
         let fields = &def.non_enum_variant().fields;
         if fields.is_empty() {
-            struct_span_err!(tcx.sess, sp, E0075, "SIMD vector cannot be empty").emit();
+            struct_span_code_err!(tcx.dcx(), sp, E0075, "SIMD vector cannot be empty").emit();
             return;
         }
-        let e = fields[0].ty(tcx, substs);
-        if !fields.iter().all(|f| f.ty(tcx, substs) == e) {
-            struct_span_err!(tcx.sess, sp, E0076, "SIMD vector should be homogeneous")
-                .span_label(sp, "SIMD elements must have the same type")
+
+        let array_field = &fields[FieldIdx::ZERO];
+        let array_ty = array_field.ty(tcx, args);
+        let ty::Array(element_ty, len_const) = array_ty.kind() else {
+            struct_span_code_err!(
+                tcx.dcx(),
+                sp,
+                E0076,
+                "SIMD vector's only field must be an array"
+            )
+            .with_span_label(tcx.def_span(array_field.did), "not an array")
+            .emit();
+            return;
+        };
+
+        if let Some(second_field) = fields.get(FieldIdx::from_u32(1)) {
+            struct_span_code_err!(tcx.dcx(), sp, E0075, "SIMD vector cannot have multiple fields")
+                .with_span_label(tcx.def_span(second_field.did), "excess field")
                 .emit();
             return;
         }
 
-        let len = if let ty::Array(_ty, c) = e.kind() {
-            c.try_eval_usize(tcx, tcx.param_env(def.did()))
-        } else {
-            Some(fields.len() as u64)
-        };
-        if let Some(len) = len {
+        // FIXME(repr_simd): This check is nice, but perhaps unnecessary due to the fact
+        // we do not expect users to implement their own `repr(simd)` types. If they could,
+        // this check is easily side-steppable by hiding the const behind normalization.
+        // The consequence is that the error is, in general, only observable post-mono.
+        if let Some(len) = len_const.try_to_target_usize(tcx) {
             if len == 0 {
-                struct_span_err!(tcx.sess, sp, E0075, "SIMD vector cannot be empty").emit();
+                struct_span_code_err!(tcx.dcx(), sp, E0075, "SIMD vector cannot be empty").emit();
                 return;
             } else if len > MAX_SIMD_LANES {
-                struct_span_err!(
-                    tcx.sess,
+                struct_span_code_err!(
+                    tcx.dcx(),
                     sp,
                     E0075,
                     "SIMD vector cannot have more than {MAX_SIMD_LANES} elements",
@@ -902,20 +1222,13 @@ pub fn check_simd(tcx: TyCtxt<'_>, sp: Span, def_id: LocalDefId) {
         // Check that we use types valid for use in the lanes of a SIMD "vector register"
         // These are scalar types which directly match a "machine" type
         // Yes: Integers, floats, "thin" pointers
-        // No: char, "fat" pointers, compound types
-        match e.kind() {
-            ty::Param(_) => (), // pass struct<T>(T, T, T, T) through, let monomorphization catch errors
-            ty::Int(_) | ty::Uint(_) | ty::Float(_) | ty::RawPtr(_) => (), // struct(u8, u8, u8, u8) is ok
-            ty::Array(t, _) if matches!(t.kind(), ty::Param(_)) => (), // pass struct<T>([T; N]) through, let monomorphization catch errors
-            ty::Array(t, _clen)
-                if matches!(
-                    t.kind(),
-                    ty::Int(_) | ty::Uint(_) | ty::Float(_) | ty::RawPtr(_)
-                ) =>
-            { /* struct([f32; 4]) is ok */ }
+        // No: char, "wide" pointers, compound types
+        match element_ty.kind() {
+            ty::Param(_) => (), // pass struct<T>([T; 4]) through, let monomorphization catch errors
+            ty::Int(_) | ty::Uint(_) | ty::Float(_) | ty::RawPtr(_, _) => (), // struct([u8; 4]) is ok
             _ => {
-                struct_span_err!(
-                    tcx.sess,
+                struct_span_code_err!(
+                    tcx.dcx(),
                     sp,
                     E0077,
                     "SIMD vector element type should be a \
@@ -931,69 +1244,66 @@ pub fn check_simd(tcx: TyCtxt<'_>, sp: Span, def_id: LocalDefId) {
 pub(super) fn check_packed(tcx: TyCtxt<'_>, sp: Span, def: ty::AdtDef<'_>) {
     let repr = def.repr();
     if repr.packed() {
-        for attr in tcx.get_attrs(def.did(), sym::repr) {
-            for r in attr::parse_repr_attr(&tcx.sess, attr) {
-                if let attr::ReprPacked(pack) = r
-                && let Some(repr_pack) = repr.pack
-                && pack as u64 != repr_pack.bytes()
-            {
-                        struct_span_err!(
-                            tcx.sess,
-                            sp,
-                            E0634,
-                            "type has conflicting packed representation hints"
-                        )
-                        .emit();
-            }
+        if let Some(reprs) =
+            attr::find_attr!(tcx.get_all_attrs(def.did()), AttributeKind::Repr(r) => r)
+        {
+            for (r, _) in reprs {
+                if let ReprPacked(pack) = r
+                    && let Some(repr_pack) = repr.pack
+                    && pack != &repr_pack
+                {
+                    struct_span_code_err!(
+                        tcx.dcx(),
+                        sp,
+                        E0634,
+                        "type has conflicting packed representation hints"
+                    )
+                    .emit();
+                }
             }
         }
         if repr.align.is_some() {
-            struct_span_err!(
-                tcx.sess,
+            struct_span_code_err!(
+                tcx.dcx(),
                 sp,
                 E0587,
                 "type has conflicting packed and align representation hints"
             )
             .emit();
-        } else {
-            if let Some(def_spans) = check_packed_inner(tcx, def.did(), &mut vec![]) {
-                let mut err = struct_span_err!(
-                    tcx.sess,
-                    sp,
-                    E0588,
-                    "packed type cannot transitively contain a `#[repr(align)]` type"
-                );
+        } else if let Some(def_spans) = check_packed_inner(tcx, def.did(), &mut vec![]) {
+            let mut err = struct_span_code_err!(
+                tcx.dcx(),
+                sp,
+                E0588,
+                "packed type cannot transitively contain a `#[repr(align)]` type"
+            );
 
-                err.span_note(
-                    tcx.def_span(def_spans[0].0),
-                    &format!(
-                        "`{}` has a `#[repr(align)]` attribute",
-                        tcx.item_name(def_spans[0].0)
-                    ),
-                );
+            err.span_note(
+                tcx.def_span(def_spans[0].0),
+                format!("`{}` has a `#[repr(align)]` attribute", tcx.item_name(def_spans[0].0)),
+            );
 
-                if def_spans.len() > 2 {
-                    let mut first = true;
-                    for (adt_def, span) in def_spans.iter().skip(1).rev() {
-                        let ident = tcx.item_name(*adt_def);
-                        err.span_note(
-                            *span,
-                            &if first {
-                                format!(
-                                    "`{}` contains a field of type `{}`",
-                                    tcx.type_of(def.did()),
-                                    ident
-                                )
-                            } else {
-                                format!("...which contains a field of type `{ident}`")
-                            },
-                        );
-                        first = false;
-                    }
+            if def_spans.len() > 2 {
+                let mut first = true;
+                for (adt_def, span) in def_spans.iter().skip(1).rev() {
+                    let ident = tcx.item_name(*adt_def);
+                    err.span_note(
+                        *span,
+                        if first {
+                            format!(
+                                "`{}` contains a field of type `{}`",
+                                tcx.type_of(def.did()).instantiate_identity(),
+                                ident
+                            )
+                        } else {
+                            format!("...which contains a field of type `{ident}`")
+                        },
+                    );
+                    first = false;
                 }
-
-                err.emit();
             }
+
+            err.emit();
         }
     }
 }
@@ -1003,7 +1313,7 @@ pub(super) fn check_packed_inner(
     def_id: DefId,
     stack: &mut Vec<DefId>,
 ) -> Option<Vec<(DefId, Span)>> {
-    if let ty::Adt(def, substs) = tcx.type_of(def_id).kind() {
+    if let ty::Adt(def, args) = tcx.type_of(def_id).instantiate_identity().kind() {
         if def.is_struct() || def.is_union() {
             if def.repr().align.is_some() {
                 return Some(vec![(def.did(), DUMMY_SP)]);
@@ -1011,7 +1321,7 @@ pub(super) fn check_packed_inner(
 
             stack.push(def_id);
             for field in &def.non_enum_variant().fields {
-                if let ty::Adt(def, _) = field.ty(tcx, substs).kind()
+                if let ty::Adt(def, _) = field.ty(tcx, args).kind()
                     && !stack.contains(&def.did())
                     && let Some(mut defs) = check_packed_inner(tcx, def.did(), stack)
                 {
@@ -1026,52 +1336,51 @@ pub(super) fn check_packed_inner(
     None
 }
 
-pub(super) fn check_transparent<'tcx>(tcx: TyCtxt<'tcx>, sp: Span, adt: ty::AdtDef<'tcx>) {
+pub(super) fn check_transparent<'tcx>(tcx: TyCtxt<'tcx>, adt: ty::AdtDef<'tcx>) {
     if !adt.repr().transparent() {
         return;
     }
 
-    if adt.is_union() && !tcx.features().transparent_unions {
+    if adt.is_union() && !tcx.features().transparent_unions() {
         feature_err(
-            &tcx.sess.parse_sess,
+            &tcx.sess,
             sym::transparent_unions,
-            sp,
+            tcx.def_span(adt.did()),
             "transparent unions are unstable",
         )
         .emit();
     }
 
     if adt.variants().len() != 1 {
-        bad_variant_count(tcx, adt, sp, adt.did());
-        if adt.variants().is_empty() {
-            // Don't bother checking the fields. No variants (and thus no fields) exist.
-            return;
-        }
+        bad_variant_count(tcx, adt, tcx.def_span(adt.did()), adt.did());
+        // Don't bother checking the fields.
+        return;
     }
 
-    // For each field, figure out if it's known to be a ZST and align(1), with "known"
-    // respecting #[non_exhaustive] attributes.
+    // For each field, figure out if it's known to have "trivial" layout (i.e., is a 1-ZST), with
+    // "known" respecting #[non_exhaustive] attributes.
     let field_infos = adt.all_fields().map(|field| {
-        let ty = field.ty(tcx, InternalSubsts::identity_for_item(tcx, field.did));
-        let param_env = tcx.param_env(field.did);
-        let layout = tcx.layout_of(param_env.and(ty));
+        let ty = field.ty(tcx, GenericArgs::identity_for_item(tcx, field.did));
+        let typing_env = ty::TypingEnv::non_body_analysis(tcx, field.did);
+        let layout = tcx.layout_of(typing_env.as_query_input(ty));
         // We are currently checking the type this field came from, so it must be local
         let span = tcx.hir().span_if_local(field.did).unwrap();
-        let zst = layout.map_or(false, |layout| layout.is_zst());
-        let align1 = layout.map_or(false, |layout| layout.align.abi.bytes() == 1);
-        if !zst {
-            return (span, zst, align1, None);
+        let trivial = layout.is_ok_and(|layout| layout.is_1zst());
+        if !trivial {
+            return (span, trivial, None);
         }
+        // Even some 1-ZST fields are not allowed though, if they have `non_exhaustive`.
 
         fn check_non_exhaustive<'tcx>(
             tcx: TyCtxt<'tcx>,
             t: Ty<'tcx>,
-        ) -> ControlFlow<(&'static str, DefId, SubstsRef<'tcx>, bool)> {
+        ) -> ControlFlow<(&'static str, DefId, GenericArgsRef<'tcx>, bool)> {
             match t.kind() {
                 ty::Tuple(list) => list.iter().try_for_each(|t| check_non_exhaustive(tcx, t)),
                 ty::Array(ty, _) => check_non_exhaustive(tcx, *ty),
-                ty::Adt(def, subst) => {
-                    if !def.did().is_local() {
+                ty::Adt(def, args) => {
+                    if !def.did().is_local() && !tcx.has_attr(def.did(), sym::rustc_pub_transparent)
+                    {
                         let non_exhaustive = def.is_variant_list_non_exhaustive()
                             || def
                                 .variants()
@@ -1082,172 +1391,189 @@ pub(super) fn check_transparent<'tcx>(tcx: TyCtxt<'tcx>, sp: Span, adt: ty::AdtD
                             return ControlFlow::Break((
                                 def.descr(),
                                 def.did(),
-                                subst,
+                                args,
                                 non_exhaustive,
                             ));
                         }
                     }
                     def.all_fields()
-                        .map(|field| field.ty(tcx, subst))
+                        .map(|field| field.ty(tcx, args))
                         .try_for_each(|t| check_non_exhaustive(tcx, t))
                 }
                 _ => ControlFlow::Continue(()),
             }
         }
 
-        (span, zst, align1, check_non_exhaustive(tcx, ty).break_value())
+        (span, trivial, check_non_exhaustive(tcx, ty).break_value())
     });
 
-    let non_zst_fields = field_infos
+    let non_trivial_fields = field_infos
         .clone()
-        .filter_map(|(span, zst, _align1, _non_exhaustive)| if !zst { Some(span) } else { None });
-    let non_zst_count = non_zst_fields.clone().count();
-    if non_zst_count >= 2 {
-        bad_non_zero_sized_fields(tcx, adt, non_zst_count, non_zst_fields, sp);
+        .filter_map(|(span, trivial, _non_exhaustive)| if !trivial { Some(span) } else { None });
+    let non_trivial_count = non_trivial_fields.clone().count();
+    if non_trivial_count >= 2 {
+        bad_non_zero_sized_fields(
+            tcx,
+            adt,
+            non_trivial_count,
+            non_trivial_fields,
+            tcx.def_span(adt.did()),
+        );
+        return;
     }
-    let incompatible_zst_fields =
-        field_infos.clone().filter(|(_, _, _, opt)| opt.is_some()).count();
-    let incompat = incompatible_zst_fields + non_zst_count >= 2 && non_zst_count < 2;
-    for (span, zst, align1, non_exhaustive) in field_infos {
-        if zst && !align1 {
-            struct_span_err!(
-                tcx.sess,
-                span,
-                E0691,
-                "zero-sized field in transparent {} has alignment larger than 1",
-                adt.descr(),
-            )
-            .span_label(span, "has alignment larger than 1")
-            .emit();
-        }
-        if incompat && let Some((descr, def_id, substs, non_exhaustive)) = non_exhaustive {
-            tcx.struct_span_lint_hir(
-                REPR_TRANSPARENT_EXTERNAL_PRIVATE_FIELDS,
-                tcx.hir().local_def_id_to_hir_id(adt.did().expect_local()),
-                span,
-                "zero-sized fields in `repr(transparent)` cannot contain external non-exhaustive types",
-                |lint| {
-                    let note = if non_exhaustive {
-                        "is marked with `#[non_exhaustive]`"
-                    } else {
-                        "contains private fields"
-                    };
-                    let field_ty = tcx.def_path_str_with_substs(def_id, substs);
-                    lint
-                        .note(format!("this {descr} contains `{field_ty}`, which {note}, \
-                            and makes it not a breaking change to become non-zero-sized in the future."))
-                },
-            )
+    let mut prev_non_exhaustive_1zst = false;
+    for (span, _trivial, non_exhaustive_1zst) in field_infos {
+        if let Some((descr, def_id, args, non_exhaustive)) = non_exhaustive_1zst {
+            // If there are any non-trivial fields, then there can be no non-exhaustive 1-zsts.
+            // Otherwise, it's only an issue if there's >1 non-exhaustive 1-zst.
+            if non_trivial_count > 0 || prev_non_exhaustive_1zst {
+                tcx.node_span_lint(
+                    REPR_TRANSPARENT_EXTERNAL_PRIVATE_FIELDS,
+                    tcx.local_def_id_to_hir_id(adt.did().expect_local()),
+                    span,
+                    |lint| {
+                        lint.primary_message(
+                            "zero-sized fields in `repr(transparent)` cannot \
+                             contain external non-exhaustive types",
+                        );
+                        let note = if non_exhaustive {
+                            "is marked with `#[non_exhaustive]`"
+                        } else {
+                            "contains private fields"
+                        };
+                        let field_ty = tcx.def_path_str_with_args(def_id, args);
+                        lint.note(format!(
+                            "this {descr} contains `{field_ty}`, which {note}, \
+                                and makes it not a breaking change to become \
+                                non-zero-sized in the future."
+                        ));
+                    },
+                )
+            } else {
+                prev_non_exhaustive_1zst = true;
+            }
         }
     }
 }
 
 #[allow(trivial_numeric_casts)]
-fn check_enum<'tcx>(tcx: TyCtxt<'tcx>, vs: &'tcx [hir::Variant<'tcx>], def_id: LocalDefId) {
+fn check_enum(tcx: TyCtxt<'_>, def_id: LocalDefId) {
     let def = tcx.adt_def(def_id);
-    let sp = tcx.def_span(def_id);
     def.destructor(tcx); // force the destructor to be evaluated
 
-    if vs.is_empty() {
-        if let Some(attr) = tcx.get_attrs(def_id.to_def_id(), sym::repr).next() {
-            struct_span_err!(
-                tcx.sess,
-                attr.span,
-                E0084,
-                "unsupported representation for zero-variant enum"
-            )
-            .span_label(sp, "zero-variant enum")
-            .emit();
-        }
+    if def.variants().is_empty() {
+        attr::find_attr!(
+            tcx.get_all_attrs(def_id),
+            AttributeKind::Repr(rs) => {
+                struct_span_code_err!(
+                    tcx.dcx(),
+                    rs.first().unwrap().1,
+                    E0084,
+                    "unsupported representation for zero-variant enum"
+                )
+                .with_span_label(tcx.def_span(def_id), "zero-variant enum")
+                .emit();
+            }
+        );
     }
 
     let repr_type_ty = def.repr().discr_type().to_ty(tcx);
     if repr_type_ty == tcx.types.i128 || repr_type_ty == tcx.types.u128 {
-        if !tcx.features().repr128 {
+        if !tcx.features().repr128() {
             feature_err(
-                &tcx.sess.parse_sess,
+                &tcx.sess,
                 sym::repr128,
-                sp,
+                tcx.def_span(def_id),
                 "repr with 128-bit type is unstable",
             )
             .emit();
         }
     }
 
-    for v in vs {
-        if let Some(ref e) = v.disr_expr {
-            tcx.ensure().typeck(tcx.hir().local_def_id(e.hir_id));
+    for v in def.variants() {
+        if let ty::VariantDiscr::Explicit(discr_def_id) = v.discr {
+            tcx.ensure_ok().typeck(discr_def_id.expect_local());
         }
     }
 
-    if tcx.adt_def(def_id).repr().int.is_none() {
-        let is_unit = |var: &hir::Variant<'_>| matches!(var.data, hir::VariantData::Unit(..));
+    if def.repr().int.is_none() {
+        let is_unit = |var: &ty::VariantDef| matches!(var.ctor_kind(), Some(CtorKind::Const));
+        let has_disr = |var: &ty::VariantDef| matches!(var.discr, ty::VariantDiscr::Explicit(_));
 
-        let has_disr = |var: &hir::Variant<'_>| var.disr_expr.is_some();
-        let has_non_units = vs.iter().any(|var| !is_unit(var));
-        let disr_units = vs.iter().any(|var| is_unit(&var) && has_disr(&var));
-        let disr_non_unit = vs.iter().any(|var| !is_unit(&var) && has_disr(&var));
+        let has_non_units = def.variants().iter().any(|var| !is_unit(var));
+        let disr_units = def.variants().iter().any(|var| is_unit(var) && has_disr(var));
+        let disr_non_unit = def.variants().iter().any(|var| !is_unit(var) && has_disr(var));
 
         if disr_non_unit || (disr_units && has_non_units) {
-            let mut err =
-                struct_span_err!(tcx.sess, sp, E0732, "`#[repr(inttype)]` must be specified");
-            err.emit();
+            struct_span_code_err!(
+                tcx.dcx(),
+                tcx.def_span(def_id),
+                E0732,
+                "`#[repr(inttype)]` must be specified"
+            )
+            .emit();
         }
     }
 
-    detect_discriminant_duplicate(tcx, def.discriminants(tcx).collect(), vs, sp);
-
-    check_transparent(tcx, sp, def);
+    detect_discriminant_duplicate(tcx, def);
+    check_transparent(tcx, def);
+    check_unsafe_fields(tcx, def_id);
 }
 
 /// Part of enum check. Given the discriminants of an enum, errors if two or more discriminants are equal
-fn detect_discriminant_duplicate<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    mut discrs: Vec<(VariantIdx, Discr<'tcx>)>,
-    vs: &'tcx [hir::Variant<'tcx>],
-    self_span: Span,
-) {
+fn detect_discriminant_duplicate<'tcx>(tcx: TyCtxt<'tcx>, adt: ty::AdtDef<'tcx>) {
     // Helper closure to reduce duplicate code. This gets called everytime we detect a duplicate.
     // Here `idx` refers to the order of which the discriminant appears, and its index in `vs`
-    let report = |dis: Discr<'tcx>, idx: usize, err: &mut Diagnostic| {
-        let var = &vs[idx]; // HIR for the duplicate discriminant
-        let (span, display_discr) = match var.disr_expr {
-            Some(ref expr) => {
+    let report = |dis: Discr<'tcx>, idx, err: &mut Diag<'_>| {
+        let var = adt.variant(idx); // HIR for the duplicate discriminant
+        let (span, display_discr) = match var.discr {
+            ty::VariantDiscr::Explicit(discr_def_id) => {
                 // In the case the discriminant is both a duplicate and overflowed, let the user know
-                if let hir::ExprKind::Lit(lit) = &tcx.hir().body(expr.body).value.kind
+                if let hir::Node::AnonConst(expr) =
+                    tcx.hir_node_by_def_id(discr_def_id.expect_local())
+                    && let hir::ExprKind::Lit(lit) = &tcx.hir_body(expr.body).value.kind
                     && let rustc_ast::LitKind::Int(lit_value, _int_kind) = &lit.node
                     && *lit_value != dis.val
                 {
-                    (tcx.hir().span(expr.hir_id), format!("`{dis}` (overflowed from `{lit_value}`)"))
-                // Otherwise, format the value as-is
+                    (tcx.def_span(discr_def_id), format!("`{dis}` (overflowed from `{lit_value}`)"))
                 } else {
-                    (tcx.hir().span(expr.hir_id), format!("`{dis}`"))
+                    // Otherwise, format the value as-is
+                    (tcx.def_span(discr_def_id), format!("`{dis}`"))
                 }
             }
-            None => {
+            // This should not happen.
+            ty::VariantDiscr::Relative(0) => (tcx.def_span(var.def_id), format!("`{dis}`")),
+            ty::VariantDiscr::Relative(distance_to_explicit) => {
                 // At this point we know this discriminant is a duplicate, and was not explicitly
                 // assigned by the user. Here we iterate backwards to fetch the HIR for the last
                 // explicitly assigned discriminant, and letting the user know that this was the
                 // increment startpoint, and how many steps from there leading to the duplicate
-                if let Some((n, hir::Variant { span, ident, .. })) =
-                    vs[..idx].iter().rev().enumerate().find(|v| v.1.disr_expr.is_some())
+                if let Some(explicit_idx) =
+                    idx.as_u32().checked_sub(distance_to_explicit).map(VariantIdx::from_u32)
                 {
-                    let ve_ident = var.ident;
-                    let n = n + 1;
-                    let sp = if n > 1 { "variants" } else { "variant" };
+                    let explicit_variant = adt.variant(explicit_idx);
+                    let ve_ident = var.name;
+                    let ex_ident = explicit_variant.name;
+                    let sp = if distance_to_explicit > 1 { "variants" } else { "variant" };
 
                     err.span_label(
-                        *span,
-                        format!("discriminant for `{ve_ident}` incremented from this startpoint (`{ident}` + {n} {sp} later => `{ve_ident}` = {dis})"),
+                        tcx.def_span(explicit_variant.def_id),
+                        format!(
+                            "discriminant for `{ve_ident}` incremented from this startpoint \
+                            (`{ex_ident}` + {distance_to_explicit} {sp} later \
+                             => `{ve_ident}` = {dis})"
+                        ),
                     );
                 }
 
-                (vs[idx].span, format!("`{dis}`"))
+                (tcx.def_span(var.def_id), format!("`{dis}`"))
             }
         };
 
         err.span_label(span, format!("{display_discr} assigned here"));
     };
+
+    let mut discrs = adt.discriminants(tcx).collect::<Vec<_>>();
 
     // Here we loop through the discriminants, comparing each discriminant to another.
     // When a duplicate is detected, we instantiate an error and point to both
@@ -1257,29 +1583,29 @@ fn detect_discriminant_duplicate<'tcx>(
     // style as we are mutating `discrs` on the fly).
     let mut i = 0;
     while i < discrs.len() {
-        let hir_var_i_idx = discrs[i].0.index();
-        let mut error: Option<DiagnosticBuilder<'_, _>> = None;
+        let var_i_idx = discrs[i].0;
+        let mut error: Option<Diag<'_, _>> = None;
 
         let mut o = i + 1;
         while o < discrs.len() {
-            let hir_var_o_idx = discrs[o].0.index();
+            let var_o_idx = discrs[o].0;
 
             if discrs[i].1.val == discrs[o].1.val {
                 let err = error.get_or_insert_with(|| {
-                    let mut ret = struct_span_err!(
-                        tcx.sess,
-                        self_span,
+                    let mut ret = struct_span_code_err!(
+                        tcx.dcx(),
+                        tcx.def_span(adt.did()),
                         E0081,
                         "discriminant value `{}` assigned more than once",
                         discrs[i].1,
                     );
 
-                    report(discrs[i].1, hir_var_i_idx, &mut ret);
+                    report(discrs[i].1, var_i_idx, &mut ret);
 
                     ret
                 });
 
-                report(discrs[o].1, hir_var_o_idx, err);
+                report(discrs[o].1, var_o_idx, err);
 
                 // Safe to unwrap here, as we wouldn't reach this point if `discrs` was empty
                 discrs[o] = *discrs.last().unwrap();
@@ -1289,7 +1615,7 @@ fn detect_discriminant_duplicate<'tcx>(
             }
         }
 
-        if let Some(mut e) = error {
+        if let Some(e) = error {
             e.emit();
         }
 
@@ -1297,28 +1623,50 @@ fn detect_discriminant_duplicate<'tcx>(
     }
 }
 
-pub(super) fn check_type_params_are_used<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    generics: &ty::Generics,
-    ty: Ty<'tcx>,
-) {
-    debug!("check_type_params_are_used(generics={:?}, ty={:?})", generics, ty);
+fn check_type_alias_type_params_are_used<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) {
+    if tcx.type_alias_is_lazy(def_id) {
+        // Since we compute the variances for lazy type aliases and already reject bivariant
+        // parameters as unused, we can and should skip this check for lazy type aliases.
+        return;
+    }
 
-    assert_eq!(generics.parent, None);
-
+    let generics = tcx.generics_of(def_id);
     if generics.own_counts().types == 0 {
         return;
     }
 
-    let mut params_used = BitSet::new_empty(generics.params.len());
-
+    let ty = tcx.type_of(def_id).instantiate_identity();
     if ty.references_error() {
-        // If there is already another error, do not emit
-        // an error for not using a type parameter.
-        assert!(tcx.sess.has_errors().is_some());
+        // If there is already another error, do not emit an error for not using a type parameter.
         return;
     }
 
+    // Lazily calculated because it is only needed in case of an error.
+    let bounded_params = LazyCell::new(|| {
+        tcx.explicit_predicates_of(def_id)
+            .predicates
+            .iter()
+            .filter_map(|(predicate, span)| {
+                let bounded_ty = match predicate.kind().skip_binder() {
+                    ty::ClauseKind::Trait(pred) => pred.trait_ref.self_ty(),
+                    ty::ClauseKind::TypeOutlives(pred) => pred.0,
+                    _ => return None,
+                };
+                if let ty::Param(param) = bounded_ty.kind() {
+                    Some((param.index, span))
+                } else {
+                    None
+                }
+            })
+            // FIXME: This assumes that elaborated `Sized` bounds come first (which does hold at the
+            // time of writing). This is a bit fragile since we later use the span to detect elaborated
+            // `Sized` bounds. If they came last for example, this would break `Trait + /*elab*/Sized`
+            // since it would overwrite the span of the user-written bound. This could be fixed by
+            // folding the spans with `Span::to` which requires a bit of effort I think.
+            .collect::<FxIndexMap<_, _>>()
+    });
+
+    let mut params_used = DenseBitSet::new_empty(generics.own_params.len());
     for leaf in ty.walk() {
         if let GenericArgKind::Type(leaf_ty) = leaf.unpack()
             && let ty::Param(param) = leaf_ty.kind()
@@ -1328,39 +1676,32 @@ pub(super) fn check_type_params_are_used<'tcx>(
         }
     }
 
-    for param in &generics.params {
+    for param in &generics.own_params {
         if !params_used.contains(param.index)
             && let ty::GenericParamDefKind::Type { .. } = param.kind
         {
             let span = tcx.def_span(param.def_id);
-            struct_span_err!(
-                tcx.sess,
+            let param_name = Ident::new(param.name, span);
+
+            // The corresponding predicates are post-`Sized`-elaboration. Therefore we
+            // * check for emptiness to detect lone user-written `?Sized` bounds
+            // * compare the param span to the pred span to detect lone user-written `Sized` bounds
+            let has_explicit_bounds = bounded_params.is_empty()
+                || (*bounded_params).get(&param.index).is_some_and(|&&pred_sp| pred_sp != span);
+            let const_param_help = !has_explicit_bounds;
+
+            let mut diag = tcx.dcx().create_err(errors::UnusedGenericParameter {
                 span,
-                E0091,
-                "type parameter `{}` is unused",
-                param.name,
-            )
-            .span_label(span, "unused type parameter")
-            .emit();
+                param_name,
+                param_def_kind: tcx.def_descr(param.def_id),
+                help: errors::UnusedGenericParameterHelp::TyAlias { param_name },
+                usage_spans: vec![],
+                const_param_help,
+            });
+            diag.code(E0091);
+            diag.emit();
         }
     }
-}
-
-pub(super) fn check_mod_item_types(tcx: TyCtxt<'_>, module_def_id: LocalDefId) {
-    let module = tcx.hir_module_items(module_def_id);
-    for id in module.items() {
-        check_item_type(tcx, id);
-    }
-}
-
-fn async_opaque_type_cycle_error(tcx: TyCtxt<'_>, span: Span) -> ErrorGuaranteed {
-    struct_span_err!(tcx.sess, span, E0733, "recursion in an `async fn` requires boxing")
-        .span_label(span, "recursive `async fn`")
-        .note("a recursive `async fn` must be rewritten to return a boxed `dyn Future`")
-        .note(
-            "consider using the `async_recursion` crate: https://crates.io/crates/async_recursion",
-        )
-        .emit()
 }
 
 /// Emit an error for recursive opaque types.
@@ -1371,11 +1712,12 @@ fn async_opaque_type_cycle_error(tcx: TyCtxt<'_>, span: Span) -> ErrorGuaranteed
 ///
 /// If all the return expressions evaluate to `!`, then we explain that the error will go away
 /// after changing it. This can happen when a user uses `panic!()` or similar as a placeholder.
-fn opaque_type_cycle_error(tcx: TyCtxt<'_>, def_id: LocalDefId, span: Span) -> ErrorGuaranteed {
-    let mut err = struct_span_err!(tcx.sess, span, E0720, "cannot resolve opaque type");
+fn opaque_type_cycle_error(tcx: TyCtxt<'_>, opaque_def_id: LocalDefId) -> ErrorGuaranteed {
+    let span = tcx.def_span(opaque_def_id);
+    let mut err = struct_span_code_err!(tcx.dcx(), span, E0720, "cannot resolve opaque type");
 
     let mut label = false;
-    if let Some((def_id, visitor)) = get_owner_return_paths(tcx, def_id) {
+    if let Some((def_id, visitor)) = get_owner_return_paths(tcx, opaque_def_id) {
         let typeck_results = tcx.typeck(def_id);
         if visitor
             .returns
@@ -1411,27 +1753,77 @@ fn opaque_type_cycle_error(tcx: TyCtxt<'_>, def_id: LocalDefId, span: Span) -> E
                 .filter_map(|e| typeck_results.node_type_opt(e.hir_id).map(|t| (e.span, t)))
                 .filter(|(_, ty)| !matches!(ty.kind(), ty::Never))
             {
-                struct OpaqueTypeCollector(Vec<DefId>);
-                impl<'tcx> ty::visit::TypeVisitor<'tcx> for OpaqueTypeCollector {
-                    fn visit_ty(&mut self, t: Ty<'tcx>) -> ControlFlow<Self::BreakTy> {
+                #[derive(Default)]
+                struct OpaqueTypeCollector {
+                    opaques: Vec<DefId>,
+                    closures: Vec<DefId>,
+                }
+                impl<'tcx> ty::visit::TypeVisitor<TyCtxt<'tcx>> for OpaqueTypeCollector {
+                    fn visit_ty(&mut self, t: Ty<'tcx>) {
                         match *t.kind() {
-                            ty::Opaque(def, _) => {
-                                self.0.push(def);
-                                ControlFlow::CONTINUE
+                            ty::Alias(ty::Opaque, ty::AliasTy { def_id: def, .. }) => {
+                                self.opaques.push(def);
+                            }
+                            ty::Closure(def_id, ..) | ty::Coroutine(def_id, ..) => {
+                                self.closures.push(def_id);
+                                t.super_visit_with(self);
                             }
                             _ => t.super_visit_with(self),
                         }
                     }
                 }
-                let mut visitor = OpaqueTypeCollector(vec![]);
+
+                let mut visitor = OpaqueTypeCollector::default();
                 ty.visit_with(&mut visitor);
-                for def_id in visitor.0 {
+                for def_id in visitor.opaques {
                     let ty_span = tcx.def_span(def_id);
                     if !seen.contains(&ty_span) {
-                        err.span_label(ty_span, &format!("returning this opaque type `{ty}`"));
+                        let descr = if ty.is_impl_trait() { "opaque " } else { "" };
+                        err.span_label(ty_span, format!("returning this {descr}type `{ty}`"));
                         seen.insert(ty_span);
                     }
-                    err.span_label(sp, &format!("returning here with type `{ty}`"));
+                    err.span_label(sp, format!("returning here with type `{ty}`"));
+                }
+
+                for closure_def_id in visitor.closures {
+                    let Some(closure_local_did) = closure_def_id.as_local() else {
+                        continue;
+                    };
+                    let typeck_results = tcx.typeck(closure_local_did);
+
+                    let mut label_match = |ty: Ty<'_>, span| {
+                        for arg in ty.walk() {
+                            if let ty::GenericArgKind::Type(ty) = arg.unpack()
+                                && let ty::Alias(
+                                    ty::Opaque,
+                                    ty::AliasTy { def_id: captured_def_id, .. },
+                                ) = *ty.kind()
+                                && captured_def_id == opaque_def_id.to_def_id()
+                            {
+                                err.span_label(
+                                    span,
+                                    format!(
+                                        "{} captures itself here",
+                                        tcx.def_descr(closure_def_id)
+                                    ),
+                                );
+                            }
+                        }
+                    };
+
+                    // Label any closure upvars that capture the opaque
+                    for capture in typeck_results.closure_min_captures_flattened(closure_local_did)
+                    {
+                        label_match(capture.place.ty(), capture.get_path_span(tcx));
+                    }
+                    // Label any coroutine locals that capture the opaque
+                    if tcx.is_coroutine(closure_def_id)
+                        && let Some(coroutine_layout) = tcx.mir_coroutine_witnesses(closure_def_id)
+                    {
+                        for interior_ty in &coroutine_layout.field_tys {
+                            label_match(interior_ty.ty, interior_ty.source_info.span);
+                        }
+                    }
                 }
             }
         }
@@ -1440,4 +1832,52 @@ fn opaque_type_cycle_error(tcx: TyCtxt<'_>, def_id: LocalDefId, span: Span) -> E
         err.span_label(span, "cannot resolve opaque type");
     }
     err.emit()
+}
+
+pub(super) fn check_coroutine_obligations(
+    tcx: TyCtxt<'_>,
+    def_id: LocalDefId,
+) -> Result<(), ErrorGuaranteed> {
+    debug_assert!(!tcx.is_typeck_child(def_id.to_def_id()));
+
+    let typeck_results = tcx.typeck(def_id);
+    let param_env = tcx.param_env(def_id);
+
+    debug!(?typeck_results.coroutine_stalled_predicates);
+
+    let mode = if tcx.next_trait_solver_globally() {
+        TypingMode::post_borrowck_analysis(tcx, def_id)
+    } else {
+        TypingMode::analysis_in_body(tcx, def_id)
+    };
+
+    let infcx = tcx
+        .infer_ctxt()
+        // typeck writeback gives us predicates with their regions erased.
+        // As borrowck already has checked lifetimes, we do not need to do it again.
+        .ignoring_regions()
+        .build(mode);
+
+    let ocx = ObligationCtxt::new_with_diagnostics(&infcx);
+    for (predicate, cause) in &typeck_results.coroutine_stalled_predicates {
+        ocx.register_obligation(Obligation::new(tcx, cause.clone(), param_env, *predicate));
+    }
+
+    let errors = ocx.select_all_or_error();
+    debug!(?errors);
+    if !errors.is_empty() {
+        return Err(infcx.err_ctxt().report_fulfillment_errors(errors));
+    }
+
+    if !tcx.next_trait_solver_globally() {
+        // Check that any hidden types found when checking these stalled coroutine obligations
+        // are valid.
+        for (key, ty) in infcx.take_opaque_types() {
+            let hidden_type = infcx.resolve_vars_if_possible(ty);
+            let key = infcx.resolve_vars_if_possible(key);
+            sanity_check_found_hidden_type(tcx, key, hidden_type)?;
+        }
+    }
+
+    Ok(())
 }

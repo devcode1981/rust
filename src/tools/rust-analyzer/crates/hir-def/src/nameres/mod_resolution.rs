@@ -1,13 +1,12 @@
 //! This module resolves `mod foo;` declaration to file.
 use arrayvec::ArrayVec;
-use base_db::{AnchoredPath, FileId};
-use hir_expand::name::Name;
-use limit::Limit;
-use syntax::SmolStr;
+use base_db::AnchoredPath;
+use hir_expand::{name::Name, HirFileIdExt};
+use span::EditionedFileId;
 
 use crate::{db::DefDatabase, HirFileId};
 
-const MOD_DEPTH_LIMIT: Limit = Limit::new(32);
+const MOD_DEPTH_LIMIT: usize = 32;
 
 #[derive(Clone, Debug)]
 pub(super) struct ModDir {
@@ -29,12 +28,12 @@ impl ModDir {
     pub(super) fn descend_into_definition(
         &self,
         name: &Name,
-        attr_path: Option<&SmolStr>,
+        attr_path: Option<&str>,
     ) -> Option<ModDir> {
-        let path = match attr_path.map(SmolStr::as_str) {
+        let path = match attr_path {
             None => {
                 let mut path = self.dir_path.clone();
-                path.push(&name.to_smol_str());
+                path.push(name.as_str());
                 path
             }
             Some(attr_path) => {
@@ -50,7 +49,7 @@ impl ModDir {
 
     fn child(&self, dir_path: DirPath, root_non_dir_owner: bool) -> Option<ModDir> {
         let depth = self.depth + 1;
-        if MOD_DEPTH_LIMIT.check(depth as usize).is_err() {
+        if depth as usize > MOD_DEPTH_LIMIT {
             tracing::error!("MOD_DEPTH_LIMIT exceeded");
             cov_mark::hit!(circular_mods);
             return None;
@@ -63,19 +62,14 @@ impl ModDir {
         db: &dyn DefDatabase,
         file_id: HirFileId,
         name: &Name,
-        attr_path: Option<&SmolStr>,
-    ) -> Result<(FileId, bool, ModDir), Box<[String]>> {
-        let name = name.unescaped();
-        let orig_file_id = file_id.original_file(db.upcast());
+        attr_path: Option<&str>,
+    ) -> Result<(EditionedFileId, bool, ModDir), Box<[String]>> {
+        let name = name.as_str();
 
         let mut candidate_files = ArrayVec::<_, 2>::new();
         match attr_path {
             Some(attr_path) => {
                 candidate_files.push(self.dir_path.join_attr(attr_path, self.root_non_dir_owner))
-            }
-            None if file_id.is_include_macro(db.upcast()) => {
-                candidate_files.push(format!("{}.rs", name));
-                candidate_files.push(format!("{}/mod.rs", name));
             }
             None => {
                 candidate_files.push(format!("{}{}.rs", self.dir_path.0, name));
@@ -83,18 +77,25 @@ impl ModDir {
             }
         };
 
+        let orig_file_id = file_id.original_file_respecting_includes(db.upcast());
         for candidate in candidate_files.iter() {
-            let path = AnchoredPath { anchor: orig_file_id, path: candidate.as_str() };
+            let path = AnchoredPath { anchor: orig_file_id.file_id(), path: candidate.as_str() };
             if let Some(file_id) = db.resolve_path(path) {
                 let is_mod_rs = candidate.ends_with("/mod.rs");
 
-                let (dir_path, root_non_dir_owner) = if is_mod_rs || attr_path.is_some() {
-                    (DirPath::empty(), false)
+                let root_dir_owner = is_mod_rs || attr_path.is_some();
+                let dir_path = if root_dir_owner {
+                    DirPath::empty()
                 } else {
-                    (DirPath::new(format!("{}/", name)), true)
+                    DirPath::new(format!("{}/", name))
                 };
-                if let Some(mod_dir) = self.child(dir_path, root_non_dir_owner) {
-                    return Ok((file_id, is_mod_rs, mod_dir));
+                if let Some(mod_dir) = self.child(dir_path, !root_dir_owner) {
+                    return Ok((
+                        // FIXME: Edition, is this rightr?
+                        EditionedFileId::new(file_id, orig_file_id.edition()),
+                        is_mod_rs,
+                        mod_dir,
+                    ));
                 }
             }
         }
@@ -133,7 +134,7 @@ impl DirPath {
     /// So this is the case which doesn't really work I think if we try to be
     /// 100% platform agnostic:
     ///
-    /// ```
+    /// ```ignore
     /// mod a {
     ///     #[path="C://sad/face"]
     ///     mod b { mod c; }
@@ -156,7 +157,7 @@ impl DirPath {
         } else {
             attr
         };
-        let res = format!("{}{}", base, attr);
+        let res = format!("{base}{attr}");
         res
     }
 }

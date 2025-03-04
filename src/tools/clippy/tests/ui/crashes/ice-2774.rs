@@ -13,6 +13,8 @@ pub struct Foo;
 #[allow(clippy::implicit_hasher)]
 // This should not cause a "cannot relate bound region" ICE.
 pub fn add_barfoos_to_foos<'a>(bars: &HashSet<&'a Bar>) {
+    //~^ needless_lifetimes
+
     let mut foos = HashSet::new();
     foos.extend(bars.iter().map(|b| &b.foo));
 }

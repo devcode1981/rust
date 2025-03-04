@@ -1,9 +1,8 @@
-use syntax::{
-    ast::{self, edit_in_place::GenericParamsOwnerEdit, make, AstNode},
-    ted,
-};
+use ide_db::syntax_helpers::suggest_name;
+use itertools::Itertools;
+use syntax::ast::{self, syntax_factory::SyntaxFactory, AstNode, HasGenericParams, HasName};
 
-use crate::{utils::suggest_name, AssistContext, AssistId, AssistKind, Assists};
+use crate::{AssistContext, AssistId, AssistKind, Assists};
 
 // Assist: introduce_named_generic
 //
@@ -14,32 +13,51 @@ use crate::{utils::suggest_name, AssistContext, AssistId, AssistKind, Assists};
 // ```
 // ->
 // ```
-// fn foo<B: Bar>(bar: B) {}
+// fn foo<$0B: Bar>(bar: B) {}
 // ```
 pub(crate) fn introduce_named_generic(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
     let impl_trait_type = ctx.find_node_at_offset::<ast::ImplTraitType>()?;
-    let param = impl_trait_type.syntax().parent().and_then(ast::Param::cast)?;
+    let param = impl_trait_type.syntax().ancestors().find_map(ast::Param::cast)?;
     let fn_ = param.syntax().ancestors().find_map(ast::Fn::cast)?;
 
     let type_bound_list = impl_trait_type.type_bound_list()?;
 
+    let make = SyntaxFactory::new();
     let target = fn_.syntax().text_range();
     acc.add(
         AssistId("introduce_named_generic", AssistKind::RefactorRewrite),
         "Replace impl trait with generic",
         target,
-        |edit| {
-            let impl_trait_type = edit.make_mut(impl_trait_type);
-            let fn_ = edit.make_mut(fn_);
+        |builder| {
+            let mut editor = builder.make_editor(fn_.syntax());
 
-            let type_param_name = suggest_name::for_generic_parameter(&impl_trait_type);
+            let existing_names = match fn_.generic_param_list() {
+                Some(generic_param_list) => generic_param_list
+                    .generic_params()
+                    .flat_map(|param| match param {
+                        ast::GenericParam::TypeParam(t) => t.name().map(|name| name.to_string()),
+                        p => Some(p.to_string()),
+                    })
+                    .collect_vec(),
+                None => Vec::new(),
+            };
+            let type_param_name = suggest_name::NameGenerator::new_with_names(
+                existing_names.iter().map(|s| s.as_str()),
+            )
+            .for_impl_trait_as_generic(&impl_trait_type);
 
-            let type_param = make::type_param(make::name(&type_param_name), Some(type_bound_list))
-                .clone_for_update();
-            let new_ty = make::ty(&type_param_name).clone_for_update();
+            let type_param = make.type_param(make.name(&type_param_name), Some(type_bound_list));
+            let new_ty = make.ty(&type_param_name);
 
-            ted::replace(impl_trait_type.syntax(), new_ty.syntax());
-            fn_.get_or_create_generic_param_list().add_generic_param(type_param.into())
+            editor.replace(impl_trait_type.syntax(), new_ty.syntax());
+            editor.add_generic_param(&fn_, type_param.clone().into());
+
+            if let Some(cap) = ctx.config.snippet_cap {
+                editor.add_annotation(type_param.syntax(), builder.make_tabstop_before(cap));
+            }
+
+            editor.add_mappings(make.finish_with_mappings());
+            builder.add_file_edits(ctx.file_id(), editor);
         },
     )
 }
@@ -55,7 +73,7 @@ mod tests {
         check_assist(
             introduce_named_generic,
             r#"fn foo<G>(bar: $0impl Bar) {}"#,
-            r#"fn foo<G, B: Bar>(bar: B) {}"#,
+            r#"fn foo<G, $0B: Bar>(bar: B) {}"#,
         );
     }
 
@@ -64,7 +82,7 @@ mod tests {
         check_assist(
             introduce_named_generic,
             r#"fn foo(bar: $0impl Bar) {}"#,
-            r#"fn foo<B: Bar>(bar: B) {}"#,
+            r#"fn foo<$0B: Bar>(bar: B) {}"#,
         );
     }
 
@@ -73,7 +91,7 @@ mod tests {
         check_assist(
             introduce_named_generic,
             r#"fn foo<G>(foo: impl Foo, bar: $0impl Bar) {}"#,
-            r#"fn foo<G, B: Bar>(foo: impl Foo, bar: B) {}"#,
+            r#"fn foo<G, $0B: Bar>(foo: impl Foo, bar: B) {}"#,
         );
     }
 
@@ -82,7 +100,7 @@ mod tests {
         check_assist(
             introduce_named_generic,
             r#"fn foo<>(bar: $0impl Bar) {}"#,
-            r#"fn foo<B: Bar>(bar: B) {}"#,
+            r#"fn foo<$0B: Bar>(bar: B) {}"#,
         );
     }
 
@@ -95,7 +113,7 @@ fn foo<
 >(bar: $0impl Bar) {}
 "#,
             r#"
-fn foo<B: Bar
+fn foo<$0B: Bar
 >(bar: B) {}
 "#,
         );
@@ -103,12 +121,19 @@ fn foo<B: Bar
 
     #[test]
     fn replace_impl_trait_with_exist_generic_letter() {
-        // FIXME: This is wrong, we should pick a different name if the one we
-        // want is already bound.
         check_assist(
             introduce_named_generic,
             r#"fn foo<B>(bar: $0impl Bar) {}"#,
-            r#"fn foo<B, B: Bar>(bar: B) {}"#,
+            r#"fn foo<B, $0B1: Bar>(bar: B1) {}"#,
+        );
+    }
+
+    #[test]
+    fn replace_impl_trait_with_more_exist_generic_letter() {
+        check_assist(
+            introduce_named_generic,
+            r#"fn foo<B, B0, B1, B3>(bar: $0impl Bar) {}"#,
+            r#"fn foo<B, B0, B1, B3, $0B4: Bar>(bar: B4) {}"#,
         );
     }
 
@@ -127,7 +152,7 @@ fn foo<
 fn foo<
     G: Foo,
     F,
-    H, B: Bar,
+    H, $0B: Bar,
 >(bar: B) {}
 "#,
         );
@@ -138,7 +163,25 @@ fn foo<
         check_assist(
             introduce_named_generic,
             r#"fn foo(bar: $0impl Foo + Bar) {}"#,
-            r#"fn foo<F: Foo + Bar>(bar: F) {}"#,
+            r#"fn foo<$0F: Foo + Bar>(bar: F) {}"#,
+        );
+    }
+
+    #[test]
+    fn replace_impl_with_mut() {
+        check_assist(
+            introduce_named_generic,
+            r#"fn f(iter: &mut $0impl Iterator<Item = i32>) {}"#,
+            r#"fn f<$0I: Iterator<Item = i32>>(iter: &mut I) {}"#,
+        );
+    }
+
+    #[test]
+    fn replace_impl_inside() {
+        check_assist(
+            introduce_named_generic,
+            r#"fn f(x: &mut Vec<$0impl Iterator<Item = i32>>) {}"#,
+            r#"fn f<$0I: Iterator<Item = i32>>(x: &mut Vec<I>) {}"#,
         );
     }
 }

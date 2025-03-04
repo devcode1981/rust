@@ -1,15 +1,21 @@
-use crate::dep_graph::DepContext;
-use crate::query::QueryInfo;
+use rustc_span::ErrorGuaranteed;
 
-pub trait Value<CTX: DepContext>: Sized {
-    fn from_cycle_error(tcx: CTX, cycle: &[QueryInfo]) -> Self;
+use crate::dep_graph::DepContext;
+use crate::query::CycleError;
+
+pub trait Value<Tcx: DepContext>: Sized {
+    fn from_cycle_error(tcx: Tcx, cycle_error: &CycleError, guar: ErrorGuaranteed) -> Self;
 }
 
-impl<CTX: DepContext, T> Value<CTX> for T {
-    default fn from_cycle_error(tcx: CTX, _: &[QueryInfo]) -> T {
-        tcx.sess().abort_if_errors();
+impl<Tcx: DepContext, T> Value<Tcx> for T {
+    default fn from_cycle_error(tcx: Tcx, cycle_error: &CycleError, _guar: ErrorGuaranteed) -> T {
+        tcx.sess().dcx().abort_if_errors();
         // Ideally we would use `bug!` here. But bug! is only defined in rustc_middle, and it's
         // non-trivial to define it earlier.
-        panic!("Value::from_cycle_error called without errors");
+        panic!(
+            "<{} as Value>::from_cycle_error called without errors: {:#?}",
+            std::any::type_name::<T>(),
+            cycle_error.cycle,
+        );
     }
 }

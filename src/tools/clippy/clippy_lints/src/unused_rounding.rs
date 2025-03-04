@@ -1,8 +1,9 @@
 use clippy_utils::diagnostics::span_lint_and_sugg;
-use rustc_ast::ast::{Expr, ExprKind, LitFloatType, LitKind};
+use clippy_utils::source::snippet;
+use rustc_ast::ast::{Expr, ExprKind, MethodCall};
 use rustc_errors::Applicability;
 use rustc_lint::{EarlyContext, EarlyLintPass};
-use rustc_session::{declare_lint_pass, declare_tool_lint};
+use rustc_session::declare_lint_pass;
 
 declare_clippy_lint! {
     /// ### What it does
@@ -15,11 +16,11 @@ declare_clippy_lint! {
     /// This is unnecessary and confusing to the reader. Doing this is probably a mistake.
     ///
     /// ### Example
-    /// ```rust
+    /// ```no_run
     /// let x = 1f32.ceil();
     /// ```
     /// Use instead:
-    /// ```rust
+    /// ```no_run
     /// let x = 1f32;
     /// ```
     #[clippy::version = "1.63.0"]
@@ -29,37 +30,33 @@ declare_clippy_lint! {
 }
 declare_lint_pass!(UnusedRounding => [UNUSED_ROUNDING]);
 
-fn is_useless_rounding(expr: &Expr) -> Option<(&str, String)> {
-    if let ExprKind::MethodCall(name_ident, receiver, _, _) = &expr.kind
+fn is_useless_rounding<'a>(cx: &EarlyContext<'_>, expr: &'a Expr) -> Option<(&'a str, String)> {
+    if let ExprKind::MethodCall(box MethodCall {
+        seg: name_ident,
+        receiver,
+        ..
+    }) = &expr.kind
         && let method_name = name_ident.ident.name.as_str()
         && (method_name == "ceil" || method_name == "round" || method_name == "floor")
-        && let ExprKind::Lit(spanned) = &receiver.kind
-        && let LitKind::Float(symbol, ty) = spanned.kind {
-            let f = symbol.as_str().parse::<f64>().unwrap();
-            let f_str = symbol.to_string() + if let LitFloatType::Suffixed(ty) = ty {
-                ty.name_str()
-            } else {
-                ""
-            };
-            if f.fract() == 0.0 {
-                Some((method_name, f_str))
-            } else {
-                None
-            }
-        } else {
-            None
-        }
+        && let ExprKind::Lit(token_lit) = &receiver.kind
+        && token_lit.is_semantic_float()
+        && let Ok(f) = token_lit.symbol.as_str().replace('_', "").parse::<f64>()
+    {
+        (f.fract() == 0.0).then(|| (method_name, snippet(cx, receiver.span, "..").to_string()))
+    } else {
+        None
+    }
 }
 
 impl EarlyLintPass for UnusedRounding {
     fn check_expr(&mut self, cx: &EarlyContext<'_>, expr: &Expr) {
-        if let Some((method_name, float)) = is_useless_rounding(expr) {
+        if let Some((method_name, float)) = is_useless_rounding(cx, expr) {
             span_lint_and_sugg(
                 cx,
                 UNUSED_ROUNDING,
                 expr.span,
-                &format!("used the `{method_name}` method with a whole number float"),
-                &format!("remove the `{method_name}` method call"),
+                format!("used the `{method_name}` method with a whole number float"),
+                format!("remove the `{method_name}` method call"),
                 float,
                 Applicability::MachineApplicable,
             );

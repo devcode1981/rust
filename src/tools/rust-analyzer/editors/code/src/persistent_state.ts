@@ -1,4 +1,4 @@
-import * as vscode from "vscode";
+import type * as vscode from "vscode";
 import { log } from "./util";
 
 export class PersistentState {
@@ -14,6 +14,7 @@ export class PersistentState {
     get serverVersion(): string | undefined {
         return this.globalState.get("serverVersion");
     }
+
     async updateServerVersion(value: string | undefined) {
         await this.globalState.update("serverVersion", value);
     }

@@ -1,6 +1,10 @@
 use crate::array;
-use crate::iter::{ByRefSized, FusedIterator, Iterator};
-use crate::ops::{ControlFlow, Try};
+use crate::iter::adapters::SourceIter;
+use crate::iter::{
+    ByRefSized, FusedIterator, InPlaceIterable, TrustedFused, TrustedRandomAccessNoCoerce,
+};
+use crate::num::NonZero;
+use crate::ops::{ControlFlow, NeverShortCircuit, Try};
 
 /// An iterator over `N` elements of the iterator at a time.
 ///
@@ -30,9 +34,22 @@ where
     /// Returns an iterator over the remaining elements of the original iterator
     /// that are not going to be returned by this iterator. The returned
     /// iterator will yield at most `N-1` elements.
+    ///
+    /// # Example
+    /// ```
+    /// # // Also serves as a regression test for https://github.com/rust-lang/rust/issues/123333
+    /// # #![feature(iter_array_chunks)]
+    /// let x = [1,2,3,4,5].into_iter().array_chunks::<2>();
+    /// let mut rem = x.into_remainder().unwrap();
+    /// assert_eq!(rem.next(), Some(5));
+    /// assert_eq!(rem.next(), None);
+    /// ```
     #[unstable(feature = "iter_array_chunks", reason = "recently added", issue = "100450")]
     #[inline]
-    pub fn into_remainder(self) -> Option<array::IntoIter<I::Item, N>> {
+    pub fn into_remainder(mut self) -> Option<array::IntoIter<I::Item, N>> {
+        if self.remainder.is_none() {
+            while let Some(_) = self.next() {}
+        }
         self.remainder
     }
 }
@@ -82,7 +99,13 @@ where
         }
     }
 
-    impl_fold_via_try_fold! { fold -> try_fold }
+    fn fold<B, F>(self, init: B, f: F) -> B
+    where
+        Self: Sized,
+        F: FnMut(B, Self::Item) -> B,
+    {
+        <Self as SpecFold>::fold(self, init, f)
+    }
 }
 
 #[unstable(feature = "iter_array_chunks", reason = "recently added", issue = "100450")]
@@ -153,6 +176,9 @@ where
 #[unstable(feature = "iter_array_chunks", reason = "recently added", issue = "100450")]
 impl<I, const N: usize> FusedIterator for ArrayChunks<I, N> where I: FusedIterator {}
 
+#[unstable(issue = "none", feature = "trusted_fused")]
+unsafe impl<I, const N: usize> TrustedFused for ArrayChunks<I, N> where I: TrustedFused + Iterator {}
+
 #[unstable(feature = "iter_array_chunks", reason = "recently added", issue = "100450")]
 impl<I, const N: usize> ExactSizeIterator for ArrayChunks<I, N>
 where
@@ -167,4 +193,84 @@ where
     fn is_empty(&self) -> bool {
         self.iter.len() < N
     }
+}
+
+trait SpecFold: Iterator {
+    fn fold<B, F>(self, init: B, f: F) -> B
+    where
+        Self: Sized,
+        F: FnMut(B, Self::Item) -> B;
+}
+
+impl<I, const N: usize> SpecFold for ArrayChunks<I, N>
+where
+    I: Iterator,
+{
+    #[inline]
+    default fn fold<B, F>(mut self, init: B, f: F) -> B
+    where
+        Self: Sized,
+        F: FnMut(B, Self::Item) -> B,
+    {
+        self.try_fold(init, NeverShortCircuit::wrap_mut_2(f)).0
+    }
+}
+
+impl<I, const N: usize> SpecFold for ArrayChunks<I, N>
+where
+    I: Iterator + TrustedRandomAccessNoCoerce,
+{
+    #[inline]
+    fn fold<B, F>(mut self, init: B, mut f: F) -> B
+    where
+        Self: Sized,
+        F: FnMut(B, Self::Item) -> B,
+    {
+        let mut accum = init;
+        let inner_len = self.iter.size();
+        let mut i = 0;
+        // Use a while loop because (0..len).step_by(N) doesn't optimize well.
+        while inner_len - i >= N {
+            let chunk = crate::array::from_fn(|local| {
+                // SAFETY: The method consumes the iterator and the loop condition ensures that
+                // all accesses are in bounds and only happen once.
+                unsafe {
+                    let idx = i + local;
+                    self.iter.__iterator_get_unchecked(idx)
+                }
+            });
+            accum = f(accum, chunk);
+            i += N;
+        }
+
+        // unlike try_fold this method does not need to take care of the remainder
+        // since `self` will be dropped
+
+        accum
+    }
+}
+
+#[unstable(issue = "none", feature = "inplace_iteration")]
+unsafe impl<I, const N: usize> SourceIter for ArrayChunks<I, N>
+where
+    I: SourceIter + Iterator,
+{
+    type Source = I::Source;
+
+    #[inline]
+    unsafe fn as_inner(&mut self) -> &mut I::Source {
+        // SAFETY: unsafe function forwarding to unsafe function with the same requirements
+        unsafe { SourceIter::as_inner(&mut self.iter) }
+    }
+}
+
+#[unstable(issue = "none", feature = "inplace_iteration")]
+unsafe impl<I: InPlaceIterable + Iterator, const N: usize> InPlaceIterable for ArrayChunks<I, N> {
+    const EXPAND_BY: Option<NonZero<usize>> = I::EXPAND_BY;
+    const MERGE_BY: Option<NonZero<usize>> = const {
+        match (I::MERGE_BY, NonZero::new(N)) {
+            (Some(m), Some(n)) => m.checked_mul(n),
+            _ => None,
+        }
+    };
 }

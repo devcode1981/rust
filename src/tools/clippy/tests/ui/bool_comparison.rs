@@ -1,76 +1,90 @@
-// run-rustfix
-
+#![allow(non_local_definitions, clippy::needless_if)]
 #![warn(clippy::bool_comparison)]
+#![allow(clippy::non_canonical_partial_ord_impl, clippy::nonminimal_bool)]
 
 fn main() {
     let x = true;
     if x == true {
+        //~^ bool_comparison
         "yes"
     } else {
         "no"
     };
     if x == false {
+        //~^ bool_comparison
         "yes"
     } else {
         "no"
     };
     if true == x {
+        //~^ bool_comparison
         "yes"
     } else {
         "no"
     };
     if false == x {
+        //~^ bool_comparison
         "yes"
     } else {
         "no"
     };
     if x != true {
+        //~^ bool_comparison
         "yes"
     } else {
         "no"
     };
     if x != false {
+        //~^ bool_comparison
         "yes"
     } else {
         "no"
     };
     if true != x {
+        //~^ bool_comparison
         "yes"
     } else {
         "no"
     };
     if false != x {
+        //~^ bool_comparison
         "yes"
     } else {
         "no"
     };
     if x < true {
+        //~^ bool_comparison
         "yes"
     } else {
         "no"
     };
     if false < x {
+        //~^ bool_comparison
         "yes"
     } else {
         "no"
     };
     if x > false {
+        //~^ bool_comparison
         "yes"
     } else {
         "no"
     };
     if true > x {
+        //~^ bool_comparison
         "yes"
     } else {
         "no"
     };
     let y = true;
     if x < y {
+        //~^ bool_comparison
         "yes"
     } else {
         "no"
     };
     if x > y {
+        //~^ bool_comparison
         "yes"
     } else {
         "no"
@@ -119,12 +133,16 @@ fn issue4983() {
     let b = false;
 
     if a == !b {};
+    //~^ bool_comparison
     if !a == b {};
+    //~^ bool_comparison
     if a == b {};
     if !a == !b {};
 
     if b == !a {};
+    //~^ bool_comparison
     if !b == a {};
+    //~^ bool_comparison
     if b == a {};
     if !b == !a {};
 }
@@ -149,9 +167,13 @@ fn issue3973() {
 
     // lint, could be simplified
     if false == m!(func) {}
+    //~^ bool_comparison
     if m!(func) == false {}
+    //~^ bool_comparison
     if true == m!(func) {}
+    //~^ bool_comparison
     if m!(func) == true {}
+    //~^ bool_comparison
 
     // no lint with a variable
     let is_debug = false;
@@ -164,4 +186,16 @@ fn issue3973() {
     if cfg!(feature = "debugging") == is_debug {}
     if is_debug == m!(func) {}
     if m!(func) == is_debug {}
+}
+
+#[allow(clippy::unnecessary_cast)]
+fn issue9907() {
+    let _ = ((1 < 2) == false) as usize;
+    //~^ bool_comparison
+    let _ = (false == m!(func)) as usize;
+    //~^ bool_comparison
+    // This is not part of the issue, but an unexpected found when fixing the issue,
+    // the provided span was inside of macro rather than the macro callsite.
+    let _ = ((1 < 2) == !m!(func)) as usize;
+    //~^ bool_comparison
 }

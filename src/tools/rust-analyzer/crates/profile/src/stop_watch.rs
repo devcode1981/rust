@@ -1,4 +1,7 @@
 //! Like `std::time::Instant`, but also measures memory & CPU cycles.
+
+#![allow(clippy::print_stderr)]
+
 use std::{
     fmt,
     time::{Duration, Instant},
@@ -8,36 +11,35 @@ use crate::MemoryUsage;
 
 pub struct StopWatch {
     time: Instant,
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     counter: Option<perf_event::Counter>,
-    memory: Option<MemoryUsage>,
+    memory: MemoryUsage,
 }
 
 pub struct StopWatchSpan {
     pub time: Duration,
     pub instructions: Option<u64>,
-    pub memory: Option<MemoryUsage>,
+    pub memory: MemoryUsage,
 }
 
 impl StopWatch {
     pub fn start() -> StopWatch {
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         let counter = {
             // When debugging rust-analyzer using rr, the perf-related syscalls cause it to abort.
             // We allow disabling perf by setting the env var `RA_DISABLE_PERF`.
 
-            use once_cell::sync::Lazy;
-            static PERF_ENABLED: Lazy<bool> =
-                Lazy::new(|| std::env::var_os("RA_DISABLE_PERF").is_none());
+            use std::sync::OnceLock;
+            static PERF_ENABLED: OnceLock<bool> = OnceLock::new();
 
-            if *PERF_ENABLED {
+            if *PERF_ENABLED.get_or_init(|| std::env::var_os("RA_DISABLE_PERF").is_none()) {
                 let mut counter = perf_event::Builder::new()
                     .build()
-                    .map_err(|err| eprintln!("Failed to create perf counter: {}", err))
+                    .map_err(|err| eprintln!("Failed to create perf counter: {err}"))
                     .ok();
                 if let Some(counter) = &mut counter {
                     if let Err(err) = counter.enable() {
-                        eprintln!("Failed to start perf counter: {}", err)
+                        eprintln!("Failed to start perf counter: {err}")
                     }
                 }
                 counter
@@ -45,31 +47,29 @@ impl StopWatch {
                 None
             }
         };
+        let memory = MemoryUsage::now();
         let time = Instant::now();
         StopWatch {
             time,
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
             counter,
-            memory: None,
+            memory,
         }
     }
-    pub fn memory(mut self, yes: bool) -> StopWatch {
-        if yes {
-            self.memory = Some(MemoryUsage::now());
-        }
-        self
-    }
+
     pub fn elapsed(&mut self) -> StopWatchSpan {
         let time = self.time.elapsed();
 
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         let instructions = self.counter.as_mut().and_then(|it| {
-            it.read().map_err(|err| eprintln!("Failed to read perf counter: {}", err)).ok()
+            it.read().map_err(|err| eprintln!("Failed to read perf counter: {err}")).ok()
         });
+        #[cfg(all(target_os = "linux", target_env = "ohos"))]
+        let instructions = None;
         #[cfg(not(target_os = "linux"))]
         let instructions = None;
 
-        let memory = self.memory.map(|it| MemoryUsage::now() - it);
+        let memory = MemoryUsage::now() - self.memory;
         StopWatchSpan { time, instructions, memory }
     }
 }
@@ -91,11 +91,9 @@ impl fmt::Display for StopWatchSpan {
                 instructions /= 1000;
                 prefix = "g";
             }
-            write!(f, ", {}{}instr", instructions, prefix)?;
+            write!(f, ", {instructions}{prefix}instr")?;
         }
-        if let Some(memory) = self.memory {
-            write!(f, ", {}", memory)?;
-        }
+        write!(f, ", {}", self.memory)?;
         Ok(())
     }
 }

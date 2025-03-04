@@ -1,6 +1,5 @@
-// run-rustfix
-
 #![warn(clippy::needless_bitwise_bool)]
+#![allow(clippy::const_is_empty)]
 
 fn returns_bool() -> bool {
     true
@@ -22,6 +21,7 @@ fn main() {
         println!("true")
     }
     if y & !x {
+        //~^ needless_bitwise_bool
         println!("true")
     }
 

@@ -1,4 +1,3 @@
-use crate::alloc::{Allocator, Global};
 use core::fmt;
 use core::iter::{FusedIterator, TrustedLen};
 use core::mem::{self, ManuallyDrop, SizedTypeProperties};
@@ -6,6 +5,7 @@ use core::ptr::{self, NonNull};
 use core::slice::{self};
 
 use super::Vec;
+use crate::alloc::{Allocator, Global};
 
 /// A draining iterator for `Vec<T>`.
 ///
@@ -16,7 +16,7 @@ use super::Vec;
 ///
 /// ```
 /// let mut v = vec![0, 1, 2];
-/// let iter: std::vec::Drain<_> = v.drain(..);
+/// let iter: std::vec::Drain<'_, _> = v.drain(..);
 /// ```
 #[stable(feature = "drain", since = "1.6.0")]
 pub struct Drain<
@@ -112,9 +112,7 @@ impl<'a, T, A: Allocator> Drain<'a, T, A> {
             let unyielded_ptr = this.iter.as_slice().as_ptr();
 
             // ZSTs have no identity, so we don't need to move them around.
-            let needs_move = mem::size_of::<T>() != 0;
-
-            if needs_move {
+            if !T::IS_ZST {
                 let start_ptr = source_vec.as_mut_ptr().add(start);
 
                 // memmove back unyielded elements
@@ -197,7 +195,7 @@ impl<T, A: Allocator> Drop for Drain<'_, T, A> {
             }
         }
 
-        let iter = mem::replace(&mut self.iter, (&mut []).iter());
+        let iter = mem::take(&mut self.iter);
         let drop_len = iter.len();
 
         let mut vec = self.vec;
@@ -223,9 +221,9 @@ impl<T, A: Allocator> Drop for Drain<'_, T, A> {
         }
 
         // as_slice() must only be called when iter.len() is > 0 because
-        // vec::Splice modifies vec::Drain fields and may grow the vec which would invalidate
-        // the iterator's internal pointers. Creating a reference to deallocated memory
-        // is invalid even when it is zero-length
+        // it also gets touched by vec::Splice which may turn it into a dangling pointer
+        // which would make it and the vec pointer point to different allocations which would
+        // lead to invalid pointer arithmetic below.
         let drop_ptr = iter.as_slice().as_ptr();
 
         unsafe {
@@ -234,7 +232,7 @@ impl<T, A: Allocator> Drop for Drain<'_, T, A> {
             // it from the original vec but also avoid creating a &mut to the front since that could
             // invalidate raw pointers to it which some unsafe code might rely on.
             let vec_ptr = vec.as_mut().as_mut_ptr();
-            let drop_offset = drop_ptr.sub_ptr(vec_ptr);
+            let drop_offset = drop_ptr.offset_from_unsigned(vec_ptr);
             let to_drop = ptr::slice_from_raw_parts_mut(vec_ptr.add(drop_offset), drop_len);
             ptr::drop_in_place(to_drop);
         }

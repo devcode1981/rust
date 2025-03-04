@@ -1,4 +1,5 @@
-// aux-build: proc_macro_with_span.rs
+//@aux-build: proc_macros.rs
+//@no-rustfix: overlapping suggestions
 #![warn(clippy::unit_arg)]
 #![allow(unused_must_use, unused_variables)]
 #![allow(
@@ -13,9 +14,9 @@
     clippy::unused_unit
 )]
 
-extern crate proc_macro_with_span;
+extern crate proc_macros;
 
-use proc_macro_with_span::with_span;
+use proc_macros::with_span;
 use std::fmt::Debug;
 
 fn foo<T: Debug>(t: T) {
@@ -60,23 +61,30 @@ impl Tr for B {
 
 fn bad() {
     foo({
+        //~^ unit_arg
         1;
     });
     foo(foo(1));
+    //~^ unit_arg
     foo({
+        //~^ unit_arg
         foo(1);
         foo(2);
     });
     let b = Bar;
     b.bar({
+        //~^ unit_arg
         1;
     });
     taking_multiple_units(foo(0), foo(1));
+    //~^ unit_arg
     taking_multiple_units(foo(0), {
+        //~^ unit_arg
         foo(1);
         foo(2);
     });
     taking_multiple_units(
+        //~^ unit_arg
         {
             foo(0);
             foo(1);
@@ -88,9 +96,11 @@ fn bad() {
     );
     // here Some(foo(2)) isn't the top level statement expression, wrap the suggestion in a block
     None.or(Some(foo(2)));
+    //~^ unit_arg
     // in this case, the suggestion can be inlined, no need for a surrounding block
     // foo(()); foo(()) instead of { foo(()); foo(()) }
     foo(foo(()));
+    //~^ unit_arg
 }
 
 fn ok() {
@@ -128,6 +138,7 @@ mod issue_2945 {
 #[allow(dead_code)]
 fn returning_expr() -> Option<()> {
     Some(foo(1))
+    //~^ unit_arg
 }
 
 fn taking_multiple_units(a: (), b: ()) {}

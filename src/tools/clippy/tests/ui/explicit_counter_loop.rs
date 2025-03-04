@@ -1,27 +1,83 @@
 #![warn(clippy::explicit_counter_loop)]
-#![allow(clippy::uninlined_format_args)]
-
+#![allow(clippy::uninlined_format_args, clippy::useless_vec)]
+//@no-rustfix
 fn main() {
     let mut vec = vec![1, 2, 3, 4];
     let mut _index = 0;
     for _v in &vec {
+        //~^ explicit_counter_loop
+
         _index += 1
     }
 
     let mut _index = 1;
     _index = 0;
     for _v in &vec {
+        //~^ explicit_counter_loop
+
         _index += 1
     }
 
     let mut _index = 0;
     for _v in &mut vec {
+        //~^ explicit_counter_loop
+
         _index += 1;
     }
 
     let mut _index = 0;
     for _v in vec {
+        //~^ explicit_counter_loop
+
         _index += 1;
+    }
+
+    let vec = [1, 2, 3, 4];
+    // Potential false positives
+    let mut _index = 0;
+    _index = 1;
+    for _v in &vec {
+        _index += 1
+    }
+
+    let mut _index = 0;
+    _index += 1;
+    for _v in &vec {
+        _index += 1
+    }
+
+    let mut _index = 0;
+    for _v in &vec {
+        _index = 1;
+        _index += 1
+    }
+
+    let mut _index = 0;
+    for _v in &vec {
+        let mut _index = 0;
+        _index += 1
+    }
+
+    let mut _index = 0;
+    for _v in &vec {
+        _index += 1;
+        _index = 0;
+    }
+
+    let mut _index = 0;
+    if true {
+        _index = 1
+    };
+    for _v in &vec {
+        _index += 1
+    }
+
+    let mut _index = 1;
+    if false {
+        _index = 0
+    };
+    for _v in &vec {
+        _index += 1
     }
 }
 
@@ -60,6 +116,8 @@ mod issue_1219 {
         let text = "banana";
         let mut count = 0;
         for ch in text.chars() {
+            //~^ explicit_counter_loop
+
             println!("{}", count);
             count += 1;
             if ch == 'a' {
@@ -71,6 +129,8 @@ mod issue_1219 {
         let text = "banana";
         let mut count = 0;
         for ch in text.chars() {
+            //~^ explicit_counter_loop
+
             println!("{}", count);
             count += 1;
             for i in 0..2 {
@@ -129,6 +189,8 @@ mod issue_1670 {
     pub fn test() {
         let mut count = 0;
         for _i in 3..10 {
+            //~^ explicit_counter_loop
+
             count += 1;
         }
     }
@@ -169,6 +231,8 @@ mod issue_7920 {
 
         // should suggest `enumerate`
         for _item in slice {
+            //~^ explicit_counter_loop
+
             if idx_usize == index_usize {
                 break;
             }
@@ -181,11 +245,57 @@ mod issue_7920 {
 
         // should suggest `zip`
         for _item in slice {
+            //~^ explicit_counter_loop
+
             if idx_u32 == index_u32 {
                 break;
             }
 
             idx_u32 += 1;
+        }
+    }
+}
+
+mod issue_10058 {
+    pub fn test() {
+        // should not lint since we are increasing counter potentially more than once in the loop
+        let values = [0, 1, 0, 1, 1, 1, 0, 1, 0, 1];
+        let mut counter = 0;
+        for value in values {
+            counter += 1;
+
+            if value == 0 {
+                continue;
+            }
+
+            counter += 1;
+        }
+    }
+
+    pub fn test2() {
+        // should not lint since we are increasing counter potentially more than once in the loop
+        let values = [0, 1, 0, 1, 1, 1, 0, 1, 0, 1];
+        let mut counter = 0;
+        for value in values {
+            counter += 1;
+
+            if value != 0 {
+                counter += 1;
+            }
+        }
+    }
+}
+
+mod issue_13123 {
+    pub fn test() {
+        let mut vec = vec![1, 2, 3, 4];
+        let mut _index = 0;
+        'label: for v in vec {
+            //~^ explicit_counter_loop
+            _index += 1;
+            if v == 1 {
+                break 'label;
+            }
         }
     }
 }

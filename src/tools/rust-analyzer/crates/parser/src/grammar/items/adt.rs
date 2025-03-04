@@ -1,3 +1,5 @@
+use crate::grammar::attributes::ATTRIBUTE_FIRST;
+
 use super::*;
 
 // test struct_item
@@ -133,6 +135,11 @@ pub(crate) fn record_field_list(p: &mut Parser<'_>) {
             name(p);
             p.expect(T![:]);
             types::type_(p);
+            // test record_field_default_values
+            // struct S { f: f32 = 0.0 }
+            if p.eat(T![=]) {
+                expressions::expr(p);
+            }
             m.complete(p, RECORD_FIELD);
         } else {
             m.abandon(p);
@@ -141,28 +148,42 @@ pub(crate) fn record_field_list(p: &mut Parser<'_>) {
     }
 }
 
+const TUPLE_FIELD_FIRST: TokenSet =
+    types::TYPE_FIRST.union(ATTRIBUTE_FIRST).union(VISIBILITY_FIRST);
+
+// test_err tuple_field_list_recovery
+// struct S(struct S;
+// struct S(A,,B);
 fn tuple_field_list(p: &mut Parser<'_>) {
     assert!(p.at(T!['(']));
     let m = p.start();
-    p.bump(T!['(']);
-    while !p.at(T![')']) && !p.at(EOF) {
-        let m = p.start();
-        // test tuple_field_attrs
-        // struct S (#[attr] f32);
-        attributes::outer_attrs(p);
-        opt_visibility(p, true);
-        if !p.at_ts(types::TYPE_FIRST) {
-            p.error("expected a type");
-            m.complete(p, ERROR);
-            break;
-        }
-        types::type_(p);
-        m.complete(p, TUPLE_FIELD);
+    delimited(
+        p,
+        T!['('],
+        T![')'],
+        T![,],
+        || "expected tuple field".into(),
+        TUPLE_FIELD_FIRST,
+        |p| {
+            let m = p.start();
+            // test tuple_field_attrs
+            // struct S (#[attr] f32);
+            attributes::outer_attrs(p);
+            let has_vis = opt_visibility(p, true);
+            if !p.at_ts(types::TYPE_FIRST) {
+                p.error("expected a type");
+                if has_vis {
+                    m.complete(p, ERROR);
+                } else {
+                    m.abandon(p);
+                }
+                return false;
+            }
+            types::type_(p);
+            m.complete(p, TUPLE_FIELD);
+            true
+        },
+    );
 
-        if !p.at(T![')']) {
-            p.expect(T![,]);
-        }
-    }
-    p.expect(T![')']);
     m.complete(p, TUPLE_FIELD_LIST);
 }

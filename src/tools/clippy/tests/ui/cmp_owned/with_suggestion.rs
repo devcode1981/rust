@@ -1,12 +1,12 @@
-// run-rustfix
-
 #[warn(clippy::cmp_owned)]
 #[allow(clippy::unnecessary_operation, clippy::no_effect, unused_must_use, clippy::eq_op)]
 fn main() {
     fn with_to_string(x: &str) {
         x != "foo".to_string();
+        //~^ cmp_owned
 
         "foo".to_string() != x;
+        //~^ cmp_owned
     }
 
     let x = "oh";
@@ -14,14 +14,18 @@ fn main() {
     with_to_string(x);
 
     x != "foo".to_owned();
+    //~^ cmp_owned
 
     x != String::from("foo");
+    //~^ cmp_owned
 
     42.to_string() == "42";
 
     Foo.to_owned() == Foo;
+    //~^ cmp_owned
 
     "abc".chars().filter(|c| c.to_owned() != 'X');
+    //~^ cmp_owned
 
     "abc".chars().filter(|c| *c != 'X');
 }

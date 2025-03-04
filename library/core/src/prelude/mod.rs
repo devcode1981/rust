@@ -1,8 +1,11 @@
-//! The libcore prelude
+//! The core prelude
 //!
-//! This module is intended for users of libcore which do not link to libstd as
-//! well. This module is imported by default when `#![no_std]` is used in the
-//! same manner as the standard library's prelude.
+//! This module is intended for users of core which do not link to std as well.
+//! This module is imported by default when `#![no_std]` is used in the same
+//! manner as the standard library's prelude.
+
+// No formatting: this file is nothing but re-exports, and their order is worth preserving.
+#![cfg_attr(rustfmt, rustfmt::skip)]
 
 #![stable(feature = "core_prelude", since = "1.4.0")]
 
@@ -46,12 +49,24 @@ pub mod rust_2021 {
     pub use crate::convert::{TryFrom, TryInto};
 }
 
-/// The 2024 edition of the core prelude.
+/// The 2024 version of the core prelude.
 ///
 /// See the [module-level documentation](self) for more.
-#[unstable(feature = "prelude_2024", issue = "none")]
+#[stable(feature = "prelude_2024", since = "1.85.0")]
 pub mod rust_2024 {
-    #[unstable(feature = "prelude_2024", issue = "none")]
+    #[stable(feature = "rust1", since = "1.0.0")]
     #[doc(no_inline)]
-    pub use super::rust_2021::*;
+    pub use super::v1::*;
+
+    #[stable(feature = "prelude_2021", since = "1.55.0")]
+    #[doc(no_inline)]
+    pub use crate::iter::FromIterator;
+
+    #[stable(feature = "prelude_2021", since = "1.55.0")]
+    #[doc(no_inline)]
+    pub use crate::convert::{TryFrom, TryInto};
+
+    #[stable(feature = "prelude_2024", since = "1.85.0")]
+    #[doc(no_inline)]
+    pub use crate::future::{Future, IntoFuture};
 }

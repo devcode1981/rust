@@ -6,7 +6,7 @@
 //! * Extracting markup (mainly, `$0` markers) out of fixture strings.
 //! * marks (see the eponymous module).
 
-#![warn(rust_2018_idioms, unused_lifetimes, semicolon_in_expressions_from_macros)]
+#![allow(clippy::print_stderr)]
 
 mod assert_linear;
 pub mod bench_fixture;
@@ -18,6 +18,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use paths::Utf8PathBuf;
 use profile::StopWatch;
 use stdx::is_ci;
 use text_size::{TextRange, TextSize};
@@ -27,7 +28,7 @@ pub use rustc_hash::FxHashMap;
 
 pub use crate::{
     assert_linear::AssertLinear,
-    fixture::{Fixture, MiniCore},
+    fixture::{Fixture, FixtureWithProjectMeta, MiniCore},
 };
 
 pub const CURSOR_MARKER: &str = "$0";
@@ -95,7 +96,7 @@ fn try_extract_range(text: &str) -> Option<(TextRange, String)> {
     Some((TextRange::new(start, end), text))
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum RangeOrOffset {
     Range(TextRange),
     Offset(TextSize),
@@ -146,8 +147,8 @@ pub fn extract_range_or_offset(text: &str) -> (RangeOrOffset, String) {
 
 /// Extracts ranges, marked with `<tag> </tag>` pairs from the `text`
 pub fn extract_tags(mut text: &str, tag: &str) -> (Vec<(TextRange, Option<String>)>, String) {
-    let open = format!("<{}", tag);
-    let close = format!("</{}>", tag);
+    let open = format!("<{tag}");
+    let close = format!("</{tag}>");
     let mut ranges = Vec::new();
     let mut res = String::new();
     let mut stack = Vec::new();
@@ -163,14 +164,13 @@ pub fn extract_tags(mut text: &str, tag: &str) -> (Vec<(TextRange, Option<String
                 if text.starts_with(&open) {
                     let close_open = text.find('>').unwrap();
                     let attr = text[open.len()..close_open].trim();
-                    let attr = if attr.is_empty() { None } else { Some(attr.to_string()) };
+                    let attr = if attr.is_empty() { None } else { Some(attr.to_owned()) };
                     text = &text[close_open + '>'.len_utf8()..];
                     let from = TextSize::of(&res);
                     stack.push((from, attr));
                 } else if text.starts_with(&close) {
                     text = &text[close.len()..];
-                    let (from, attr) =
-                        stack.pop().unwrap_or_else(|| panic!("unmatched </{}>", tag));
+                    let (from, attr) = stack.pop().unwrap_or_else(|| panic!("unmatched </{tag}>"));
                     let to = TextSize::of(&res);
                     ranges.push((TextRange::new(from, to), attr));
                 } else {
@@ -180,7 +180,7 @@ pub fn extract_tags(mut text: &str, tag: &str) -> (Vec<(TextRange, Option<String
             }
         }
     }
-    assert!(stack.is_empty(), "unmatched <{}>", tag);
+    assert!(stack.is_empty(), "unmatched <{tag}>");
     ranges.sort_by_key(|r| (r.0.start(), r.0.end()));
     (ranges, res)
 }
@@ -224,7 +224,7 @@ pub fn add_cursor(text: &str, offset: TextSize) -> String {
 /// Annotations point to the last line that actually was long enough for the
 /// range, not counting annotations themselves. So overlapping annotations are
 /// possible:
-/// ```no_run
+/// ```text
 /// // stuff        other stuff
 /// // ^^ 'st'
 /// // ^^^^^ 'stuff'
@@ -305,7 +305,7 @@ fn extract_line_annotations(mut line: &str) -> Vec<LineAnnotation> {
         }
         let range = TextRange::at(offset, len.try_into().unwrap());
         let line_no_caret = &line[len..];
-        let end_marker = line_no_caret.find(|c| c == '$');
+        let end_marker = line_no_caret.find('$');
         let next = line_no_caret.find(marker).map_or(line.len(), |it| it + len);
 
         let cond = |end_marker| {
@@ -326,7 +326,7 @@ fn extract_line_annotations(mut line: &str) -> Vec<LineAnnotation> {
             content = &content["file".len()..];
         }
 
-        let content = content.trim_start().to_string();
+        let content = content.trim_start().to_owned();
 
         let annotation = if continuation {
             LineAnnotation::Continuation { offset: range.end(), content }
@@ -396,16 +396,24 @@ pub fn skip_slow_tests() -> bool {
     if should_skip {
         eprintln!("ignoring slow test");
     } else {
-        let path = project_root().join("./target/.slow_tests_cookie");
-        fs::write(&path, ".").unwrap();
+        let path = target_dir().join(".slow_tests_cookie");
+        fs::write(path, ".").unwrap();
     }
     should_skip
 }
 
+pub fn target_dir() -> Utf8PathBuf {
+    match std::env::var("CARGO_TARGET_DIR") {
+        Ok(target) => Utf8PathBuf::from(target),
+        Err(_) => project_root().join("target"),
+    }
+}
+
 /// Returns the path to the root directory of `rust-analyzer` project.
-pub fn project_root() -> PathBuf {
+pub fn project_root() -> Utf8PathBuf {
     let dir = env!("CARGO_MANIFEST_DIR");
-    PathBuf::from(dir).parent().unwrap().parent().unwrap().to_owned()
+    Utf8PathBuf::from_path_buf(PathBuf::from(dir).parent().unwrap().parent().unwrap().to_owned())
+        .unwrap()
 }
 
 pub fn format_diff(chunks: Vec<dissimilar::Chunk<'_>>) -> String {
@@ -413,8 +421,8 @@ pub fn format_diff(chunks: Vec<dissimilar::Chunk<'_>>) -> String {
     for chunk in chunks {
         let formatted = match chunk {
             dissimilar::Chunk::Equal(text) => text.into(),
-            dissimilar::Chunk::Delete(text) => format!("\x1b[41m{}\x1b[0m", text),
-            dissimilar::Chunk::Insert(text) => format!("\x1b[42m{}\x1b[0m", text),
+            dissimilar::Chunk::Delete(text) => format!("\x1b[41m{text}\x1b[0m\x1b[K"),
+            dissimilar::Chunk::Insert(text) => format!("\x1b[42m{text}\x1b[0m\x1b[K"),
         };
         buf.push_str(&formatted);
     }
@@ -425,7 +433,7 @@ pub fn format_diff(chunks: Vec<dissimilar::Chunk<'_>>) -> String {
 ///
 /// A benchmark test looks like this:
 ///
-/// ```
+/// ```ignore
 /// #[test]
 /// fn benchmark_foo() {
 ///     if skip_slow_tests() { return; }
@@ -480,7 +488,7 @@ pub fn try_ensure_file_contents(file: &Path, contents: &str) -> Result<(), ()> {
         }
         _ => (),
     }
-    let display_path = file.strip_prefix(&project_root()).unwrap_or(file);
+    let display_path = file.strip_prefix(project_root()).unwrap_or(file);
     eprintln!(
         "\n\x1b[31;1merror\x1b[0m: {} was not up-to-date, updating\n",
         display_path.display()

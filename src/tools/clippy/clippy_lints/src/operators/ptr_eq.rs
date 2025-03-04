@@ -1,13 +1,11 @@
 use clippy_utils::diagnostics::span_lint_and_sugg;
-use clippy_utils::source::snippet_opt;
-use if_chain::if_chain;
+use clippy_utils::source::SpanRangeExt;
+use clippy_utils::std_or_core;
 use rustc_errors::Applicability;
 use rustc_hir::{BinOpKind, Expr, ExprKind};
 use rustc_lint::LateContext;
 
 use super::PTR_EQ;
-
-static LINT_MSG: &str = "use `std::ptr::eq` when comparing raw pointers";
 
 pub(super) fn check<'tcx>(
     cx: &LateContext<'tcx>,
@@ -22,22 +20,21 @@ pub(super) fn check<'tcx>(
             _ => (left, right),
         };
 
-        if_chain! {
-            if let Some(left_var) = expr_as_cast_to_raw_pointer(cx, left);
-            if let Some(right_var) = expr_as_cast_to_raw_pointer(cx, right);
-            if let Some(left_snip) = snippet_opt(cx, left_var.span);
-            if let Some(right_snip) = snippet_opt(cx, right_var.span);
-            then {
-                span_lint_and_sugg(
-                    cx,
-                    PTR_EQ,
-                    expr.span,
-                    LINT_MSG,
-                    "try",
-                    format!("std::ptr::eq({left_snip}, {right_snip})"),
-                    Applicability::MachineApplicable,
-                    );
-            }
+        if let Some(left_var) = expr_as_cast_to_raw_pointer(cx, left)
+            && let Some(right_var) = expr_as_cast_to_raw_pointer(cx, right)
+            && let Some(left_snip) = left_var.span.get_source_text(cx)
+            && let Some(right_snip) = right_var.span.get_source_text(cx)
+        {
+            let Some(top_crate) = std_or_core(cx) else { return };
+            span_lint_and_sugg(
+                cx,
+                PTR_EQ,
+                expr.span,
+                format!("use `{top_crate}::ptr::eq` when comparing raw pointers"),
+                "try",
+                format!("{top_crate}::ptr::eq({left_snip}, {right_snip})"),
+                Applicability::MachineApplicable,
+            );
         }
     }
 }
@@ -56,7 +53,7 @@ fn expr_as_cast_to_usize<'tcx>(cx: &LateContext<'tcx>, cast_expr: &'tcx Expr<'_>
 // If the given expression is a cast to a `*const` pointer, return the lhs of the cast
 // E.g., `foo as *const _` returns `foo`.
 fn expr_as_cast_to_raw_pointer<'tcx>(cx: &LateContext<'tcx>, cast_expr: &'tcx Expr<'_>) -> Option<&'tcx Expr<'tcx>> {
-    if cx.typeck_results().expr_ty(cast_expr).is_unsafe_ptr() {
+    if cx.typeck_results().expr_ty(cast_expr).is_raw_ptr() {
         if let ExprKind::Cast(expr, _) = cast_expr.kind {
             return Some(expr);
         }

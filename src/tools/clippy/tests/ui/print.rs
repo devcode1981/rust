@@ -9,6 +9,7 @@ struct Foo;
 impl Display for Foo {
     fn fmt(&self, f: &mut Formatter) -> Result {
         write!(f, "{:?}", 43.1415)
+        //~^ use_debug
     }
 }
 
@@ -21,13 +22,21 @@ impl Debug for Foo {
 
 fn main() {
     println!("Hello");
+    //~^ print_stdout
+
     print!("Hello");
+    //~^ print_stdout
 
     print!("Hello {}", "World");
+    //~^ print_stdout
 
     print!("Hello {:?}", "World");
+    //~^ print_stdout
+    //~| use_debug
 
     print!("Hello {:#?}", "#orld");
+    //~^ print_stdout
+    //~| use_debug
 
     assert_eq!(42, 1337);
 

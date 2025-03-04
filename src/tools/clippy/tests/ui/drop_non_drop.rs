@@ -20,6 +20,8 @@ fn main() {
     struct Foo;
     // Lint
     drop(Foo);
+    //~^ drop_non_drop
+
     // Don't lint
     drop(make_result(Foo));
     // Don't lint
@@ -35,6 +37,8 @@ fn main() {
     struct Baz<T>(T);
     // Lint
     drop(Baz(Foo));
+    //~^ drop_non_drop
+
     // Don't lint
     drop(Baz(Bar));
 }

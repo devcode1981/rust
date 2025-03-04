@@ -4,13 +4,19 @@
 use std::collections::BTreeSet;
 
 use either::Either;
-use hir::{AssocItem, GenericParam, HasAttrs, HirDisplay, Semantics, Trait};
-use ide_db::{active_parameter::callable_for_node, base_db::FilePosition};
+use hir::{AssocItem, GenericParam, HirDisplay, ModuleDef, PathResolution, Semantics, Trait};
+use ide_db::{
+    active_parameter::{callable_for_node, generic_def_for_node},
+    documentation::{Documentation, HasDocs},
+    FilePosition, FxIndexMap,
+};
+use span::Edition;
 use stdx::format_to;
 use syntax::{
     algo,
-    ast::{self, HasArgList},
-    match_ast, AstNode, Direction, SyntaxToken, TextRange, TextSize,
+    ast::{self, AstChildren, HasArgList},
+    match_ast, AstNode, Direction, NodeOrToken, SyntaxElementChildren, SyntaxNode, SyntaxToken,
+    TextRange, TextSize, ToSmolStr, T,
 };
 
 use crate::RootDatabase;
@@ -21,7 +27,7 @@ use crate::RootDatabase;
 /// edited.
 #[derive(Debug)]
 pub struct SignatureHelp {
-    pub doc: Option<String>,
+    pub doc: Option<Documentation>,
     pub signature: String,
     pub active_parameter: Option<usize>,
     parameters: Vec<TextRange>,
@@ -37,14 +43,18 @@ impl SignatureHelp {
     }
 
     fn push_call_param(&mut self, param: &str) {
-        self.push_param('(', param);
+        self.push_param("(", param);
     }
 
     fn push_generic_param(&mut self, param: &str) {
-        self.push_param('<', param);
+        self.push_param("<", param);
     }
 
-    fn push_param(&mut self, opening_delim: char, param: &str) {
+    fn push_record_field(&mut self, param: &str) {
+        self.push_param("{ ", param);
+    }
+
+    fn push_param(&mut self, opening_delim: &str, param: &str) {
         if !self.signature.ends_with(opening_delim) {
             self.signature.push_str(", ");
         }
@@ -56,17 +66,22 @@ impl SignatureHelp {
 }
 
 /// Computes parameter information for the given position.
-pub(crate) fn signature_help(db: &RootDatabase, position: FilePosition) -> Option<SignatureHelp> {
+pub(crate) fn signature_help(
+    db: &RootDatabase,
+    FilePosition { file_id, offset }: FilePosition,
+) -> Option<SignatureHelp> {
     let sema = Semantics::new(db);
-    let file = sema.parse(position.file_id);
+    let file = sema.parse_guess_edition(file_id);
     let file = file.syntax();
     let token = file
-        .token_at_offset(position.offset)
+        .token_at_offset(offset)
         .left_biased()
         // if the cursor is sandwiched between two space tokens and the call is unclosed
         // this prevents us from leaving the CallExpression
         .and_then(|tok| algo::skip_trivia_token(tok, Direction::Prev))?;
-    let token = sema.descend_into_macros_single(token);
+    let token = sema.descend_into_macros_single_exact(token);
+    let edition =
+        sema.attach_first_edition(file_id).map(|it| it.edition()).unwrap_or(Edition::CURRENT);
 
     for node in token.parent_ancestors() {
         match_ast! {
@@ -74,18 +89,63 @@ pub(crate) fn signature_help(db: &RootDatabase, position: FilePosition) -> Optio
                 ast::ArgList(arg_list) => {
                     let cursor_outside = arg_list.r_paren_token().as_ref() == Some(&token);
                     if cursor_outside {
-                        return None;
+                        continue;
                     }
-                    return signature_help_for_call(&sema, token);
+                    return signature_help_for_call(&sema, arg_list, token, edition);
                 },
                 ast::GenericArgList(garg_list) => {
                     let cursor_outside = garg_list.r_angle_token().as_ref() == Some(&token);
                     if cursor_outside {
-                        return None;
+                        continue;
                     }
-                    return signature_help_for_generics(&sema, token);
+                    return signature_help_for_generics(&sema, garg_list, token, edition);
+                },
+                ast::RecordExpr(record) => {
+                    let cursor_outside = record.record_expr_field_list().and_then(|list| list.r_curly_token()).as_ref() == Some(&token);
+                    if cursor_outside {
+                        continue;
+                    }
+                    return signature_help_for_record_lit(&sema, record, token, edition);
+                },
+                ast::RecordPat(record) => {
+                    let cursor_outside = record.record_pat_field_list().and_then(|list| list.r_curly_token()).as_ref() == Some(&token);
+                    if cursor_outside {
+                        continue;
+                    }
+                    return signature_help_for_record_pat(&sema, record, token, edition);
+                },
+                ast::TupleStructPat(tuple_pat) => {
+                    let cursor_outside = tuple_pat.r_paren_token().as_ref() == Some(&token);
+                    if cursor_outside {
+                        continue;
+                    }
+                    return signature_help_for_tuple_struct_pat(&sema, tuple_pat, token, edition);
+                },
+                ast::TuplePat(tuple_pat) => {
+                    let cursor_outside = tuple_pat.r_paren_token().as_ref() == Some(&token);
+                    if cursor_outside {
+                        continue;
+                    }
+                    return signature_help_for_tuple_pat(&sema, tuple_pat, token, edition);
+                },
+                ast::TupleExpr(tuple_expr) => {
+                    let cursor_outside = tuple_expr.r_paren_token().as_ref() == Some(&token);
+                    if cursor_outside {
+                        continue;
+                    }
+                    return signature_help_for_tuple_expr(&sema, tuple_expr, token, edition);
                 },
                 _ => (),
+            }
+        }
+
+        // Stop at multi-line expressions, since the signature of the outer call is not very
+        // helpful inside them.
+        if let Some(expr) = ast::Expr::cast(node.clone()) {
+            if !matches!(expr, ast::Expr::RecordExpr(..))
+                && expr.syntax().text().contains_char('\n')
+            {
+                break;
             }
         }
     }
@@ -95,29 +155,21 @@ pub(crate) fn signature_help(db: &RootDatabase, position: FilePosition) -> Optio
 
 fn signature_help_for_call(
     sema: &Semantics<'_, RootDatabase>,
+    arg_list: ast::ArgList,
     token: SyntaxToken,
+    edition: Edition,
 ) -> Option<SignatureHelp> {
     // Find the calling expression and its NameRef
-    let mut node = token.parent()?;
+    let mut nodes = arg_list.syntax().ancestors().skip(1);
     let calling_node = loop {
-        if let Some(callable) = ast::CallableExpr::cast(node.clone()) {
-            if callable
+        if let Some(callable) = ast::CallableExpr::cast(nodes.next()?) {
+            let inside_callable = callable
                 .arg_list()
-                .map_or(false, |it| it.syntax().text_range().contains(token.text_range().start()))
-            {
+                .is_some_and(|it| it.syntax().text_range().contains(token.text_range().start()));
+            if inside_callable {
                 break callable;
             }
         }
-
-        // Stop at multi-line expressions, since the signature of the outer call is not very
-        // helpful inside them.
-        if let Some(expr) = ast::Expr::cast(node.clone()) {
-            if expr.syntax().text().contains_char('\n') {
-                return None;
-            }
-        }
-
-        node = node.parent()?;
     };
 
     let (callable, active_parameter) = callable_for_node(sema, &calling_node, &token)?;
@@ -129,41 +181,58 @@ fn signature_help_for_call(
     let mut fn_params = None;
     match callable.kind() {
         hir::CallableKind::Function(func) => {
-            res.doc = func.docs(db).map(|it| it.into());
-            format_to!(res.signature, "fn {}", func.name(db));
+            res.doc = func.docs(db);
+            format_to!(res.signature, "fn {}", func.name(db).display(db, edition));
             fn_params = Some(match callable.receiver_param(db) {
                 Some(_self) => func.params_without_self(db),
                 None => func.assoc_fn_params(db),
             });
         }
         hir::CallableKind::TupleStruct(strukt) => {
-            res.doc = strukt.docs(db).map(|it| it.into());
-            format_to!(res.signature, "struct {}", strukt.name(db));
+            res.doc = strukt.docs(db);
+            format_to!(res.signature, "struct {}", strukt.name(db).display(db, edition));
         }
         hir::CallableKind::TupleEnumVariant(variant) => {
-            res.doc = variant.docs(db).map(|it| it.into());
+            res.doc = variant.docs(db);
             format_to!(
                 res.signature,
                 "enum {}::{}",
-                variant.parent_enum(db).name(db),
-                variant.name(db)
+                variant.parent_enum(db).name(db).display(db, edition),
+                variant.name(db).display(db, edition)
             );
         }
-        hir::CallableKind::Closure | hir::CallableKind::FnPtr => (),
+        hir::CallableKind::Closure(closure) => {
+            let fn_trait = closure.fn_trait(db);
+            format_to!(res.signature, "impl {fn_trait}")
+        }
+        hir::CallableKind::FnPtr => format_to!(res.signature, "fn"),
+        hir::CallableKind::FnImpl(fn_trait) => match callable.ty().as_adt() {
+            // FIXME: Render docs of the concrete trait impl function
+            Some(adt) => format_to!(
+                res.signature,
+                "<{} as {fn_trait}>::{}",
+                adt.name(db).display(db, edition),
+                fn_trait.function_name()
+            ),
+            None => format_to!(res.signature, "impl {fn_trait}"),
+        },
     }
 
     res.signature.push('(');
     {
-        if let Some(self_param) = callable.receiver_param(db) {
-            format_to!(res.signature, "{}", self_param)
+        if let Some((self_param, _)) = callable.receiver_param(db) {
+            format_to!(res.signature, "{}", self_param.display(db, edition))
         }
         let mut buf = String::new();
-        for (idx, (pat, ty)) in callable.params(db).into_iter().enumerate() {
+        for (idx, p) in callable.params().into_iter().enumerate() {
             buf.clear();
-            if let Some(pat) = pat {
-                match pat {
-                    Either::Left(_self) => format_to!(buf, "self: "),
-                    Either::Right(pat) => format_to!(buf, "{}: ", pat),
+            if let Some(param) = sema.source(p.clone()) {
+                match param.value {
+                    Either::Right(param) => match param.pat() {
+                        Some(pat) => format_to!(buf, "{}: ", pat),
+                        None => format_to!(buf, "?: "),
+                    },
+                    Either::Left(_) => format_to!(buf, "self: "),
                 }
             }
             // APITs (argument position `impl Trait`s) are inferred as {unknown} as the user is
@@ -171,9 +240,11 @@ fn signature_help_for_call(
             // In that case, fall back to render definitions of the respective parameters.
             // This is overly conservative: we do not substitute known type vars
             // (see FIXME in tests::impl_trait) and falling back on any unknowns.
-            match (ty.contains_unknown(), fn_params.as_deref()) {
-                (true, Some(fn_params)) => format_to!(buf, "{}", fn_params[idx].ty().display(db)),
-                _ => format_to!(buf, "{}", ty.display(db)),
+            match (p.ty().contains_unknown(), fn_params.as_deref()) {
+                (true, Some(fn_params)) => {
+                    format_to!(buf, "{}", fn_params[idx].ty().display(db, edition))
+                }
+                _ => format_to!(buf, "{}", p.ty().display(db, edition)),
             }
             res.push_call_param(&buf);
         }
@@ -182,16 +253,17 @@ fn signature_help_for_call(
 
     let mut render = |ret_type: hir::Type| {
         if !ret_type.is_unit() {
-            format_to!(res.signature, " -> {}", ret_type.display(db));
+            format_to!(res.signature, " -> {}", ret_type.display(db, edition));
         }
     };
     match callable.kind() {
         hir::CallableKind::Function(func) if callable.return_type().contains_unknown() => {
             render(func.ret_type(db))
         }
-        hir::CallableKind::Function(_) | hir::CallableKind::Closure | hir::CallableKind::FnPtr => {
-            render(callable.return_type())
-        }
+        hir::CallableKind::Function(_)
+        | hir::CallableKind::Closure(_)
+        | hir::CallableKind::FnPtr
+        | hir::CallableKind::FnImpl(_) => render(callable.return_type()),
         hir::CallableKind::TupleStruct(_) | hir::CallableKind::TupleEnumVariant(_) => {}
     }
     Some(res)
@@ -199,58 +271,12 @@ fn signature_help_for_call(
 
 fn signature_help_for_generics(
     sema: &Semantics<'_, RootDatabase>,
+    arg_list: ast::GenericArgList,
     token: SyntaxToken,
+    edition: Edition,
 ) -> Option<SignatureHelp> {
-    let parent = token.parent()?;
-    let arg_list = parent
-        .ancestors()
-        .filter_map(ast::GenericArgList::cast)
-        .find(|list| list.syntax().text_range().contains(token.text_range().start()))?;
-
-    let mut active_parameter = arg_list
-        .generic_args()
-        .take_while(|arg| arg.syntax().text_range().end() <= token.text_range().start())
-        .count();
-
-    let first_arg_is_non_lifetime = arg_list
-        .generic_args()
-        .next()
-        .map_or(false, |arg| !matches!(arg, ast::GenericArg::LifetimeArg(_)));
-
-    let mut generics_def = if let Some(path) =
-        arg_list.syntax().ancestors().find_map(ast::Path::cast)
-    {
-        let res = sema.resolve_path(&path)?;
-        let generic_def: hir::GenericDef = match res {
-            hir::PathResolution::Def(hir::ModuleDef::Adt(it)) => it.into(),
-            hir::PathResolution::Def(hir::ModuleDef::Function(it)) => it.into(),
-            hir::PathResolution::Def(hir::ModuleDef::Trait(it)) => it.into(),
-            hir::PathResolution::Def(hir::ModuleDef::TypeAlias(it)) => it.into(),
-            hir::PathResolution::Def(hir::ModuleDef::Variant(it)) => it.into(),
-            hir::PathResolution::Def(hir::ModuleDef::BuiltinType(_))
-            | hir::PathResolution::Def(hir::ModuleDef::Const(_))
-            | hir::PathResolution::Def(hir::ModuleDef::Macro(_))
-            | hir::PathResolution::Def(hir::ModuleDef::Module(_))
-            | hir::PathResolution::Def(hir::ModuleDef::Static(_)) => return None,
-            hir::PathResolution::BuiltinAttr(_)
-            | hir::PathResolution::ToolModule(_)
-            | hir::PathResolution::Local(_)
-            | hir::PathResolution::TypeParam(_)
-            | hir::PathResolution::ConstParam(_)
-            | hir::PathResolution::SelfType(_)
-            | hir::PathResolution::DeriveHelper(_) => return None,
-        };
-
-        generic_def
-    } else if let Some(method_call) = arg_list.syntax().parent().and_then(ast::MethodCallExpr::cast)
-    {
-        // recv.method::<$0>()
-        let method = sema.resolve_method_call(&method_call)?;
-        method.into()
-    } else {
-        return None;
-    };
-
+    let (generics_def, mut active_parameter, first_arg_is_non_lifetime, variant) =
+        generic_def_for_node(sema, &arg_list, &token)?;
     let mut res = SignatureHelp {
         doc: None,
         signature: String::new(),
@@ -261,40 +287,43 @@ fn signature_help_for_generics(
     let db = sema.db;
     match generics_def {
         hir::GenericDef::Function(it) => {
-            res.doc = it.docs(db).map(|it| it.into());
-            format_to!(res.signature, "fn {}", it.name(db));
+            res.doc = it.docs(db);
+            format_to!(res.signature, "fn {}", it.name(db).display(db, edition));
         }
         hir::GenericDef::Adt(hir::Adt::Enum(it)) => {
-            res.doc = it.docs(db).map(|it| it.into());
-            format_to!(res.signature, "enum {}", it.name(db));
+            res.doc = it.docs(db);
+            format_to!(res.signature, "enum {}", it.name(db).display(db, edition));
+            if let Some(variant) = variant {
+                // In paths, generics of an enum can be specified *after* one of its variants.
+                // eg. `None::<u8>`
+                // We'll use the signature of the enum, but include the docs of the variant.
+                res.doc = variant.docs(db);
+            }
         }
         hir::GenericDef::Adt(hir::Adt::Struct(it)) => {
-            res.doc = it.docs(db).map(|it| it.into());
-            format_to!(res.signature, "struct {}", it.name(db));
+            res.doc = it.docs(db);
+            format_to!(res.signature, "struct {}", it.name(db).display(db, edition));
         }
         hir::GenericDef::Adt(hir::Adt::Union(it)) => {
-            res.doc = it.docs(db).map(|it| it.into());
-            format_to!(res.signature, "union {}", it.name(db));
+            res.doc = it.docs(db);
+            format_to!(res.signature, "union {}", it.name(db).display(db, edition));
         }
         hir::GenericDef::Trait(it) => {
-            res.doc = it.docs(db).map(|it| it.into());
-            format_to!(res.signature, "trait {}", it.name(db));
+            res.doc = it.docs(db);
+            format_to!(res.signature, "trait {}", it.name(db).display(db, edition));
+        }
+        hir::GenericDef::TraitAlias(it) => {
+            res.doc = it.docs(db);
+            format_to!(res.signature, "trait {}", it.name(db).display(db, edition));
         }
         hir::GenericDef::TypeAlias(it) => {
-            res.doc = it.docs(db).map(|it| it.into());
-            format_to!(res.signature, "type {}", it.name(db));
-        }
-        hir::GenericDef::Variant(it) => {
-            // In paths, generics of an enum can be specified *after* one of its variants.
-            // eg. `None::<u8>`
-            // We'll use the signature of the enum, but include the docs of the variant.
-            res.doc = it.docs(db).map(|it| it.into());
-            let it = it.parent_enum(db);
-            format_to!(res.signature, "enum {}", it.name(db));
-            generics_def = it.into();
+            res.doc = it.docs(db);
+            format_to!(res.signature, "type {}", it.name(db).display(db, edition));
         }
         // These don't have generic args that can be specified
-        hir::GenericDef::Impl(_) | hir::GenericDef::Const(_) => return None,
+        hir::GenericDef::Impl(_) | hir::GenericDef::Const(_) | hir::GenericDef::Static(_) => {
+            return None
+        }
     }
 
     let params = generics_def.params(sema.db);
@@ -316,11 +345,11 @@ fn signature_help_for_generics(
         }
 
         buf.clear();
-        format_to!(buf, "{}", param.display(db));
+        format_to!(buf, "{}", param.display(db, edition));
         res.push_generic_param(&buf);
     }
     if let hir::GenericDef::Trait(tr) = generics_def {
-        add_assoc_type_bindings(db, &mut res, tr, arg_list);
+        add_assoc_type_bindings(db, &mut res, tr, arg_list, edition);
     }
     res.signature.push('>');
 
@@ -332,6 +361,7 @@ fn add_assoc_type_bindings(
     res: &mut SignatureHelp,
     tr: Trait,
     args: ast::GenericArgList,
+    edition: Edition,
 ) {
     if args.syntax().ancestors().find_map(ast::TypeBound::cast).is_none() {
         // Assoc type bindings are only valid in type bound position.
@@ -355,7 +385,7 @@ fn add_assoc_type_bindings(
 
     for item in tr.items_with_supertraits(db) {
         if let AssocItem::TypeAlias(ty) = item {
-            let name = ty.name(db).to_smol_str();
+            let name = ty.name(db).display_no_db(edition).to_smolstr();
             if !present_bindings.contains(&*name) {
                 buf.clear();
                 format_to!(buf, "{} = …", name);
@@ -365,32 +395,322 @@ fn add_assoc_type_bindings(
     }
 }
 
+fn signature_help_for_record_lit(
+    sema: &Semantics<'_, RootDatabase>,
+    record: ast::RecordExpr,
+    token: SyntaxToken,
+    edition: Edition,
+) -> Option<SignatureHelp> {
+    signature_help_for_record_(
+        sema,
+        record.record_expr_field_list()?.syntax().children_with_tokens(),
+        &record.path()?,
+        record
+            .record_expr_field_list()?
+            .fields()
+            .filter_map(|field| sema.resolve_record_field(&field))
+            .map(|(field, _, ty)| (field, ty)),
+        token,
+        edition,
+    )
+}
+
+fn signature_help_for_record_pat(
+    sema: &Semantics<'_, RootDatabase>,
+    record: ast::RecordPat,
+    token: SyntaxToken,
+    edition: Edition,
+) -> Option<SignatureHelp> {
+    signature_help_for_record_(
+        sema,
+        record.record_pat_field_list()?.syntax().children_with_tokens(),
+        &record.path()?,
+        record
+            .record_pat_field_list()?
+            .fields()
+            .filter_map(|field| sema.resolve_record_pat_field(&field)),
+        token,
+        edition,
+    )
+}
+
+fn signature_help_for_tuple_struct_pat(
+    sema: &Semantics<'_, RootDatabase>,
+    pat: ast::TupleStructPat,
+    token: SyntaxToken,
+    edition: Edition,
+) -> Option<SignatureHelp> {
+    let path = pat.path()?;
+    let path_res = sema.resolve_path(&path)?;
+    let mut res = SignatureHelp {
+        doc: None,
+        signature: String::new(),
+        parameters: vec![],
+        active_parameter: None,
+    };
+    let db = sema.db;
+
+    let fields: Vec<_> = if let PathResolution::Def(ModuleDef::Variant(variant)) = path_res {
+        let en = variant.parent_enum(db);
+
+        res.doc = en.docs(db);
+        format_to!(
+            res.signature,
+            "enum {}::{} (",
+            en.name(db).display(db, edition),
+            variant.name(db).display(db, edition)
+        );
+        variant.fields(db)
+    } else {
+        let adt = match path_res {
+            PathResolution::SelfType(imp) => imp.self_ty(db).as_adt()?,
+            PathResolution::Def(ModuleDef::Adt(adt)) => adt,
+            _ => return None,
+        };
+
+        match adt {
+            hir::Adt::Struct(it) => {
+                res.doc = it.docs(db);
+                format_to!(res.signature, "struct {} (", it.name(db).display(db, edition));
+                it.fields(db)
+            }
+            _ => return None,
+        }
+    };
+    Some(signature_help_for_tuple_pat_ish(
+        db,
+        res,
+        pat.syntax(),
+        token,
+        pat.fields(),
+        fields.into_iter().map(|it| it.ty(db)),
+        edition,
+    ))
+}
+
+fn signature_help_for_tuple_pat(
+    sema: &Semantics<'_, RootDatabase>,
+    pat: ast::TuplePat,
+    token: SyntaxToken,
+    edition: Edition,
+) -> Option<SignatureHelp> {
+    let db = sema.db;
+    let field_pats = pat.fields();
+    let pat = pat.into();
+    let ty = sema.type_of_pat(&pat)?;
+    let fields = ty.original.tuple_fields(db);
+
+    Some(signature_help_for_tuple_pat_ish(
+        db,
+        SignatureHelp {
+            doc: None,
+            signature: String::from('('),
+            parameters: vec![],
+            active_parameter: None,
+        },
+        pat.syntax(),
+        token,
+        field_pats,
+        fields.into_iter(),
+        edition,
+    ))
+}
+
+fn signature_help_for_tuple_expr(
+    sema: &Semantics<'_, RootDatabase>,
+    expr: ast::TupleExpr,
+    token: SyntaxToken,
+    edition: Edition,
+) -> Option<SignatureHelp> {
+    let active_parameter = Some(
+        expr.syntax()
+            .children_with_tokens()
+            .filter_map(NodeOrToken::into_token)
+            .filter(|t| t.kind() == T![,])
+            .take_while(|t| t.text_range().start() <= token.text_range().start())
+            .count(),
+    );
+
+    let db = sema.db;
+    let mut res = SignatureHelp {
+        doc: None,
+        signature: String::from('('),
+        parameters: vec![],
+        active_parameter,
+    };
+    let expr = sema.type_of_expr(&expr.into())?;
+    let fields = expr.original.tuple_fields(db);
+    let mut buf = String::new();
+    for ty in fields {
+        format_to!(buf, "{}", ty.display_truncated(db, Some(20), edition));
+        res.push_call_param(&buf);
+        buf.clear();
+    }
+    res.signature.push(')');
+    Some(res)
+}
+
+fn signature_help_for_record_(
+    sema: &Semantics<'_, RootDatabase>,
+    field_list_children: SyntaxElementChildren,
+    path: &ast::Path,
+    fields2: impl Iterator<Item = (hir::Field, hir::Type)>,
+    token: SyntaxToken,
+    edition: Edition,
+) -> Option<SignatureHelp> {
+    let active_parameter = field_list_children
+        .filter_map(NodeOrToken::into_token)
+        .filter(|t| t.kind() == T![,])
+        .take_while(|t| t.text_range().start() <= token.text_range().start())
+        .count();
+
+    let mut res = SignatureHelp {
+        doc: None,
+        signature: String::new(),
+        parameters: vec![],
+        active_parameter: Some(active_parameter),
+    };
+
+    let fields;
+
+    let db = sema.db;
+    let path_res = sema.resolve_path(path)?;
+    if let PathResolution::Def(ModuleDef::Variant(variant)) = path_res {
+        fields = variant.fields(db);
+        let en = variant.parent_enum(db);
+
+        res.doc = en.docs(db);
+        format_to!(
+            res.signature,
+            "enum {}::{} {{ ",
+            en.name(db).display(db, edition),
+            variant.name(db).display(db, edition)
+        );
+    } else {
+        let adt = match path_res {
+            PathResolution::SelfType(imp) => imp.self_ty(db).as_adt()?,
+            PathResolution::Def(ModuleDef::Adt(adt)) => adt,
+            _ => return None,
+        };
+
+        match adt {
+            hir::Adt::Struct(it) => {
+                fields = it.fields(db);
+                res.doc = it.docs(db);
+                format_to!(res.signature, "struct {} {{ ", it.name(db).display(db, edition));
+            }
+            hir::Adt::Union(it) => {
+                fields = it.fields(db);
+                res.doc = it.docs(db);
+                format_to!(res.signature, "union {} {{ ", it.name(db).display(db, edition));
+            }
+            _ => return None,
+        }
+    }
+
+    let mut fields =
+        fields.into_iter().map(|field| (field.name(db), Some(field))).collect::<FxIndexMap<_, _>>();
+    let mut buf = String::new();
+    for (field, ty) in fields2 {
+        let name = field.name(db);
+        format_to!(
+            buf,
+            "{}: {}",
+            name.display(db, edition),
+            ty.display_truncated(db, Some(20), edition)
+        );
+        res.push_record_field(&buf);
+        buf.clear();
+
+        if let Some(field) = fields.get_mut(&name) {
+            *field = None;
+        }
+    }
+    for (name, field) in fields {
+        let Some(field) = field else { continue };
+        format_to!(
+            buf,
+            "{}: {}",
+            name.display(db, edition),
+            field.ty(db).display_truncated(db, Some(20), edition)
+        );
+        res.push_record_field(&buf);
+        buf.clear();
+    }
+    res.signature.push_str(" }");
+    Some(res)
+}
+
+fn signature_help_for_tuple_pat_ish(
+    db: &RootDatabase,
+    mut res: SignatureHelp,
+    pat: &SyntaxNode,
+    token: SyntaxToken,
+    mut field_pats: AstChildren<ast::Pat>,
+    fields: impl ExactSizeIterator<Item = hir::Type>,
+    edition: Edition,
+) -> SignatureHelp {
+    let rest_pat = field_pats.find(|it| matches!(it, ast::Pat::RestPat(_)));
+    let is_left_of_rest_pat =
+        rest_pat.is_none_or(|it| token.text_range().start() < it.syntax().text_range().end());
+
+    let commas = pat
+        .children_with_tokens()
+        .filter_map(NodeOrToken::into_token)
+        .filter(|t| t.kind() == T![,]);
+
+    res.active_parameter = {
+        Some(if is_left_of_rest_pat {
+            commas.take_while(|t| t.text_range().start() <= token.text_range().start()).count()
+        } else {
+            let n_commas = commas
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .take_while(|t| t.text_range().start() > token.text_range().start())
+                .count();
+            fields.len().saturating_sub(1).saturating_sub(n_commas)
+        })
+    };
+
+    let mut buf = String::new();
+    for ty in fields {
+        format_to!(buf, "{}", ty.display_truncated(db, Some(20), edition));
+        res.push_call_param(&buf);
+        buf.clear();
+    }
+    res.signature.push(')');
+    res
+}
 #[cfg(test)]
 mod tests {
     use std::iter;
 
     use expect_test::{expect, Expect};
-    use ide_db::base_db::{fixture::ChangeFixture, FilePosition};
+    use ide_db::FilePosition;
     use stdx::format_to;
+    use test_fixture::ChangeFixture;
 
     use crate::RootDatabase;
 
     /// Creates analysis from a multi-file fixture, returns positions marked with $0.
-    pub(crate) fn position(ra_fixture: &str) -> (RootDatabase, FilePosition) {
+    pub(crate) fn position(
+        #[rust_analyzer::rust_fixture] ra_fixture: &str,
+    ) -> (RootDatabase, FilePosition) {
         let change_fixture = ChangeFixture::parse(ra_fixture);
         let mut database = RootDatabase::default();
         database.apply_change(change_fixture.change);
         let (file_id, range_or_offset) =
             change_fixture.file_position.expect("expected a marker ($0)");
         let offset = range_or_offset.expect_offset();
-        (database, FilePosition { file_id, offset })
+        (database, FilePosition { file_id: file_id.into(), offset })
     }
 
-    fn check(ra_fixture: &str, expect: Expect) {
-        // Implicitly add `Sized` to avoid noisy `T: ?Sized` in the results.
+    #[track_caller]
+    fn check(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect) {
         let fixture = format!(
             r#"
-#[lang = "sized"] trait Sized {{}}
+//- minicore: sized, fn
 {ra_fixture}
             "#
         );
@@ -644,7 +964,7 @@ pub fn add_one(x: i32) -> i32 {
     x + 1
 }
 
-pub fn do() {
+pub fn r#do() {
     add_one($0
 }"#,
             expect![[r##"
@@ -770,6 +1090,32 @@ fn f() {
 "#,
             expect![[]],
         );
+        check(
+            r#"
+fn foo(a: u8) -> u8 {a}
+fn bar(a: u8) -> u8 {a}
+fn f() {
+    foo(bar(123)$0)
+}
+"#,
+            expect![[r#"
+                fn foo(a: u8) -> u8
+                       ^^^^^
+            "#]],
+        );
+        check(
+            r#"
+struct Vec<T>(T);
+struct Vec2<T>(T);
+fn f() {
+    let _: Vec2<Vec<u8>$0>
+}
+"#,
+            expect![[r#"
+                struct Vec2<T>
+                            ^
+            "#]],
+        );
     }
 
     #[test]
@@ -808,6 +1154,119 @@ fn main() {
                 ------
                 struct S(u32, i32)
                          ---  ^^^
+            "#]],
+        );
+    }
+
+    #[test]
+    fn tuple_struct_pat() {
+        check(
+            r#"
+/// A cool tuple struct
+struct S(u32, i32);
+fn main() {
+    let S(0, $0);
+}
+"#,
+            expect![[r#"
+                A cool tuple struct
+                ------
+                struct S (u32, i32)
+                          ---  ^^^
+            "#]],
+        );
+    }
+
+    #[test]
+    fn tuple_struct_pat_rest() {
+        check(
+            r#"
+/// A cool tuple struct
+struct S(u32, i32, f32, u16);
+fn main() {
+    let S(0, .., $0);
+}
+"#,
+            expect![[r#"
+                A cool tuple struct
+                ------
+                struct S (u32, i32, f32, u16)
+                          ---  ---  ---  ^^^
+            "#]],
+        );
+        check(
+            r#"
+/// A cool tuple struct
+struct S(u32, i32, f32, u16, u8);
+fn main() {
+    let S(0, .., $0, 0);
+}
+"#,
+            expect![[r#"
+                A cool tuple struct
+                ------
+                struct S (u32, i32, f32, u16, u8)
+                          ---  ---  ---  ^^^  --
+            "#]],
+        );
+        check(
+            r#"
+/// A cool tuple struct
+struct S(u32, i32, f32, u16);
+fn main() {
+    let S($0, .., 1);
+}
+"#,
+            expect![[r#"
+                A cool tuple struct
+                ------
+                struct S (u32, i32, f32, u16)
+                          ^^^  ---  ---  ---
+            "#]],
+        );
+        check(
+            r#"
+/// A cool tuple struct
+struct S(u32, i32, f32, u16, u8);
+fn main() {
+    let S(1, .., 1, $0, 2);
+}
+"#,
+            expect![[r#"
+                A cool tuple struct
+                ------
+                struct S (u32, i32, f32, u16, u8)
+                          ---  ---  ---  ^^^  --
+            "#]],
+        );
+        check(
+            r#"
+/// A cool tuple struct
+struct S(u32, i32, f32, u16);
+fn main() {
+    let S(1, $0.., 1);
+}
+"#,
+            expect![[r#"
+                A cool tuple struct
+                ------
+                struct S (u32, i32, f32, u16)
+                          ---  ^^^  ---  ---
+            "#]],
+        );
+        check(
+            r#"
+/// A cool tuple struct
+struct S(u32, i32, f32, u16);
+fn main() {
+    let S(1, ..$0, 1);
+}
+"#,
+            expect![[r#"
+                A cool tuple struct
+                ------
+                struct S (u32, i32, f32, u16)
+                          ---  ^^^  ---  ---
             "#]],
         );
     }
@@ -905,7 +1364,40 @@ id! {
     }
 
     #[test]
+    fn fn_signature_for_method_call_defined_in_macro() {
+        check(
+            r#"
+macro_rules! id { ($($tt:tt)*) => { $($tt)* } }
+struct S;
+id! {
+    impl S {
+        fn foo<'a>(&'a mut self) {}
+    }
+}
+fn test() { S.foo($0); }
+"#,
+            expect![[r#"
+                fn foo(&'a mut self)
+            "#]],
+        );
+    }
+
+    #[test]
     fn call_info_for_lambdas() {
+        check(
+            r#"
+struct S;
+fn foo(s: S) -> i32 { 92 }
+fn main() {
+    let _move = S;
+    (|s| {{_move}; foo(s)})($0)
+}
+        "#,
+            expect![[r#"
+                impl FnOnce(s: S) -> i32
+                            ^^^^
+            "#]],
+        );
         check(
             r#"
 struct S;
@@ -915,8 +1407,40 @@ fn main() {
 }
         "#,
             expect![[r#"
-                (s: S) -> i32
-                 ^^^^
+                impl Fn(s: S) -> i32
+                        ^^^^
+            "#]],
+        );
+        check(
+            r#"
+struct S;
+fn foo(s: S) -> i32 { 92 }
+fn main() {
+    let mut mutate = 0;
+    (|s| { mutate = 1; foo(s) })($0)
+}
+        "#,
+            expect![[r#"
+                impl FnMut(s: S) -> i32
+                           ^^^^
+            "#]],
+        );
+    }
+
+    #[test]
+    fn call_info_for_fn_def_over_reference() {
+        check(
+            r#"
+struct S;
+fn foo(s: S) -> i32 { 92 }
+fn main() {
+    let bar = &&&&&foo;
+    bar($0);
+}
+        "#,
+            expect![[r#"
+                fn foo(s: S) -> i32
+                       ^^^^
             "#]],
         )
     }
@@ -930,10 +1454,79 @@ fn main(f: fn(i32, f64) -> char) {
 }
         "#,
             expect![[r#"
-                (i32, f64) -> char
-                 ---  ^^^
+                fn(i32, f64) -> char
+                   ---  ^^^
             "#]],
         )
+    }
+
+    #[test]
+    fn call_info_for_fn_impl() {
+        check(
+            r#"
+struct S;
+impl core::ops::FnOnce<(i32, f64)> for S {
+    type Output = char;
+}
+impl core::ops::FnMut<(i32, f64)> for S {}
+impl core::ops::Fn<(i32, f64)> for S {}
+fn main() {
+    S($0);
+}
+        "#,
+            expect![[r#"
+                <S as Fn>::call(i32, f64) -> char
+                                ^^^  ---
+            "#]],
+        );
+        check(
+            r#"
+struct S;
+impl core::ops::FnOnce<(i32, f64)> for S {
+    type Output = char;
+}
+impl core::ops::FnMut<(i32, f64)> for S {}
+impl core::ops::Fn<(i32, f64)> for S {}
+fn main() {
+    S(1, $0);
+}
+        "#,
+            expect![[r#"
+                <S as Fn>::call(i32, f64) -> char
+                                ---  ^^^
+            "#]],
+        );
+        check(
+            r#"
+struct S;
+impl core::ops::FnOnce<(i32, f64)> for S {
+    type Output = char;
+}
+impl core::ops::FnOnce<(char, char)> for S {
+    type Output = f64;
+}
+fn main() {
+    S($0);
+}
+        "#,
+            expect![""],
+        );
+        check(
+            r#"
+struct S;
+impl core::ops::FnOnce<(i32, f64)> for S {
+    type Output = char;
+}
+impl core::ops::FnOnce<(char, char)> for S {
+    type Output = f64;
+}
+fn main() {
+    // FIXME: The ide layer loses the calling info here so we get an ambiguous trait solve result
+    S(0i32, $0);
+}
+        "#,
+            expect![""],
+        );
     }
 
     #[test]
@@ -1328,6 +1921,478 @@ fn f() {
             expect![[r#"
                 fn foo(self: &Self, other: Self)
                        ^^^^^^^^^^^  -----------
+            "#]],
+        );
+    }
+
+    #[test]
+    fn help_for_generic_call() {
+        check(
+            r#"
+fn f<F: FnOnce(u8, u16) -> i32>(f: F) {
+    f($0)
+}
+"#,
+            expect![[r#"
+                impl FnOnce(u8, u16) -> i32
+                            ^^  ---
+            "#]],
+        );
+        check(
+            r#"
+fn f<T, F: FnMut(&T, u16) -> &T>(f: F) {
+    f($0)
+}
+"#,
+            expect![[r#"
+                impl FnMut(&T, u16) -> &T
+                           ^^  ---
+            "#]],
+        );
+    }
+
+    #[test]
+    fn regression_13579() {
+        check(
+            r#"
+fn f() {
+    take(2)($0);
+}
+
+fn take<C, Error>(
+    count: C
+) -> impl Fn() -> C  {
+    move || count
+}
+"#,
+            expect![[r#"
+                impl Fn() -> i32
+            "#]],
+        );
+    }
+
+    #[test]
+    fn record_literal() {
+        check(
+            r#"
+struct Strukt<T, U = ()> {
+    t: T,
+    u: U,
+    unit: (),
+}
+fn f() {
+    Strukt {
+        u: 0,
+        $0
+    }
+}
+"#,
+            expect![[r#"
+                struct Strukt { u: i32, t: T, unit: () }
+                                ------  ^^^^  --------
+            "#]],
+        );
+    }
+
+    #[test]
+    fn record_literal_nonexistent_field() {
+        check(
+            r#"
+struct Strukt {
+    a: u8,
+}
+fn f() {
+    Strukt {
+        b: 8,
+        $0
+    }
+}
+"#,
+            expect![[r#"
+                struct Strukt { a: u8 }
+                                -----
+            "#]],
+        );
+    }
+
+    #[test]
+    fn tuple_variant_record_literal() {
+        check(
+            r#"
+enum Opt {
+    Some(u8),
+}
+fn f() {
+    Opt::Some {$0}
+}
+"#,
+            expect![[r#"
+                enum Opt::Some { 0: u8 }
+                                 ^^^^^
+            "#]],
+        );
+        check(
+            r#"
+enum Opt {
+    Some(u8),
+}
+fn f() {
+    Opt::Some {0:0,$0}
+}
+"#,
+            expect![[r#"
+                enum Opt::Some { 0: u8 }
+                                 -----
+            "#]],
+        );
+    }
+
+    #[test]
+    fn record_literal_self() {
+        check(
+            r#"
+struct S { t: u8 }
+impl S {
+    fn new() -> Self {
+        Self { $0 }
+    }
+}
+        "#,
+            expect![[r#"
+                struct S { t: u8 }
+                           ^^^^^
+            "#]],
+        );
+    }
+
+    #[test]
+    fn record_pat() {
+        check(
+            r#"
+struct Strukt<T, U = ()> {
+    t: T,
+    u: U,
+    unit: (),
+}
+fn f() {
+    let Strukt {
+        u: 0,
+        $0
+    }
+}
+"#,
+            expect![[r#"
+                struct Strukt { u: i32, t: T, unit: () }
+                                ------  ^^^^  --------
+            "#]],
+        );
+    }
+
+    #[test]
+    fn test_enum_in_nested_method_in_lambda() {
+        check(
+            r#"
+enum A {
+    A,
+    B
+}
+
+fn bar(_: A) { }
+
+fn main() {
+    let foo = Foo;
+    std::thread::spawn(move || { bar(A:$0) } );
+}
+"#,
+            expect![[r#"
+                fn bar(_: A)
+                       ^^^^
+            "#]],
+        );
+    }
+
+    #[test]
+    fn test_tuple_expr_free() {
+        check(
+            r#"
+fn main() {
+    (0$0, 1, 3);
+}
+"#,
+            expect![[r#"
+                (i32, i32, i32)
+                 ^^^  ---  ---
+            "#]],
+        );
+        check(
+            r#"
+fn main() {
+    ($0 1, 3);
+}
+"#,
+            expect![[r#"
+                (i32, i32)
+                 ^^^  ---
+            "#]],
+        );
+        check(
+            r#"
+fn main() {
+    (1, 3 $0);
+}
+"#,
+            expect![[r#"
+                (i32, i32)
+                 ---  ^^^
+            "#]],
+        );
+        check(
+            r#"
+fn main() {
+    (1, 3 $0,);
+}
+"#,
+            expect![[r#"
+                (i32, i32)
+                 ---  ^^^
+            "#]],
+        );
+    }
+
+    #[test]
+    fn test_tuple_expr_expected() {
+        check(
+            r#"
+fn main() {
+    let _: (&str, u32, u32)= ($0, 1, 3);
+}
+"#,
+            expect![[r#"
+                (&str, u32, u32)
+                 ^^^^  ---  ---
+            "#]],
+        );
+        // FIXME: Should typeck report a 4-ary tuple for the expression here?
+        check(
+            r#"
+fn main() {
+    let _: (&str, u32, u32, u32) = ($0, 1, 3);
+}
+"#,
+            expect![[r#"
+                (&str, u32, u32)
+                 ^^^^  ---  ---
+            "#]],
+        );
+        check(
+            r#"
+fn main() {
+    let _: (&str, u32, u32)= ($0, 1, 3, 5);
+}
+"#,
+            expect![[r#"
+                (&str, u32, u32, i32)
+                 ^^^^  ---  ---  ---
+            "#]],
+        );
+    }
+
+    #[test]
+    fn test_tuple_pat_free() {
+        check(
+            r#"
+fn main() {
+    let ($0, 1, 3);
+}
+"#,
+            expect![[r#"
+                ({unknown}, i32, i32)
+                 ^^^^^^^^^  ---  ---
+            "#]],
+        );
+        check(
+            r#"
+fn main() {
+    let (0$0, 1, 3);
+}
+"#,
+            expect![[r#"
+                (i32, i32, i32)
+                 ^^^  ---  ---
+            "#]],
+        );
+        check(
+            r#"
+fn main() {
+    let ($0 1, 3);
+}
+"#,
+            expect![[r#"
+                (i32, i32)
+                 ^^^  ---
+            "#]],
+        );
+        check(
+            r#"
+fn main() {
+    let (1, 3 $0);
+}
+"#,
+            expect![[r#"
+                (i32, i32)
+                 ---  ^^^
+            "#]],
+        );
+        check(
+            r#"
+fn main() {
+    let (1, 3 $0,);
+}
+"#,
+            expect![[r#"
+                (i32, i32)
+                 ---  ^^^
+            "#]],
+        );
+        check(
+            r#"
+fn main() {
+    let (1, 3 $0, ..);
+}
+"#,
+            expect![[r#"
+                (i32, i32)
+                 ---  ^^^
+            "#]],
+        );
+        check(
+            r#"
+fn main() {
+    let (1, 3, .., $0);
+}
+"#,
+            // FIXME: This is wrong, this should not mark the last as active
+            expect![[r#"
+                (i32, i32)
+                 ---  ^^^
+            "#]],
+        );
+    }
+
+    #[test]
+    fn test_tuple_pat_expected() {
+        check(
+            r#"
+fn main() {
+    let (0$0, 1, 3): (i32, i32, i32);
+}
+"#,
+            expect![[r#"
+                (i32, i32, i32)
+                 ^^^  ---  ---
+            "#]],
+        );
+        check(
+            r#"
+fn main() {
+    let ($0, 1, 3): (i32, i32, i32);
+}
+"#,
+            expect![[r#"
+                (i32, i32, i32)
+                 ^^^  ---  ---
+            "#]],
+        );
+        check(
+            r#"
+fn main() {
+    let (1, 3 $0): (i32,);
+}
+"#,
+            expect![[r#"
+                (i32, i32)
+                 ---  ^^^
+            "#]],
+        );
+        check(
+            r#"
+fn main() {
+    let (1, 3 $0, ..): (i32, i32, i32, i32);
+}
+"#,
+            expect![[r#"
+                (i32, i32, i32, i32)
+                 ---  ^^^  ---  ---
+            "#]],
+        );
+        check(
+            r#"
+fn main() {
+    let (1, 3, .., $0): (i32, i32, i32);
+}
+"#,
+            expect![[r#"
+                (i32, i32, i32)
+                 ---  ---  ^^^
+            "#]],
+        );
+    }
+    #[test]
+    fn test_tuple_pat_expected_inferred() {
+        check(
+            r#"
+fn main() {
+    let (0$0, 1, 3) = (1, 2 ,3);
+}
+"#,
+            expect![[r#"
+                (i32, i32, i32)
+                 ^^^  ---  ---
+            "#]],
+        );
+        check(
+            r#"
+fn main() {
+    let ($0 1, 3) = (1, 2, 3);
+}
+"#,
+            // FIXME: Should typeck report a 3-ary tuple for the pattern here?
+            expect![[r#"
+                (i32, i32)
+                 ^^^  ---
+            "#]],
+        );
+        check(
+            r#"
+fn main() {
+    let (1, 3 $0) = (1,);
+}
+"#,
+            expect![[r#"
+                (i32, i32)
+                 ---  ^^^
+            "#]],
+        );
+        check(
+            r#"
+fn main() {
+    let (1, 3 $0, ..) = (1, 2, 3, 4);
+}
+"#,
+            expect![[r#"
+                (i32, i32, i32, i32)
+                 ---  ^^^  ---  ---
+            "#]],
+        );
+        check(
+            r#"
+fn main() {
+    let (1, 3, .., $0) = (1, 2, 3);
+}
+"#,
+            expect![[r#"
+                (i32, i32, i32)
+                 ---  ---  ^^^
             "#]],
         );
     }

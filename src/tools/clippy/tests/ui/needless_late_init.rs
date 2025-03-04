@@ -1,14 +1,17 @@
-// run-rustfix
+//@aux-build:proc_macros.rs
 #![feature(let_chains)]
 #![allow(unused)]
 #![allow(
     clippy::assign_op_pattern,
-    clippy::blocks_in_if_conditions,
+    clippy::blocks_in_conditions,
     clippy::let_and_return,
     clippy::let_unit_value,
     clippy::nonminimal_bool,
-    clippy::uninlined_format_args
+    clippy::uninlined_format_args,
+    clippy::useless_vec
 )]
+
+extern crate proc_macros;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
@@ -22,22 +25,28 @@ impl std::ops::Drop for SignificantDrop {
 
 fn simple() {
     let a;
+    //~^ needless_late_init
     a = "zero";
 
     let b;
+    //~^ needless_late_init
     let c;
+    //~^ needless_late_init
     b = 1;
     c = 2;
 
     let d: usize;
+    //~^ needless_late_init
     d = 1;
 
     let e;
+    //~^ needless_late_init
     e = format!("{}", d);
 }
 
 fn main() {
     let a;
+    //~^ needless_late_init
     let n = 1;
     match n {
         1 => a = "one",
@@ -47,6 +56,7 @@ fn main() {
     }
 
     let b;
+    //~^ needless_late_init
     if n == 3 {
         b = "four";
     } else {
@@ -54,6 +64,7 @@ fn main() {
     }
 
     let d;
+    //~^ needless_late_init
     if true {
         let temp = 5;
         d = temp;
@@ -62,6 +73,7 @@ fn main() {
     }
 
     let e;
+    //~^ needless_late_init
     if true {
         e = format!("{} {}", a, b);
     } else {
@@ -69,12 +81,14 @@ fn main() {
     }
 
     let f;
+    //~^ needless_late_init
     match 1 {
         1 => f = "three",
         _ => return,
     }; // has semi
 
     let g: usize;
+    //~^ needless_late_init
     if true {
         g = 5;
     } else {
@@ -83,14 +97,17 @@ fn main() {
 
     // Drop order only matters if both are significant
     let x;
+    //~^ needless_late_init
     let y = SignificantDrop;
     x = 1;
 
     let x;
+    //~^ needless_late_init
     let y = 1;
     x = SignificantDrop;
 
     let x;
+    //~^ needless_late_init
     // types that should be considered insignificant
     let y = 1;
     let y = "2";
@@ -110,6 +127,7 @@ async fn in_async() -> &'static str {
     }
 
     let a;
+    //~^ needless_late_init
     let n = 1;
     match n {
         1 => a = f().await,
@@ -127,6 +145,7 @@ const fn in_const() -> &'static str {
     }
 
     let a;
+    //~^ needless_late_init
     let n = 1;
     match n {
         1 => a = f(),
@@ -138,6 +157,7 @@ const fn in_const() -> &'static str {
     a
 }
 
+#[proc_macros::inline_macros]
 fn does_not_lint() {
     let z;
     if false {
@@ -195,35 +215,27 @@ fn does_not_lint() {
     }
     y = 3;
 
-    macro_rules! assign {
-        ($i:ident) => {
-            $i = 1;
-        };
-    }
     let x;
-    assign!(x);
+    inline!($x = 1;);
 
     let x;
     if true {
-        assign!(x);
+        inline!($x = 1;);
     } else {
         x = 2;
     }
 
-    macro_rules! in_macro {
-        () => {
-            let x;
-            x = 1;
+    inline!({
+        let x;
+        x = 1;
 
-            let x;
-            if true {
-                x = 1;
-            } else {
-                x = 2;
-            }
-        };
-    }
-    in_macro!();
+        let x;
+        if true {
+            x = 1;
+        } else {
+            x = 2;
+        }
+    });
 
     // ignore if-lets - https://github.com/rust-lang/rust-clippy/issues/8613
     let x;
@@ -234,7 +246,9 @@ fn does_not_lint() {
     }
 
     let x;
-    if true && let Some(n) = Some("let chains too") {
+    if true
+        && let Some(n) = Some("let chains too")
+    {
         x = 1;
     } else {
         x = 2;
@@ -271,4 +285,15 @@ fn issue8911() -> u32 {
     }
 
     3
+}
+
+macro_rules! issue13776_mac {
+    ($var:expr, $val:literal) => {
+        $var = $val;
+    };
+}
+
+fn issue13776() {
+    let x;
+    issue13776_mac!(x, 10); // should not lint
 }

@@ -1,69 +1,77 @@
 //! Query configuration and description traits.
 
-use crate::dep_graph::DepNode;
-use crate::dep_graph::SerializedDepNodeIndex;
-use crate::error::HandleCycleError;
-use crate::ich::StableHashingContext;
-use crate::query::caches::QueryCache;
-use crate::query::{QueryContext, QueryState};
-
-use rustc_data_structures::fingerprint::Fingerprint;
 use std::fmt::Debug;
 use std::hash::Hash;
 
-pub trait QueryConfig {
-    const NAME: &'static str;
+use rustc_data_structures::fingerprint::Fingerprint;
+use rustc_span::ErrorGuaranteed;
 
-    type Key: Eq + Hash + Clone + Debug;
-    type Value;
-    type Stored: Clone;
-}
+use crate::dep_graph::{DepKind, DepNode, DepNodeParams, SerializedDepNodeIndex};
+use crate::error::HandleCycleError;
+use crate::ich::StableHashingContext;
+use crate::query::caches::QueryCache;
+use crate::query::{CycleError, DepNodeIndex, QueryContext, QueryState};
 
-#[derive(Copy, Clone)]
-pub struct QueryVTable<CTX: QueryContext, K, V> {
-    pub anon: bool,
-    pub dep_kind: CTX::DepKind,
-    pub eval_always: bool,
-    pub depth_limit: bool,
+pub type HashResult<V> = Option<fn(&mut StableHashingContext<'_>, &V) -> Fingerprint>;
 
-    pub compute: fn(CTX::DepContext, K) -> V,
-    pub hash_result: Option<fn(&mut StableHashingContext<'_>, &V) -> Fingerprint>,
-    pub handle_cycle_error: HandleCycleError,
-    // NOTE: this is also `None` if `cache_on_disk()` returns false, not just if it's unsupported by the query
-    pub try_load_from_disk: Option<fn(CTX, SerializedDepNodeIndex) -> Option<V>>,
-}
+pub trait QueryConfig<Qcx: QueryContext>: Copy {
+    fn name(self) -> &'static str;
 
-impl<CTX: QueryContext, K, V> QueryVTable<CTX, K, V> {
-    pub(crate) fn to_dep_node(&self, tcx: CTX::DepContext, key: &K) -> DepNode<CTX::DepKind>
-    where
-        K: crate::dep_graph::DepNodeParams<CTX::DepContext>,
-    {
-        DepNode::construct(tcx, self.dep_kind, key)
-    }
+    // `Key` and `Value` are `Copy` instead of `Clone` to ensure copying them stays cheap,
+    // but it isn't necessary.
+    type Key: DepNodeParams<Qcx::DepContext> + Eq + Hash + Copy + Debug;
+    type Value: Copy;
 
-    pub(crate) fn compute(&self, tcx: CTX::DepContext, key: K) -> V {
-        (self.compute)(tcx, key)
-    }
-}
+    type Cache: QueryCache<Key = Self::Key, Value = Self::Value>;
 
-pub trait QueryDescription<CTX: QueryContext>: QueryConfig {
-    type Cache: QueryCache<Key = Self::Key, Stored = Self::Stored, Value = Self::Value>;
+    fn format_value(self) -> fn(&Self::Value) -> String;
 
     // Don't use this method to access query results, instead use the methods on TyCtxt
-    fn query_state<'a>(tcx: CTX) -> &'a QueryState<Self::Key>
+    fn query_state<'a>(self, tcx: Qcx) -> &'a QueryState<Self::Key>
     where
-        CTX: 'a;
+        Qcx: 'a;
 
     // Don't use this method to access query results, instead use the methods on TyCtxt
-    fn query_cache<'a>(tcx: CTX) -> &'a Self::Cache
+    fn query_cache<'a>(self, tcx: Qcx) -> &'a Self::Cache
     where
-        CTX: 'a;
+        Qcx: 'a;
+
+    fn cache_on_disk(self, tcx: Qcx::DepContext, key: &Self::Key) -> bool;
 
     // Don't use this method to compute query results, instead use the methods on TyCtxt
-    fn make_vtable(tcx: CTX, key: &Self::Key) -> QueryVTable<CTX, Self::Key, Self::Value>;
+    fn execute_query(self, tcx: Qcx::DepContext, k: Self::Key) -> Self::Value;
 
-    fn cache_on_disk(tcx: CTX::DepContext, key: &Self::Key) -> bool;
+    fn compute(self, tcx: Qcx, key: Self::Key) -> Self::Value;
 
-    // Don't use this method to compute query results, instead use the methods on TyCtxt
-    fn execute_query(tcx: CTX::DepContext, k: Self::Key) -> Self::Stored;
+    fn try_load_from_disk(
+        self,
+        tcx: Qcx,
+        key: &Self::Key,
+        prev_index: SerializedDepNodeIndex,
+        index: DepNodeIndex,
+    ) -> Option<Self::Value>;
+
+    fn loadable_from_disk(self, qcx: Qcx, key: &Self::Key, idx: SerializedDepNodeIndex) -> bool;
+
+    /// Synthesize an error value to let compilation continue after a cycle.
+    fn value_from_cycle_error(
+        self,
+        tcx: Qcx::DepContext,
+        cycle_error: &CycleError,
+        guar: ErrorGuaranteed,
+    ) -> Self::Value;
+
+    fn anon(self) -> bool;
+    fn eval_always(self) -> bool;
+    fn depth_limit(self) -> bool;
+    fn feedable(self) -> bool;
+
+    fn dep_kind(self) -> DepKind;
+    fn handle_cycle_error(self) -> HandleCycleError;
+    fn hash_result(self) -> HashResult<Self::Value>;
+
+    // Just here for convenience and checking that the key matches the kind, don't override this.
+    fn construct_dep_node(self, tcx: Qcx::DepContext, key: &Self::Key) -> DepNode {
+        DepNode::construct(tcx, self.dep_kind(), key)
+    }
 }

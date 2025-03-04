@@ -4,7 +4,7 @@ use itertools::Itertools;
 
 use syntax::{
     ast::{self, HasName},
-    ted, AstNode, TextRange,
+    AstNode, SyntaxNode,
 };
 
 use crate::{utils::get_methods, AssistContext, AssistId, AssistKind, Assists};
@@ -87,11 +87,7 @@ pub(crate) fn sort_items(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<(
         return None;
     }
 
-    if let Some(trait_ast) = ctx.find_node_at_offset::<ast::Trait>() {
-        add_sort_methods_assist(acc, trait_ast.assoc_item_list()?)
-    } else if let Some(impl_ast) = ctx.find_node_at_offset::<ast::Impl>() {
-        add_sort_methods_assist(acc, impl_ast.assoc_item_list()?)
-    } else if let Some(struct_ast) = ctx.find_node_at_offset::<ast::Struct>() {
+    if let Some(struct_ast) = ctx.find_node_at_offset::<ast::Struct>() {
         add_sort_field_list_assist(acc, struct_ast.field_list())
     } else if let Some(union_ast) = ctx.find_node_at_offset::<ast::Union>() {
         add_sort_fields_assist(acc, union_ast.record_field_list()?)
@@ -103,6 +99,10 @@ pub(crate) fn sort_items(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<(
         add_sort_fields_assist(acc, enum_struct_variant_ast)
     } else if let Some(enum_ast) = ctx.find_node_at_offset::<ast::Enum>() {
         add_sort_variants_assist(acc, enum_ast.variant_list()?)
+    } else if let Some(trait_ast) = ctx.find_node_at_offset::<ast::Trait>() {
+        add_sort_methods_assist(acc, ctx, trait_ast.assoc_item_list()?)
+    } else if let Some(impl_ast) = ctx.find_node_at_offset::<ast::Impl>() {
+        add_sort_methods_assist(acc, ctx, impl_ast.assoc_item_list()?)
     } else {
         None
     }
@@ -114,7 +114,7 @@ trait AddRewrite {
         label: &str,
         old: Vec<T>,
         new: Vec<T>,
-        target: TextRange,
+        target: &SyntaxNode,
     ) -> Option<()>;
 }
 
@@ -124,15 +124,22 @@ impl AddRewrite for Assists {
         label: &str,
         old: Vec<T>,
         new: Vec<T>,
-        target: TextRange,
+        target: &SyntaxNode,
     ) -> Option<()> {
-        self.add(AssistId("sort_items", AssistKind::RefactorRewrite), label, target, |builder| {
-            let mutable: Vec<T> = old.into_iter().map(|it| builder.make_mut(it)).collect();
-            mutable
-                .into_iter()
-                .zip(new)
-                .for_each(|(old, new)| ted::replace(old.syntax(), new.clone_for_update().syntax()));
-        })
+        self.add(
+            AssistId("sort_items", AssistKind::RefactorRewrite),
+            label,
+            target.text_range(),
+            |builder| {
+                let mut editor = builder.make_editor(target);
+
+                old.into_iter()
+                    .zip(new)
+                    .for_each(|(old, new)| editor.replace(old.syntax(), new.syntax()));
+
+                builder.add_file_edits(builder.file_id, editor)
+            },
+        )
     }
 }
 
@@ -146,7 +153,19 @@ fn add_sort_field_list_assist(acc: &mut Assists, field_list: Option<ast::FieldLi
     }
 }
 
-fn add_sort_methods_assist(acc: &mut Assists, item_list: ast::AssocItemList) -> Option<()> {
+fn add_sort_methods_assist(
+    acc: &mut Assists,
+    ctx: &AssistContext<'_>,
+    item_list: ast::AssocItemList,
+) -> Option<()> {
+    let selection = ctx.selection_trimmed();
+
+    // ignore assist if the selection intersects with an associated item.
+    if item_list.assoc_items().any(|item| item.syntax().text_range().intersect(selection).is_some())
+    {
+        return None;
+    }
+
     let methods = get_methods(&item_list);
     let sorted = sort_by_name(&methods);
 
@@ -155,7 +174,7 @@ fn add_sort_methods_assist(acc: &mut Assists, item_list: ast::AssocItemList) -> 
         return None;
     }
 
-    acc.add_rewrite("Sort methods alphabetically", methods, sorted, item_list.syntax().text_range())
+    acc.add_rewrite("Sort methods alphabetically", methods, sorted, item_list.syntax())
 }
 
 fn add_sort_fields_assist(
@@ -170,12 +189,7 @@ fn add_sort_fields_assist(
         return None;
     }
 
-    acc.add_rewrite(
-        "Sort fields alphabetically",
-        fields,
-        sorted,
-        record_field_list.syntax().text_range(),
-    )
+    acc.add_rewrite("Sort fields alphabetically", fields, sorted, record_field_list.syntax())
 }
 
 fn add_sort_variants_assist(acc: &mut Assists, variant_list: ast::VariantList) -> Option<()> {
@@ -187,12 +201,7 @@ fn add_sort_variants_assist(acc: &mut Assists, variant_list: ast::VariantList) -
         return None;
     }
 
-    acc.add_rewrite(
-        "Sort variants alphabetically",
-        variants,
-        sorted,
-        variant_list.syntax().text_range(),
-    )
+    acc.add_rewrite("Sort variants alphabetically", variants, sorted, variant_list.syntax())
 }
 
 fn sort_by_name<T: HasName + Clone>(initial: &[T]) -> Vec<T> {
@@ -217,6 +226,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn not_applicable_if_selection_in_fn_body() {
+        check_assist_not_applicable(
+            sort_items,
+            r#"
+struct S;
+impl S {
+    fn func2() {
+        $0 bar $0
+    }
+    fn func() {}
+}
+        "#,
+        )
+    }
+
+    #[test]
+    fn not_applicable_if_selection_at_associated_const() {
+        check_assist_not_applicable(
+            sort_items,
+            r#"
+struct S;
+impl S {
+    fn func2() {}
+    fn func() {}
+    const C: () = $0()$0;
+}
+        "#,
+        )
+    }
+
+    #[test]
+    fn not_applicable_if_selection_overlaps_nodes() {
+        check_assist_not_applicable(
+            sort_items,
+            r#"
+struct S;
+impl $0S {
+    fn$0 func2() {}
+    fn func() {}
+}
+        "#,
+        )
+    }
+
+    #[test]
     fn not_applicable_if_no_selection() {
         cov_mark::check!(not_applicable_if_no_selection);
 
@@ -225,6 +279,21 @@ mod tests {
             r#"
 t$0rait Bar {
     fn b();
+    fn a();
+}
+        "#,
+        )
+    }
+
+    #[test]
+    fn not_applicable_if_selection_in_trait_fn_body() {
+        check_assist_not_applicable(
+            sort_items,
+            r#"
+trait Bar {
+    fn b() {
+        $0 hello $0
+    }
     fn a();
 }
         "#,
@@ -453,6 +522,31 @@ struct Bar {
     a: u32,
     b: u8,
     c: u64,
+}
+        "#,
+        )
+    }
+
+    #[test]
+    fn sort_struct_inside_a_function() {
+        check_assist(
+            sort_items,
+            r#"
+fn hello() {
+    $0struct Bar$0 {
+        b: u8,
+        a: u32,
+        c: u64,
+    }
+}
+        "#,
+            r#"
+fn hello() {
+    struct Bar {
+        a: u32,
+        b: u8,
+        c: u64,
+    }
 }
         "#,
         )

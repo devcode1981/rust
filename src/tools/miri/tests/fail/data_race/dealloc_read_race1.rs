@@ -1,5 +1,7 @@
-// We want to control preemption here.
-//@compile-flags: -Zmiri-preemption-rate=0
+// We want to control preemption here. Stacked borrows interferes by having its own accesses.
+//@compile-flags: -Zmiri-preemption-rate=0 -Zmiri-disable-stacked-borrows
+// Avoid accidental synchronization via address reuse inside `thread::spawn`.
+//@compile-flags: -Zmiri-address-reuse-cross-thread-rate=0
 
 use std::thread::spawn;
 
@@ -20,12 +22,14 @@ pub fn main() {
 
     unsafe {
         let j1 = spawn(move || {
+            let ptr = ptr; // avoid field capturing
             let _val = *ptr.0;
         });
 
         let j2 = spawn(move || {
+            let ptr = ptr; // avoid field capturing
             __rust_dealloc(
-                //~^ ERROR: Data race detected between Deallocate on thread `<unnamed>` and Read on thread `<unnamed>`
+                //~^ ERROR: Data race detected between (1) non-atomic read on thread `unnamed-1` and (2) deallocation on thread `unnamed-2`
                 ptr.0 as *mut _,
                 std::mem::size_of::<usize>(),
                 std::mem::align_of::<usize>(),

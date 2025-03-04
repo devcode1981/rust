@@ -17,23 +17,30 @@
 //!
 //! [`Parser`]: crate::parser::Parser
 
-#![warn(rust_2018_idioms, unused_lifetimes, semicolon_in_expressions_from_macros)]
 #![allow(rustdoc::private_intra_doc_links)]
+#![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
 
-mod lexed_str;
-mod token_set;
-mod syntax_kind;
+#[cfg(not(feature = "in-rust-tree"))]
+extern crate ra_ap_rustc_lexer as rustc_lexer;
+#[cfg(feature = "in-rust-tree")]
+extern crate rustc_lexer;
+
 mod event;
-mod parser;
 mod grammar;
 mod input;
+mod lexed_str;
 mod output;
+mod parser;
 mod shortcuts;
+mod syntax_kind;
+mod token_set;
 
 #[cfg(test)]
 mod tests;
 
 pub(crate) use token_set::TokenSet;
+
+pub use edition::Edition;
 
 pub use crate::{
     input::Input,
@@ -52,7 +59,7 @@ pub use crate::{
 ///
 /// That is, for something like
 ///
-/// ```
+/// ```ignore
 /// quick_check! {
 ///    fn prop() {}
 /// }
@@ -78,7 +85,8 @@ pub enum TopEntryPoint {
 }
 
 impl TopEntryPoint {
-    pub fn parse(&self, input: &Input) -> Output {
+    pub fn parse(&self, input: &Input, edition: Edition) -> Output {
+        let _p = tracing::info_span!("TopEntryPoint::parse", ?self).entered();
         let entry_point: fn(&'_ mut parser::Parser<'_>) = match self {
             TopEntryPoint::SourceFile => grammar::entry::top::source_file,
             TopEntryPoint::MacroStmts => grammar::entry::top::macro_stmts,
@@ -88,7 +96,7 @@ impl TopEntryPoint {
             TopEntryPoint::Expr => grammar::entry::top::expr,
             TopEntryPoint::MetaItem => grammar::entry::top::meta_item,
         };
-        let mut p = parser::Parser::new(input);
+        let mut p = parser::Parser::new(input, edition);
         entry_point(&mut p);
         let events = p.finish();
         let res = event::process(events);
@@ -102,10 +110,14 @@ impl TopEntryPoint {
                 match step {
                     Step::Enter { .. } => depth += 1,
                     Step::Exit => depth -= 1,
+                    Step::FloatSplit { ends_in_dot: has_pseudo_dot } => {
+                        depth -= 1 + !has_pseudo_dot as usize
+                    }
                     Step::Token { .. } | Step::Error { .. } => (),
                 }
             }
             assert!(!first, "no tree at all");
+            assert_eq!(depth, 0, "unbalanced tree");
         }
 
         res
@@ -127,6 +139,7 @@ pub enum PrefixEntryPoint {
     Block,
     Stmt,
     Pat,
+    PatTop,
     Ty,
     Expr,
     Path,
@@ -135,19 +148,20 @@ pub enum PrefixEntryPoint {
 }
 
 impl PrefixEntryPoint {
-    pub fn parse(&self, input: &Input) -> Output {
+    pub fn parse(&self, input: &Input, edition: Edition) -> Output {
         let entry_point: fn(&'_ mut parser::Parser<'_>) = match self {
             PrefixEntryPoint::Vis => grammar::entry::prefix::vis,
             PrefixEntryPoint::Block => grammar::entry::prefix::block,
             PrefixEntryPoint::Stmt => grammar::entry::prefix::stmt,
             PrefixEntryPoint::Pat => grammar::entry::prefix::pat,
+            PrefixEntryPoint::PatTop => grammar::entry::prefix::pat_top,
             PrefixEntryPoint::Ty => grammar::entry::prefix::ty,
             PrefixEntryPoint::Expr => grammar::entry::prefix::expr,
             PrefixEntryPoint::Path => grammar::entry::prefix::path,
             PrefixEntryPoint::Item => grammar::entry::prefix::item,
             PrefixEntryPoint::MetaItem => grammar::entry::prefix::meta_item,
         };
-        let mut p = parser::Parser::new(input);
+        let mut p = parser::Parser::new(input, edition);
         entry_point(&mut p);
         let events = p.finish();
         event::process(events)
@@ -171,9 +185,9 @@ impl Reparser {
     ///
     /// Tokens must start with `{`, end with `}` and form a valid brace
     /// sequence.
-    pub fn parse(self, tokens: &Input) -> Output {
+    pub fn parse(self, tokens: &Input, edition: Edition) -> Output {
         let Reparser(r) = self;
-        let mut p = parser::Parser::new(tokens);
+        let mut p = parser::Parser::new(tokens, edition);
         r(&mut p);
         let events = p.finish();
         event::process(events)

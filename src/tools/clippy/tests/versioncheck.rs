@@ -1,12 +1,10 @@
-#![cfg_attr(feature = "deny-warnings", deny(warnings))]
 #![warn(rust_2018_idioms, unused_lifetimes)]
 #![allow(clippy::single_match_else)]
 
-use rustc_tools_util::VersionInfo;
 use std::fs;
 
 #[test]
-fn check_that_clippy_lints_and_clippy_utils_have_the_same_version_as_clippy() {
+fn consistent_clippy_crate_versions() {
     fn read_version(path: &str) -> String {
         let contents = fs::read_to_string(path).unwrap_or_else(|e| panic!("error reading `{path}`: {e:?}"));
         contents
@@ -24,11 +22,16 @@ fn check_that_clippy_lints_and_clippy_utils_have_the_same_version_as_clippy() {
     }
 
     let clippy_version = read_version("Cargo.toml");
-    let clippy_lints_version = read_version("clippy_lints/Cargo.toml");
-    let clippy_utils_version = read_version("clippy_utils/Cargo.toml");
 
-    assert_eq!(clippy_version, clippy_lints_version);
-    assert_eq!(clippy_version, clippy_utils_version);
+    let paths = [
+        "clippy_config/Cargo.toml",
+        "clippy_lints/Cargo.toml",
+        "clippy_utils/Cargo.toml",
+    ];
+
+    for path in paths {
+        assert_eq!(clippy_version, read_version(path), "{path} version differs");
+    }
 }
 
 #[test]
@@ -85,5 +88,16 @@ fn check_that_clippy_has_the_same_major_version_as_rustc() {
         _ => {
             panic!("Failed to parse rustc version: {vsplit:?}");
         },
-    };
+    }
+}
+
+#[test]
+fn check_host_compiler() {
+    // do not run this test inside the upstream rustc repo:
+    if option_env!("RUSTC_TEST_SUITE").is_some() {
+        return;
+    }
+
+    let version = rustc_tools_util::get_version_info!();
+    assert_eq!(version.host_compiler, Some("nightly".to_string()));
 }

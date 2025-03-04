@@ -7,9 +7,11 @@ fn main() {
 
     // lint here
     let mut k = (|m| m + 1)(i);
+    //~^ redundant_closure_call
 
     // lint here
     k = (|a, b| a * b)(1, 5);
+    //~^ redundant_closure_call
 
     // don't lint these
     #[allow(clippy::needless_return)]

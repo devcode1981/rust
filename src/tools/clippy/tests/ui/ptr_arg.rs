@@ -1,31 +1,55 @@
-#![feature(lint_reasons)]
-#![allow(unused, clippy::many_single_char_names, clippy::redundant_clone)]
+#![allow(
+    unused,
+    clippy::many_single_char_names,
+    clippy::needless_lifetimes,
+    clippy::redundant_clone,
+    clippy::needless_pass_by_ref_mut
+)]
 #![warn(clippy::ptr_arg)]
-
+//@no-rustfix
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 fn do_vec(x: &Vec<i64>) {
+    //~^ ptr_arg
+
     //Nothing here
 }
 
 fn do_vec_mut(x: &mut Vec<i64>) {
+    //~^ ptr_arg
+
     //Nothing here
 }
 
+fn do_vec_mut2(x: &mut Vec<i64>) {
+    //~^ ptr_arg
+
+    x.len();
+    x.is_empty();
+}
+
 fn do_str(x: &String) {
+    //~^ ptr_arg
+
     //Nothing here either
 }
 
 fn do_str_mut(x: &mut String) {
+    //~^ ptr_arg
+
     //Nothing here either
 }
 
 fn do_path(x: &PathBuf) {
+    //~^ ptr_arg
+
     //Nothing here either
 }
 
 fn do_path_mut(x: &mut PathBuf) {
+    //~^ ptr_arg
+
     //Nothing here either
 }
 
@@ -34,6 +58,8 @@ fn main() {}
 trait Foo {
     type Item;
     fn do_vec(x: &Vec<i64>);
+    //~^ ptr_arg
+
     fn do_item(x: &Self::Item);
 }
 
@@ -47,6 +73,8 @@ impl Foo for Bar {
 }
 
 fn cloned(x: &Vec<u8>) -> Vec<u8> {
+    //~^ ptr_arg
+
     let e = x.clone();
     let f = e.clone(); // OK
     let g = x;
@@ -56,6 +84,8 @@ fn cloned(x: &Vec<u8>) -> Vec<u8> {
 }
 
 fn str_cloned(x: &String) -> String {
+    //~^ ptr_arg
+
     let a = x.clone();
     let b = x.clone();
     let c = b.clone();
@@ -64,6 +94,8 @@ fn str_cloned(x: &String) -> String {
 }
 
 fn path_cloned(x: &PathBuf) -> PathBuf {
+    //~^ ptr_arg
+
     let a = x.clone();
     let b = x.clone();
     let c = b.clone();
@@ -72,6 +104,8 @@ fn path_cloned(x: &PathBuf) -> PathBuf {
 }
 
 fn false_positive_capacity(x: &Vec<u8>, y: &String) {
+    //~^ ptr_arg
+
     let a = x.capacity();
     let b = y.clone();
     let c = y.as_str();
@@ -86,6 +120,7 @@ fn false_positive_capacity_too(x: &String) -> String {
 
 #[allow(dead_code)]
 fn test_cow_with_ref(c: &Cow<[i32]>) {}
+//~^ ptr_arg
 
 fn test_cow(c: Cow<[i32]>) {
     let _c = c;
@@ -115,6 +150,7 @@ mod issue_5644 {
     }
 
     fn some_allowed(#[allow(clippy::ptr_arg)] _v: &Vec<u32>, _s: &String) {}
+    //~^ ptr_arg
 
     struct S;
     impl S {
@@ -144,22 +180,30 @@ mod issue6509 {
     use std::path::PathBuf;
 
     fn foo_vec(vec: &Vec<u8>) {
+        //~^ ptr_arg
+
         let _ = vec.clone().pop();
         let _ = vec.clone().clone();
     }
 
     fn foo_path(path: &PathBuf) {
+        //~^ ptr_arg
+
         let _ = path.clone().pop();
         let _ = path.clone().clone();
     }
 
     fn foo_str(str: &PathBuf) {
+        //~^ ptr_arg
+
         let _ = str.clone().pop();
         let _ = str.clone().clone();
     }
 }
 
 fn mut_vec_slice_methods(v: &mut Vec<u32>) {
+    //~^ ptr_arg
+
     v.copy_within(1..5, 10);
 }
 
@@ -222,6 +266,10 @@ fn dyn_trait_ok(a: &mut Vec<u32>, b: &mut String, c: &mut PathBuf) {
 }
 
 fn dyn_trait(a: &mut Vec<u32>, b: &mut String, c: &mut PathBuf) {
+    //~^ ptr_arg
+    //~| ptr_arg
+    //~| ptr_arg
+
     trait T {}
     impl<U> T for Vec<U> {}
     impl<U> T for [U] {}
@@ -234,4 +282,73 @@ fn dyn_trait(a: &mut Vec<u32>, b: &mut String, c: &mut PathBuf) {
     takes_dyn(a);
     takes_dyn(b);
     takes_dyn(c);
+}
+
+mod issue_9218 {
+    use std::borrow::Cow;
+
+    fn cow_non_elided_lifetime<'a>(input: &Cow<'a, str>) -> &'a str {
+        todo!()
+    }
+
+    // This one has an anonymous lifetime so it's not okay
+    fn cow_elided_lifetime<'a>(input: &'a Cow<str>) -> &'a str {
+        //~^ ptr_arg
+
+        todo!()
+    }
+
+    // These two's return types don't use 'a so it's not okay
+    fn cow_bad_ret_ty_1<'a>(input: &'a Cow<'a, str>) -> &'static str {
+        //~^ ptr_arg
+
+        todo!()
+    }
+    fn cow_bad_ret_ty_2<'a, 'b>(input: &'a Cow<'a, str>) -> &'b str {
+        //~^ ptr_arg
+
+        todo!()
+    }
+
+    // Inferred to be `&'a str`, afaik.
+    fn cow_good_ret_ty<'a>(input: &'a Cow<'a, str>) -> &str {
+        //~^ ERROR: elided lifetime has a name
+        todo!()
+    }
+}
+
+mod issue_11181 {
+    extern "C" fn allowed(_v: &Vec<u32>) {}
+
+    struct S;
+    impl S {
+        extern "C" fn allowed(_v: &Vec<u32>) {}
+    }
+
+    trait T {
+        extern "C" fn allowed(_v: &Vec<u32>) {}
+    }
+}
+
+mod issue_13308 {
+    use std::ops::Deref;
+
+    fn repro(source: &str, destination: &mut String) {
+        source.clone_into(destination);
+    }
+    fn repro2(source: &str, destination: &mut String) {
+        ToOwned::clone_into(source, destination);
+    }
+
+    fn h1(_: &<String as Deref>::Target) {}
+    fn h2<T: Deref>(_: T, _: &T::Target) {}
+
+    // Other cases that are still ok to lint and ideally shouldn't regress
+    fn good(v1: &String, v2: &String) {
+        //~^ ptr_arg
+        //~| ptr_arg
+
+        h1(v1);
+        h2(String::new(), v2);
+    }
 }

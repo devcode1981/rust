@@ -19,8 +19,9 @@ to beta. For reference, the first sync following this cadence was performed the
 2020-08-27.
 
 This process is described in detail in the following sections. For general
-information about `subtree`s in the Rust repository see [Rust's
-`CONTRIBUTING.md`][subtree].
+information about `subtree`s in the Rust repository see [the rustc-dev-guide][subtree].
+
+[subtree]: https://rustc-dev-guide.rust-lang.org/external-repos.html#external-dependencies-subtree
 
 ## Patching git-subtree to work with big repos
 
@@ -47,42 +48,29 @@ sudo chown --reference=/usr/lib/git-core/git-subtree~ /usr/lib/git-core/git-subt
 
 > _Note:_ If you are a Debian user, `dash` is the shell used by default for
 > scripts instead of `sh`. This shell has a hardcoded recursion limit set to
-> 1000. In order to make this process work, you need to force the script to run
+> 1,000. In order to make this process work, you need to force the script to run
 > `bash` instead. You can do this by editing the first line of the `git-subtree`
 > script and changing `sh` to `bash`.
 
-## Defining remotes
+> Note: The following sections assume that you have set up remotes following the
+> instructions in [defining remotes].
 
-You may want to define remotes, so you don't have to type out the remote
-addresses on every sync. You can do this with the following commands (these
-commands still have to be run inside the `rust` directory):
-
-```bash
-# Set clippy-upstream remote for pulls
-$ git remote add clippy-upstream https://github.com/rust-lang/rust-clippy
-# Make sure to not push to the upstream repo
-$ git remote set-url --push clippy-upstream DISABLED
-# Set a local remote
-$ git remote add clippy-local /path/to/rust-clippy
-```
-
-> Note: The following sections assume that you have set those remotes with the
-> above remote names.
+[gitgitgadget-pr]: https://github.com/gitgitgadget/git/pull/493
+[defining remotes]: release.md#defining-remotes
 
 ## Performing the sync from [`rust-lang/rust`] to Clippy
 
-Here is a TL;DR version of the sync process (all of the following commands have
+Here is a TL;DR version of the sync process (all the following commands have
 to be run inside the `rust` directory):
 
-1. Clone the [`rust-lang/rust`] repository or make sure it is up to date.
+1. Clone the [`rust-lang/rust`] repository or make sure it is up-to-date.
 2. Checkout the commit from the latest available nightly. You can get it using
    `rustup check`.
 3. Sync the changes to the rust-copy of Clippy to your Clippy fork:
     ```bash
-    # Make sure to change `your-github-name` to your github name in the following command. Also be
-    # sure to either use a net-new branch, e.g. `sync-from-rust`, or delete the branch beforehand
+    # Be sure to either use a net-new branch, e.g. `rustup`, or delete the branch beforehand
     # because changes cannot be fast forwarded and you have to run this command again.
-    git subtree push -P src/tools/clippy clippy-local sync-from-rust
+    git subtree push -P src/tools/clippy clippy-local rustup
     ```
 
     > _Note:_ Most of the time you have to create a merge commit in the
@@ -90,34 +78,31 @@ to be run inside the `rust` directory):
     > rust-copy of Clippy):
     ```bash
     git fetch upstream  # assuming upstream is the rust-lang/rust remote
-    git checkout sync-from-rust
+    git switch rustup
     git merge upstream/master --no-ff
     ```
     > Note: This is one of the few instances where a merge commit is allowed in
     > a PR.
-4. Bump the nightly version in the Clippy repository by changing the date in the
-   rust-toolchain file to the current date and committing it with the message:
+4. Bump the nightly version in the Clippy repository by running these commands:
    ```bash
-   git commit -m "Bump nightly version -> YYYY-MM-DD"
+   cargo dev sync update_nightly
+   git commit -m "Bump nightly version -> YYYY-MM-DD" rust-toolchain clippy_utils/README.md
    ```
 5. Open a PR to `rust-lang/rust-clippy` and wait for it to get merged (to
    accelerate the process ping the `@rust-lang/clippy` team in your PR and/or
    ask them in the [Zulip] stream.)
 
 [Zulip]: https://rust-lang.zulipchat.com/#narrow/stream/clippy
+[`rust-lang/rust`]: https://github.com/rust-lang/rust
 
 ## Performing the sync from Clippy to [`rust-lang/rust`]
 
-All of the following commands have to be run inside the `rust` directory.
+All the following commands have to be run inside the `rust` directory.
 
 1. Make sure you have checked out the latest `master` of `rust-lang/rust`.
 2. Sync the `rust-lang/rust-clippy` master to the rust-copy of Clippy:
     ```bash
-    git checkout -b sync-from-clippy
+    git switch -c clippy-subtree-update
     git subtree pull -P src/tools/clippy clippy-upstream master
     ```
 3. Open a PR to [`rust-lang/rust`]
-
-[gitgitgadget-pr]: https://github.com/gitgitgadget/git/pull/493
-[subtree]: https://rustc-dev-guide.rust-lang.org/contributing.html#external-dependencies-subtree
-[`rust-lang/rust`]: https://github.com/rust-lang/rust

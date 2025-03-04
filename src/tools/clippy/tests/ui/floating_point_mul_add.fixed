@@ -1,5 +1,3 @@
-// run-rustfix
-#![feature(const_fn_floating_point_arithmetic)]
 #![warn(clippy::suboptimal_flops)]
 
 /// Allow suboptimal_ops in constant context
@@ -19,21 +17,55 @@ fn main() {
     let d: f64 = 0.0001;
 
     let _ = a.mul_add(b, c);
+    //~^ suboptimal_flops
     let _ = a.mul_add(b, -c);
+    //~^ suboptimal_flops
     let _ = a.mul_add(b, c);
+    //~^ suboptimal_flops
     let _ = a.mul_add(-b, c);
+    //~^ suboptimal_flops
     let _ = 2.0f64.mul_add(4.0, a);
+    //~^ suboptimal_flops
     let _ = 2.0f64.mul_add(4., a);
+    //~^ suboptimal_flops
 
     let _ = a.mul_add(b, c);
+    //~^ suboptimal_flops
     let _ = a.mul_add(b, c);
+    //~^ suboptimal_flops
     let _ = (a * b).mul_add(c, d);
+    //~^ suboptimal_flops
 
     let _ = a.mul_add(b, c).mul_add(a.mul_add(b, c), a.mul_add(b, c)) + c;
+    //~^ suboptimal_flops
     let _ = 1234.567_f64.mul_add(45.67834_f64, 0.0004_f64);
+    //~^ suboptimal_flops
 
     let _ = a.mul_add(a, b).sqrt();
+    //~^ suboptimal_flops
+
+    let u = 1usize;
+    let _ = b.mul_add(-(u as f64), a);
+    //~^ suboptimal_flops
 
     // Cases where the lint shouldn't be applied
     let _ = (a * a + b * b).sqrt();
+}
+
+fn _issue11831() {
+    struct NotAFloat;
+
+    impl std::ops::Add<f64> for NotAFloat {
+        type Output = Self;
+
+        fn add(self, _: f64) -> Self {
+            NotAFloat
+        }
+    }
+
+    let a = NotAFloat;
+    let b = 1.0_f64;
+    let c = 1.0;
+
+    let _ = a + b * c;
 }

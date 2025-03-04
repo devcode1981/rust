@@ -7,11 +7,17 @@
 
 set -eu
 
+# syntax check
+sh -n "$0"
+
 realpath() {
-    if [ -d "$1" ]; then
-        CDPATH='' command cd "$1" && pwd -P   
+    local path="$1"
+    if [ -L "$path" ]; then
+        readlink -f "$path"
+    elif [ -d "$path" ]; then
+        (cd -P "$path" && pwd)
     else
-        echo "$(realpath "$(dirname "$1")")/$(basename "$1")"
+        echo "$(realpath "$(dirname "$path")")/$(basename "$path")"
     fi
 }
 
@@ -29,5 +35,11 @@ for SEARCH_PYTHON in py python3 python python2; do
         exec "$python" $extra_arg "$xpy" "$@"
     fi
 done
+
+python=$(bash -c "compgen -c python" | grep '^python[2-3]\.[0-9]+$' | head -n1)
+if ! [ "$python" = "" ]; then
+    exec "$python" "$xpy" "$@"
+fi
+
 echo "$0: error: did not find python installed" >&2
 exit 1

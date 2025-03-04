@@ -5,48 +5,45 @@
 mod block;
 
 use rowan::Direction;
-use rustc_lexer::unescape::{
-    self, unescape_byte, unescape_byte_literal, unescape_char, unescape_literal, Mode,
-};
+use rustc_lexer::unescape::{self, unescape_mixed, unescape_unicode, Mode};
 
 use crate::{
     algo,
-    ast::{self, HasAttrs, HasVisibility},
+    ast::{self, HasAttrs, HasVisibility, IsString, RangeItem},
     match_ast, AstNode, SyntaxError,
     SyntaxKind::{CONST, FN, INT_NUMBER, TYPE_ALIAS},
     SyntaxNode, SyntaxToken, TextSize, T,
 };
 
-pub(crate) fn validate(root: &SyntaxNode) -> Vec<SyntaxError> {
+pub(crate) fn validate(root: &SyntaxNode, errors: &mut Vec<SyntaxError>) {
+    let _p = tracing::info_span!("parser::validate").entered();
     // FIXME:
     // * Add unescape validation of raw string literals and raw byte string literals
     // * Add validation of doc comments are being attached to nodes
 
-    let mut errors = Vec::new();
     for node in root.descendants() {
         match_ast! {
             match node {
-                ast::Literal(it) => validate_literal(it, &mut errors),
-                ast::Const(it) => validate_const(it, &mut errors),
-                ast::BlockExpr(it) => block::validate_block_expr(it, &mut errors),
-                ast::FieldExpr(it) => validate_numeric_name(it.name_ref(), &mut errors),
-                ast::RecordExprField(it) => validate_numeric_name(it.name_ref(), &mut errors),
-                ast::Visibility(it) => validate_visibility(it, &mut errors),
-                ast::RangeExpr(it) => validate_range_expr(it, &mut errors),
-                ast::PathSegment(it) => validate_path_keywords(it, &mut errors),
-                ast::RefType(it) => validate_trait_object_ref_ty(it, &mut errors),
-                ast::PtrType(it) => validate_trait_object_ptr_ty(it, &mut errors),
-                ast::FnPtrType(it) => validate_trait_object_fn_ptr_ret_ty(it, &mut errors),
-                ast::MacroRules(it) => validate_macro_rules(it, &mut errors),
-                ast::LetExpr(it) => validate_let_expr(it, &mut errors),
+                ast::Literal(it) => validate_literal(it, errors),
+                ast::Const(it) => validate_const(it, errors),
+                ast::BlockExpr(it) => block::validate_block_expr(it, errors),
+                ast::FieldExpr(it) => validate_numeric_name(it.name_ref(), errors),
+                ast::RecordExprField(it) => validate_numeric_name(it.name_ref(), errors),
+                ast::Visibility(it) => validate_visibility(it, errors),
+                ast::RangeExpr(it) => validate_range_expr(it, errors),
+                ast::PathSegment(it) => validate_path_keywords(it, errors),
+                ast::RefType(it) => validate_trait_object_ref_ty(it, errors),
+                ast::PtrType(it) => validate_trait_object_ptr_ty(it, errors),
+                ast::FnPtrType(it) => validate_trait_object_fn_ptr_ret_ty(it, errors),
+                ast::MacroRules(it) => validate_macro_rules(it, errors),
+                ast::LetExpr(it) => validate_let_expr(it, errors),
                 _ => (),
             }
         }
     }
-    errors
 }
 
-fn rustc_unescape_error_to_string(err: unescape::EscapeError) -> &'static str {
+fn rustc_unescape_error_to_string(err: unescape::EscapeError) -> (&'static str, bool) {
     use unescape::EscapeError as EE;
 
     #[rustfmt::skip]
@@ -105,12 +102,18 @@ fn rustc_unescape_error_to_string(err: unescape::EscapeError) -> &'static str {
         EE::UnicodeEscapeInByte => {
             "Byte literals must not contain unicode escapes"
         }
-        EE::NonAsciiCharInByte | EE::NonAsciiCharInByteString => {
+        EE::NonAsciiCharInByte  => {
             "Byte literals must not contain non-ASCII characters"
         }
+        EE::NulInCStr  => {
+            "C strings literals must not contain null characters"
+        }
+        EE::UnskippedWhitespaceWarning => "Whitespace after this escape is not skipped",
+        EE::MultipleSkippedLinesWarning => "Multiple lines are skipped by this escape",
+
     };
 
-    err_message
+    (err_message, err.is_fatal())
 }
 
 fn validate_literal(literal: ast::Literal, acc: &mut Vec<SyntaxError>) {
@@ -123,18 +126,22 @@ fn validate_literal(literal: ast::Literal, acc: &mut Vec<SyntaxError>) {
     let text = token.text();
 
     // FIXME: lift this lambda refactor to `fn` (https://github.com/rust-lang/rust-analyzer/pull/2834#discussion_r366199205)
-    let mut push_err = |prefix_len, (off, err): (usize, unescape::EscapeError)| {
+    let mut push_err = |prefix_len, off, err: unescape::EscapeError| {
         let off = token.text_range().start() + TextSize::try_from(off + prefix_len).unwrap();
-        acc.push(SyntaxError::new_at_offset(rustc_unescape_error_to_string(err), off));
+        let (message, is_err) = rustc_unescape_error_to_string(err);
+        // FIXME: Emit lexer warnings
+        if is_err {
+            acc.push(SyntaxError::new_at_offset(message, off));
+        }
     };
 
     match literal.kind() {
         ast::LiteralKind::String(s) => {
             if !s.is_raw() {
                 if let Some(without_quotes) = unquote(text, 1, '"') {
-                    unescape_literal(without_quotes, Mode::Str, &mut |range, char| {
+                    unescape_unicode(without_quotes, Mode::Str, &mut |range, char| {
                         if let Err(err) = char {
-                            push_err(1, (range.start, err));
+                            push_err(1, range.start, err);
                         }
                     });
                 }
@@ -143,22 +150,41 @@ fn validate_literal(literal: ast::Literal, acc: &mut Vec<SyntaxError>) {
         ast::LiteralKind::ByteString(s) => {
             if !s.is_raw() {
                 if let Some(without_quotes) = unquote(text, 2, '"') {
-                    unescape_byte_literal(without_quotes, Mode::ByteStr, &mut |range, char| {
+                    unescape_unicode(without_quotes, Mode::ByteStr, &mut |range, char| {
                         if let Err(err) = char {
-                            push_err(2, (range.start, err));
+                            push_err(1, range.start, err);
+                        }
+                    });
+                }
+            }
+        }
+        ast::LiteralKind::CString(s) => {
+            if !s.is_raw() {
+                if let Some(without_quotes) = unquote(text, 2, '"') {
+                    unescape_mixed(without_quotes, Mode::CStr, &mut |range, char| {
+                        if let Err(err) = char {
+                            push_err(1, range.start, err);
                         }
                     });
                 }
             }
         }
         ast::LiteralKind::Char(_) => {
-            if let Some(Err(e)) = unquote(text, 1, '\'').map(unescape_char) {
-                push_err(1, e);
+            if let Some(without_quotes) = unquote(text, 1, '\'') {
+                unescape_unicode(without_quotes, Mode::Char, &mut |range, char| {
+                    if let Err(err) = char {
+                        push_err(1, range.start, err);
+                    }
+                });
             }
         }
         ast::LiteralKind::Byte(_) => {
-            if let Some(Err(e)) = unquote(text, 2, '\'').map(unescape_byte) {
-                push_err(2, e);
+            if let Some(without_quotes) = unquote(text, 2, '\'') {
+                unescape_unicode(without_quotes, Mode::Byte, &mut |range, char| {
+                    if let Err(err) = char {
+                        push_err(2, range.start, err);
+                    }
+                });
             }
         }
         ast::LiteralKind::IntNumber(_)
@@ -177,14 +203,14 @@ pub(crate) fn validate_block_structure(root: &SyntaxNode) {
                     assert_eq!(
                         node.parent(),
                         pair.parent(),
-                        "\nunpaired curlys:\n{}\n{:#?}\n",
+                        "\nunpaired curlies:\n{}\n{:#?}\n",
                         root.text(),
                         root,
                     );
                     assert!(
                         node.next_sibling_or_token().is_none()
                             && pair.prev_sibling_or_token().is_none(),
-                        "\nfloating curlys at {:?}\nfile:\n{}\nerror:\n{}\n",
+                        "\nfloating curlies at {:?}\nfile:\n{}\nerror:\n{}\n",
                         node,
                         root.text(),
                         node,
@@ -198,7 +224,7 @@ pub(crate) fn validate_block_structure(root: &SyntaxNode) {
 
 fn validate_numeric_name(name_ref: Option<ast::NameRef>, errors: &mut Vec<SyntaxError>) {
     if let Some(int_token) = int_token(name_ref) {
-        if int_token.text().chars().any(|c| !c.is_digit(10)) {
+        if int_token.text().chars().any(|c| !c.is_ascii_digit()) {
             errors.push(SyntaxError::new(
                 "Tuple (struct) field access is only allowed through \
                 decimal integers with no underscores or suffix",

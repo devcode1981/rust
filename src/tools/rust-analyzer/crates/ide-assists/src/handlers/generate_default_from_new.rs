@@ -1,8 +1,7 @@
 use ide_db::famous_defs::FamousDefs;
-use itertools::Itertools;
 use stdx::format_to;
 use syntax::{
-    ast::{self, HasGenericParams, HasName, HasTypeBounds, Impl},
+    ast::{self, make, HasGenericParams, HasName, Impl},
     AstNode,
 };
 
@@ -16,6 +15,7 @@ use crate::{
 // Generates default implementation from new method.
 //
 // ```
+// # //- minicore: default
 // struct Example { _inner: () }
 //
 // impl Example {
@@ -54,7 +54,8 @@ pub(crate) fn generate_default_from_new(acc: &mut Assists, ctx: &AssistContext<'
         return None;
     }
 
-    let impl_ = fn_node.syntax().ancestors().into_iter().find_map(ast::Impl::cast)?;
+    let impl_ = fn_node.syntax().ancestors().find_map(ast::Impl::cast)?;
+    let self_ty = impl_.self_ty()?;
     if is_default_implemented(ctx, &impl_) {
         cov_mark::hit!(default_block_is_already_present);
         cov_mark::hit!(struct_in_module_with_default);
@@ -71,51 +72,57 @@ pub(crate) fn generate_default_from_new(acc: &mut Assists, ctx: &AssistContext<'
             let default_code = "    fn default() -> Self {
         Self::new()
     }";
-            let code = generate_trait_impl_text_from_impl(&impl_, "Default", default_code);
+            let code = generate_trait_impl_text_from_impl(&impl_, self_ty, "Default", default_code);
             builder.insert(insert_location.end(), code);
         },
     )
 }
 
-fn generate_trait_impl_text_from_impl(impl_: &ast::Impl, trait_text: &str, code: &str) -> String {
-    let generic_params = impl_.generic_param_list();
+// FIXME: based on from utils::generate_impl_text_inner
+fn generate_trait_impl_text_from_impl(
+    impl_: &ast::Impl,
+    self_ty: ast::Type,
+    trait_text: &str,
+    code: &str,
+) -> String {
+    let generic_params = impl_.generic_param_list().map(|generic_params| {
+        let lifetime_params =
+            generic_params.lifetime_params().map(ast::GenericParam::LifetimeParam);
+        let ty_or_const_params = generic_params.type_or_const_params().map(|param| {
+            // remove defaults since they can't be specified in impls
+            match param {
+                ast::TypeOrConstParam::Type(param) => {
+                    let param = param.clone_for_update();
+                    param.remove_default();
+                    ast::GenericParam::TypeParam(param)
+                }
+                ast::TypeOrConstParam::Const(param) => {
+                    let param = param.clone_for_update();
+                    param.remove_default();
+                    ast::GenericParam::ConstParam(param)
+                }
+            }
+        });
+
+        make::generic_param_list(itertools::chain(lifetime_params, ty_or_const_params))
+    });
+
     let mut buf = String::with_capacity(code.len());
     buf.push_str("\n\n");
+
+    // `impl{generic_params} {trait_text} for {impl_.self_ty()}`
     buf.push_str("impl");
-
     if let Some(generic_params) = &generic_params {
-        let lifetimes = generic_params.lifetime_params().map(|lt| format!("{}", lt.syntax()));
-        let toc_params = generic_params.type_or_const_params().map(|toc_param| match toc_param {
-            ast::TypeOrConstParam::Type(type_param) => {
-                let mut buf = String::new();
-                if let Some(it) = type_param.name() {
-                    format_to!(buf, "{}", it.syntax());
-                }
-                if let Some(it) = type_param.colon_token() {
-                    format_to!(buf, "{} ", it);
-                }
-                if let Some(it) = type_param.type_bound_list() {
-                    format_to!(buf, "{}", it.syntax());
-                }
-                buf
-            }
-            ast::TypeOrConstParam::Const(const_param) => const_param.syntax().to_string(),
-        });
-        let generics = lifetimes.chain(toc_params).format(", ");
-        format_to!(buf, "<{}>", generics);
+        format_to!(buf, "{generic_params}")
     }
-
-    buf.push(' ');
-    buf.push_str(trait_text);
-    buf.push_str(" for ");
-    buf.push_str(&impl_.self_ty().unwrap().syntax().text().to_string());
+    format_to!(buf, " {trait_text} for {self_ty}");
 
     match impl_.where_clause() {
         Some(where_clause) => {
-            format_to!(buf, "\n{}\n{{\n{}\n}}", where_clause, code);
+            format_to!(buf, "\n{where_clause}\n{{\n{code}\n}}");
         }
         None => {
-            format_to!(buf, " {{\n{}\n}}", code);
+            format_to!(buf, " {{\n{code}\n}}");
         }
     }
 
@@ -135,7 +142,9 @@ fn is_default_implemented(ctx: &AssistContext<'_>, impl_: &Impl) -> bool {
     let default = FamousDefs(&ctx.sema, krate).core_default_Default();
     let default_trait = match default {
         Some(value) => value,
-        None => return false,
+        // Return `true` to avoid providing the assist because it makes no sense
+        // to impl `Default` when it's missing.
+        None => return true,
     };
 
     ty.impls_trait(db, default_trait, &[])
@@ -409,7 +418,7 @@ where
     }
 
     #[test]
-    fn new_function_with_generics_and_wheres() {
+    fn new_function_with_generics_and_where() {
         check_assist(
             generate_default_from_new,
             r#"
@@ -479,6 +488,7 @@ impl Example {
         check_assist_not_applicable(
             generate_default_from_new,
             r#"
+//- minicore: default
 struct Example { _inner: () }
 
 impl Example {
@@ -653,5 +663,24 @@ mod test {
 }
 "#,
         );
+    }
+
+    #[test]
+    fn not_applicable_when_default_lang_item_is_missing() {
+        check_assist_not_applicable(
+            generate_default_from_new,
+            r#"
+struct S;
+impl S {
+    fn new$0() -> Self {}
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn not_applicable_for_missing_self_ty() {
+        // Regression test for #15398.
+        check_assist_not_applicable(generate_default_from_new, "impl { fn new$0() -> Self {} }");
     }
 }

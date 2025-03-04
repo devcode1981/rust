@@ -1,14 +1,16 @@
-#[allow(clippy::unnecessary_operation)]
-#[allow(clippy::implicit_clone)]
+#![allow(clippy::unnecessary_operation)]
+#![allow(clippy::implicit_clone)]
 
 fn main() {
     let x = &Baz;
     let y = &Baz;
     y.to_owned() == *x;
+    //~^ cmp_owned
 
     let x = &&Baz;
     let y = &Baz;
     y.to_owned() == **x;
+    //~^ cmp_owned
 
     let x = 0u32;
     let y = U32Wrapper(x);
@@ -20,6 +22,7 @@ struct Foo;
 impl PartialEq for Foo {
     fn eq(&self, other: &Self) -> bool {
         self.to_owned() == *other
+        //~^ cmp_owned
     }
 }
 

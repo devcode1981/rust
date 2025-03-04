@@ -1,28 +1,28 @@
-//! This crate defines the core datastructure representing IDE state -- `RootDatabase`.
+//! This crate defines the core data structure representing IDE state -- `RootDatabase`.
 //!
 //! It is mainly a `HirDatabase` for semantic analysis, plus a `SymbolsDatabase`, for fuzzy search.
-
-#![warn(rust_2018_idioms, unused_lifetimes, semicolon_in_expressions_from_macros)]
 
 mod apply_change;
 
 pub mod active_parameter;
 pub mod assists;
 pub mod defs;
+pub mod documentation;
 pub mod famous_defs;
 pub mod helpers;
 pub mod items_locator;
 pub mod label;
-pub mod line_index;
 pub mod path_transform;
+pub mod prime_caches;
 pub mod rename;
 pub mod rust_doc;
 pub mod search;
 pub mod source_change;
 pub mod symbol_index;
+pub mod text_edit;
 pub mod traits;
 pub mod ty_filter;
-pub mod use_trivial_contructor;
+pub mod use_trivial_constructor;
 
 pub mod imports {
     pub mod import_assets;
@@ -35,40 +35,51 @@ pub mod generated {
 }
 
 pub mod syntax_helpers {
-    pub mod node_ext;
-    pub mod insert_whitespace_into_node;
     pub mod format_string;
     pub mod format_string_exprs;
+    pub mod tree_diff;
+    pub use hir::prettify_macro_expansion;
+    pub mod node_ext;
+    pub mod suggest_name;
 
     pub use parser::LexedStr;
 }
 
-use std::{fmt, mem::ManuallyDrop, sync::Arc};
+pub use hir::ChangeWithProcMacros;
+
+use std::{fmt, mem::ManuallyDrop};
 
 use base_db::{
-    salsa::{self, Durability},
-    AnchoredPath, CrateId, FileId, FileLoader, FileLoaderDelegate, SourceDatabase, Upcast,
+    ra_salsa::{self, Durability},
+    AnchoredPath, CrateId, FileLoader, FileLoaderDelegate, SourceDatabase, Upcast,
+    DEFAULT_FILE_TEXT_LRU_CAP,
 };
 use hir::{
-    db::{AstDatabase, DefDatabase, HirDatabase},
-    symbols::FileSymbolKind,
+    db::{DefDatabase, ExpandDatabase, HirDatabase},
+    FilePositionWrapper, FileRangeWrapper,
 };
-use stdx::hash::NoHashHashSet;
+use triomphe::Arc;
 
 use crate::{line_index::LineIndex, symbol_index::SymbolsDatabase};
 pub use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 
+pub use ::line_index;
+
 /// `base_db` is normally also needed in places where `ide_db` is used, so this re-export is for convenience.
 pub use base_db;
+pub use span::{EditionedFileId, FileId};
 
 pub type FxIndexSet<T> = indexmap::IndexSet<T, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>;
 pub type FxIndexMap<K, V> =
     indexmap::IndexMap<K, V, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>;
 
-#[salsa::database(
-    base_db::SourceDatabaseExtStorage,
+pub type FilePosition = FilePositionWrapper<FileId>;
+pub type FileRange = FileRangeWrapper<FileId>;
+
+#[ra_salsa::database(
+    base_db::SourceRootDatabaseStorage,
     base_db::SourceDatabaseStorage,
-    hir::db::AstDatabaseStorage,
+    hir::db::ExpandDatabaseStorage,
     hir::db::DefDatabaseStorage,
     hir::db::HirDatabaseStorage,
     hir::db::InternDatabaseStorage,
@@ -80,7 +91,7 @@ pub struct RootDatabase {
     // `&RootDatabase -> &dyn OtherDatabase` cast will instantiate its drop glue in the vtable,
     // which duplicates `Weak::drop` and `Arc::drop` tens of thousands of times, which makes
     // compile times of all `ide_*` and downstream crates suffer greatly.
-    storage: ManuallyDrop<salsa::Storage<RootDatabase>>,
+    storage: ManuallyDrop<ra_salsa::Storage<RootDatabase>>,
 }
 
 impl Drop for RootDatabase {
@@ -95,37 +106,37 @@ impl fmt::Debug for RootDatabase {
     }
 }
 
-impl Upcast<dyn AstDatabase> for RootDatabase {
-    fn upcast(&self) -> &(dyn AstDatabase + 'static) {
-        &*self
+impl Upcast<dyn ExpandDatabase> for RootDatabase {
+    #[inline]
+    fn upcast(&self) -> &(dyn ExpandDatabase + 'static) {
+        self
     }
 }
 
 impl Upcast<dyn DefDatabase> for RootDatabase {
+    #[inline]
     fn upcast(&self) -> &(dyn DefDatabase + 'static) {
-        &*self
+        self
     }
 }
 
 impl Upcast<dyn HirDatabase> for RootDatabase {
+    #[inline]
     fn upcast(&self) -> &(dyn HirDatabase + 'static) {
-        &*self
+        self
     }
 }
 
 impl FileLoader for RootDatabase {
-    fn file_text(&self, file_id: FileId) -> Arc<String> {
-        FileLoaderDelegate(self).file_text(file_id)
-    }
     fn resolve_path(&self, path: AnchoredPath<'_>) -> Option<FileId> {
         FileLoaderDelegate(self).resolve_path(path)
     }
-    fn relevant_crates(&self, file_id: FileId) -> Arc<NoHashHashSet<CrateId>> {
+    fn relevant_crates(&self, file_id: FileId) -> Arc<[CrateId]> {
         FileLoaderDelegate(self).relevant_crates(file_id)
     }
 }
 
-impl salsa::Database for RootDatabase {}
+impl ra_salsa::Database for RootDatabase {}
 
 impl Default for RootDatabase {
     fn default() -> RootDatabase {
@@ -134,38 +145,74 @@ impl Default for RootDatabase {
 }
 
 impl RootDatabase {
-    pub fn new(lru_capacity: Option<usize>) -> RootDatabase {
-        let mut db = RootDatabase { storage: ManuallyDrop::new(salsa::Storage::default()) };
+    pub fn new(lru_capacity: Option<u16>) -> RootDatabase {
+        let mut db = RootDatabase { storage: ManuallyDrop::new(ra_salsa::Storage::default()) };
         db.set_crate_graph_with_durability(Default::default(), Durability::HIGH);
+        db.set_proc_macros_with_durability(Default::default(), Durability::HIGH);
         db.set_local_roots_with_durability(Default::default(), Durability::HIGH);
         db.set_library_roots_with_durability(Default::default(), Durability::HIGH);
-        db.set_enable_proc_attr_macros(false);
-        db.update_lru_capacity(lru_capacity);
+        db.set_expand_proc_attr_macros_with_durability(false, Durability::HIGH);
+        db.update_base_query_lru_capacities(lru_capacity);
+        db.setup_syntax_context_root();
         db
     }
 
-    pub fn update_lru_capacity(&mut self, lru_capacity: Option<usize>) {
-        let lru_capacity = lru_capacity.unwrap_or(base_db::DEFAULT_LRU_CAP);
+    pub fn enable_proc_attr_macros(&mut self) {
+        self.set_expand_proc_attr_macros_with_durability(true, Durability::HIGH);
+    }
+
+    pub fn update_base_query_lru_capacities(&mut self, lru_capacity: Option<u16>) {
+        let lru_capacity = lru_capacity.unwrap_or(base_db::DEFAULT_PARSE_LRU_CAP);
+        base_db::FileTextQuery.in_db_mut(self).set_lru_capacity(DEFAULT_FILE_TEXT_LRU_CAP);
         base_db::ParseQuery.in_db_mut(self).set_lru_capacity(lru_capacity);
-        hir::db::ParseMacroExpansionQuery.in_db_mut(self).set_lru_capacity(lru_capacity);
-        hir::db::MacroExpandQuery.in_db_mut(self).set_lru_capacity(lru_capacity);
+        // macro expansions are usually rather small, so we can afford to keep more of them alive
+        hir::db::ParseMacroExpansionQuery.in_db_mut(self).set_lru_capacity(4 * lru_capacity);
+        hir::db::BorrowckQuery.in_db_mut(self).set_lru_capacity(base_db::DEFAULT_BORROWCK_LRU_CAP);
+        hir::db::BodyWithSourceMapQuery.in_db_mut(self).set_lru_capacity(2048);
+    }
+
+    pub fn update_lru_capacities(&mut self, lru_capacities: &FxHashMap<Box<str>, u16>) {
+        use hir::db as hir_db;
+
+        base_db::FileTextQuery.in_db_mut(self).set_lru_capacity(DEFAULT_FILE_TEXT_LRU_CAP);
+        base_db::ParseQuery.in_db_mut(self).set_lru_capacity(
+            lru_capacities
+                .get(stringify!(ParseQuery))
+                .copied()
+                .unwrap_or(base_db::DEFAULT_PARSE_LRU_CAP),
+        );
+        hir_db::ParseMacroExpansionQuery.in_db_mut(self).set_lru_capacity(
+            lru_capacities
+                .get(stringify!(ParseMacroExpansionQuery))
+                .copied()
+                .unwrap_or(4 * base_db::DEFAULT_PARSE_LRU_CAP),
+        );
+        hir_db::BorrowckQuery.in_db_mut(self).set_lru_capacity(
+            lru_capacities
+                .get(stringify!(BorrowckQuery))
+                .copied()
+                .unwrap_or(base_db::DEFAULT_BORROWCK_LRU_CAP),
+        );
+        hir::db::BodyWithSourceMapQuery.in_db_mut(self).set_lru_capacity(2048);
     }
 }
 
-impl salsa::ParallelDatabase for RootDatabase {
-    fn snapshot(&self) -> salsa::Snapshot<RootDatabase> {
-        salsa::Snapshot::new(RootDatabase { storage: ManuallyDrop::new(self.storage.snapshot()) })
+impl ra_salsa::ParallelDatabase for RootDatabase {
+    fn snapshot(&self) -> ra_salsa::Snapshot<RootDatabase> {
+        ra_salsa::Snapshot::new(RootDatabase {
+            storage: ManuallyDrop::new(self.storage.snapshot()),
+        })
     }
 }
 
-#[salsa::query_group(LineIndexDatabaseStorage)]
+#[ra_salsa::query_group(LineIndexDatabaseStorage)]
 pub trait LineIndexDatabase: base_db::SourceDatabase {
     fn line_index(&self, file_id: FileId) -> Arc<LineIndex>;
 }
 
 fn line_index(db: &dyn LineIndexDatabase, file_id: FileId) -> Arc<LineIndex> {
     let text = db.file_text(file_id);
-    Arc::new(LineIndex::new(&*text))
+    Arc::new(LineIndex::new(&text))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -179,11 +226,14 @@ pub enum SymbolKind {
     Enum,
     Field,
     Function,
+    Method,
     Impl,
+    InlineAsmRegOrRegClass,
     Label,
     LifetimeParam,
     Local,
     Macro,
+    ProcMacro,
     Module,
     SelfParam,
     SelfType,
@@ -191,6 +241,7 @@ pub enum SymbolKind {
     Struct,
     ToolModule,
     Trait,
+    TraitAlias,
     TypeAlias,
     TypeParam,
     Union,
@@ -201,28 +252,31 @@ pub enum SymbolKind {
 impl From<hir::MacroKind> for SymbolKind {
     fn from(it: hir::MacroKind) -> Self {
         match it {
-            hir::MacroKind::Declarative | hir::MacroKind::BuiltIn | hir::MacroKind::ProcMacro => {
-                SymbolKind::Macro
-            }
-            hir::MacroKind::Derive => SymbolKind::Derive,
-            hir::MacroKind::Attr => SymbolKind::Attribute,
+            hir::MacroKind::Declarative | hir::MacroKind::DeclarativeBuiltIn => SymbolKind::Macro,
+            hir::MacroKind::ProcMacro => SymbolKind::ProcMacro,
+            hir::MacroKind::Derive | hir::MacroKind::DeriveBuiltIn => SymbolKind::Derive,
+            hir::MacroKind::Attr | hir::MacroKind::AttrBuiltIn => SymbolKind::Attribute,
         }
     }
 }
 
-impl From<FileSymbolKind> for SymbolKind {
-    fn from(it: FileSymbolKind) -> Self {
+impl From<hir::ModuleDef> for SymbolKind {
+    fn from(it: hir::ModuleDef) -> Self {
         match it {
-            FileSymbolKind::Const => SymbolKind::Const,
-            FileSymbolKind::Enum => SymbolKind::Enum,
-            FileSymbolKind::Function => SymbolKind::Function,
-            FileSymbolKind::Macro => SymbolKind::Macro,
-            FileSymbolKind::Module => SymbolKind::Module,
-            FileSymbolKind::Static => SymbolKind::Static,
-            FileSymbolKind::Struct => SymbolKind::Struct,
-            FileSymbolKind::Trait => SymbolKind::Trait,
-            FileSymbolKind::TypeAlias => SymbolKind::TypeAlias,
-            FileSymbolKind::Union => SymbolKind::Union,
+            hir::ModuleDef::Const(..) => SymbolKind::Const,
+            hir::ModuleDef::Variant(..) => SymbolKind::Variant,
+            hir::ModuleDef::Function(..) => SymbolKind::Function,
+            hir::ModuleDef::Macro(mac) if mac.is_proc_macro() => SymbolKind::ProcMacro,
+            hir::ModuleDef::Macro(..) => SymbolKind::Macro,
+            hir::ModuleDef::Module(..) => SymbolKind::Module,
+            hir::ModuleDef::Static(..) => SymbolKind::Static,
+            hir::ModuleDef::Adt(hir::Adt::Struct(..)) => SymbolKind::Struct,
+            hir::ModuleDef::Adt(hir::Adt::Enum(..)) => SymbolKind::Enum,
+            hir::ModuleDef::Adt(hir::Adt::Union(..)) => SymbolKind::Union,
+            hir::ModuleDef::Trait(..) => SymbolKind::Trait,
+            hir::ModuleDef::TraitAlias(..) => SymbolKind::TraitAlias,
+            hir::ModuleDef::TypeAlias(..) => SymbolKind::TypeAlias,
+            hir::ModuleDef::BuiltinType(..) => SymbolKind::TypeAlias,
         }
     }
 }
@@ -242,7 +296,42 @@ impl SnippetCap {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    mod sourcegen_lints;
+pub struct Ranker<'a> {
+    pub kind: parser::SyntaxKind,
+    pub text: &'a str,
+    pub ident_kind: bool,
+}
+
+impl<'a> Ranker<'a> {
+    pub const MAX_RANK: usize = 0b1110;
+
+    pub fn from_token(token: &'a syntax::SyntaxToken) -> Self {
+        let kind = token.kind();
+        Ranker { kind, text: token.text(), ident_kind: kind.is_any_identifier() }
+    }
+
+    /// A utility function that ranks a token again a given kind and text, returning a number that
+    /// represents how close the token is to the given kind and text.
+    pub fn rank_token(&self, tok: &syntax::SyntaxToken) -> usize {
+        let tok_kind = tok.kind();
+
+        let exact_same_kind = tok_kind == self.kind;
+        let both_idents = exact_same_kind || (tok_kind.is_any_identifier() && self.ident_kind);
+        let same_text = tok.text() == self.text;
+        // anything that mapped into a token tree has likely no semantic information
+        let no_tt_parent =
+            tok.parent().is_some_and(|it| it.kind() != parser::SyntaxKind::TOKEN_TREE);
+        (both_idents as usize)
+            | ((exact_same_kind as usize) << 1)
+            | ((same_text as usize) << 2)
+            | ((no_tt_parent as usize) << 3)
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub enum Severity {
+    Error,
+    Warning,
+    WeakWarning,
+    Allow,
 }

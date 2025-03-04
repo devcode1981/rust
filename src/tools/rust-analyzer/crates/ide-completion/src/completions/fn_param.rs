@@ -32,7 +32,7 @@ pub(crate) fn complete_fn_param(
     let comma_wrapper = comma_wrapper(ctx);
     let mut add_new_item_to_acc = |label: &str| {
         let mk_item = |label: &str, range: TextRange| {
-            CompletionItem::new(CompletionItemKind::Binding, range, label)
+            CompletionItem::new(CompletionItemKind::Binding, range, label, ctx.edition)
         };
         let item = match &comma_wrapper {
             Some((fmt, range)) => mk_item(&fmt(label), *range),
@@ -40,7 +40,7 @@ pub(crate) fn complete_fn_param(
         };
         // Completion lookup is omitted intentionally here.
         // See the full discussion: https://github.com/rust-lang/rust-analyzer/issues/12073
-        item.add_to(acc)
+        item.add_to(acc, ctx.db)
     };
 
     match kind {
@@ -50,7 +50,7 @@ pub(crate) fn complete_fn_param(
         ParamKind::Closure(closure) => {
             let stmt_list = closure.syntax().ancestors().find_map(ast::StmtList::cast)?;
             params_from_stmt_list_scope(ctx, stmt_list, |name, ty| {
-                add_new_item_to_acc(&format!("{name}: {ty}"));
+                add_new_item_to_acc(&format!("{}: {ty}", name.display(ctx.db, ctx.edition)));
             });
         }
     }
@@ -100,13 +100,15 @@ fn fill_fn_params(
 
     if let Some(stmt_list) = function.syntax().parent().and_then(ast::StmtList::cast) {
         params_from_stmt_list_scope(ctx, stmt_list, |name, ty| {
-            file_params.entry(format!("{name}: {ty}")).or_insert(name.to_string());
+            file_params
+                .entry(format!("{}: {ty}", name.display(ctx.db, ctx.edition)))
+                .or_insert(name.display(ctx.db, ctx.edition).to_string());
         });
     }
     remove_duplicated(&mut file_params, param_list.params());
     let self_completion_items = ["self", "&self", "mut self", "&mut self"];
     if should_add_self_completions(ctx.token.text_range().start(), param_list, impl_) {
-        self_completion_items.into_iter().for_each(|self_item| add_new_item_to_acc(self_item));
+        self_completion_items.into_iter().for_each(&mut add_new_item_to_acc);
     }
 
     file_params.keys().for_each(|whole_param| add_new_item_to_acc(whole_param));
@@ -127,7 +129,7 @@ fn params_from_stmt_list_scope(
         let module = scope.module().into();
         scope.process_all_names(&mut |name, def| {
             if let hir::ScopeDef::Local(local) = def {
-                if let Ok(ty) = local.ty(ctx.db).display_source_code(ctx.db, module) {
+                if let Ok(ty) = local.ty(ctx.db).display_source_code(ctx.db, module, true) {
                     cb(name, ty);
                 }
             }
@@ -165,13 +167,14 @@ fn should_add_self_completions(
         return false;
     }
     match param_list.params().next() {
-        Some(first) => first.pat().map_or(false, |pat| pat.syntax().text_range().contains(cursor)),
+        Some(first) => first.pat().is_some_and(|pat| pat.syntax().text_range().contains(cursor)),
         None => true,
     }
 }
 
 fn comma_wrapper(ctx: &CompletionContext<'_>) -> Option<(impl Fn(&str) -> String, TextRange)> {
-    let param = ctx.token.parent_ancestors().find(|node| node.kind() == SyntaxKind::PARAM)?;
+    let param =
+        ctx.original_token.parent_ancestors().find(|node| node.kind() == SyntaxKind::PARAM)?;
 
     let next_token_kind = {
         let t = param.last_token()?.next_token()?;
@@ -192,5 +195,5 @@ fn comma_wrapper(ctx: &CompletionContext<'_>) -> Option<(impl Fn(&str) -> String
         matches!(prev_token_kind, SyntaxKind::COMMA | SyntaxKind::L_PAREN | SyntaxKind::PIPE);
     let leading = if has_leading_comma { "" } else { ", " };
 
-    Some((move |label: &_| (format!("{}{}{}", leading, label, trailing)), param.text_range()))
+    Some((move |label: &_| (format!("{leading}{label}{trailing}")), param.text_range()))
 }

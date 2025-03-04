@@ -3,12 +3,12 @@
 // - Remove unused aliases if there are no longer any users, see inline_call.rs.
 
 use hir::{HasSource, PathResolution};
+use ide_db::FxHashMap;
 use ide_db::{
     defs::Definition, imports::insert_use::ast_to_remove_for_path_in_use_stmt,
     search::FileReference,
 };
 use itertools::Itertools;
-use std::collections::HashMap;
 use syntax::{
     ast::{self, make, HasGenericParams, HasName},
     ted, AstNode, NodeOrToken, SyntaxNode,
@@ -43,6 +43,7 @@ use super::inline_call::split_refs_and_uses;
 // fn foo() {
 //     let _: i32 = 3;
 // }
+// ```
 pub(crate) fn inline_type_alias_uses(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
     let name = ctx.find_node_at_offset::<ast::Name>()?;
     let ast_alias = name.syntax().parent().and_then(ast::TypeAlias::cast)?;
@@ -92,7 +93,7 @@ pub(crate) fn inline_type_alias_uses(acc: &mut Assists, ctx: &AssistContext<'_>)
             };
 
             for (file_id, refs) in usages.into_iter() {
-                inline_refs_for_file(file_id, refs);
+                inline_refs_for_file(file_id.file_id(), refs);
             }
             if !definition_deleted {
                 builder.edit_file(ctx.file_id());
@@ -138,7 +139,7 @@ pub(crate) fn inline_type_alias(acc: &mut Assists, ctx: &AssistContext<'_>) -> O
             replacement = Replacement::Plain;
         }
         _ => {
-            let alias = get_type_alias(&ctx, &alias_instance)?;
+            let alias = get_type_alias(ctx, &alias_instance)?;
             concrete_type = alias.ty()?;
             replacement = inline(&alias, &alias_instance)?;
         }
@@ -158,7 +159,7 @@ impl Replacement {
     fn to_text(&self, concrete_type: &ast::Type) -> String {
         match self {
             Replacement::Generic { lifetime_map, const_and_type_map } => {
-                create_replacement(&lifetime_map, &const_and_type_map, &concrete_type)
+                create_replacement(lifetime_map, const_and_type_map, concrete_type)
             }
             Replacement::Plain => concrete_type.to_string(),
         }
@@ -189,14 +190,14 @@ fn inline(alias_def: &ast::TypeAlias, alias_instance: &ast::PathType) -> Option<
     Some(repl)
 }
 
-struct LifetimeMap(HashMap<String, ast::Lifetime>);
+struct LifetimeMap(FxHashMap<String, ast::Lifetime>);
 
 impl LifetimeMap {
     fn new(
         instance_args: &Option<ast::GenericArgList>,
         alias_generics: &ast::GenericParamList,
     ) -> Option<Self> {
-        let mut inner = HashMap::new();
+        let mut inner = FxHashMap::default();
 
         let wildcard_lifetime = make::lifetime("'_");
         let lifetimes = alias_generics
@@ -231,16 +232,16 @@ impl LifetimeMap {
     }
 }
 
-struct ConstAndTypeMap(HashMap<String, SyntaxNode>);
+struct ConstAndTypeMap(FxHashMap<String, SyntaxNode>);
 
 impl ConstAndTypeMap {
     fn new(
         instance_args: &Option<ast::GenericArgList>,
         alias_generics: &ast::GenericParamList,
     ) -> Option<Self> {
-        let mut inner = HashMap::new();
+        let mut inner = FxHashMap::default();
         let instance_generics = generic_args_to_const_and_type_generics(instance_args);
-        let alias_generics = generic_param_list_to_const_and_type_generics(&alias_generics);
+        let alias_generics = generic_param_list_to_const_and_type_generics(alias_generics);
 
         if instance_generics.len() > alias_generics.len() {
             cov_mark::hit!(too_many_generic_args);
@@ -275,7 +276,7 @@ impl ConstAndTypeMap {
 /// 1. Map the provided instance's generic args to the type alias's generic
 ///    params:
 ///
-///    ```
+///    ```ignore
 ///    type A<'a, const N: usize, T = u64> = &'a [T; N];
 ///          ^ alias generic params
 ///    let a: A<100>;

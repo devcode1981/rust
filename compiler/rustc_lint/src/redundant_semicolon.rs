@@ -1,7 +1,9 @@
-use crate::{EarlyContext, EarlyLintPass, LintContext};
 use rustc_ast::{Block, StmtKind};
-use rustc_errors::{fluent, Applicability};
+use rustc_session::{declare_lint, declare_lint_pass};
 use rustc_span::Span;
+
+use crate::lints::RedundantSemicolonsDiag;
+use crate::{EarlyContext, EarlyLintPass, LintContext};
 
 declare_lint! {
     /// The `redundant_semicolons` lint detects unnecessary trailing
@@ -48,18 +50,10 @@ fn maybe_lint_redundant_semis(cx: &EarlyContext<'_>, seq: &mut Option<(Span, boo
             return;
         }
 
-        cx.struct_span_lint(
+        cx.emit_span_lint(
             REDUNDANT_SEMICOLONS,
             span,
-            fluent::lint_redundant_semicolons,
-            |lint| {
-                lint.set_arg("multiple", multiple).span_suggestion(
-                    span,
-                    fluent::suggestion,
-                    "",
-                    Applicability::MaybeIncorrect,
-                )
-            },
+            RedundantSemicolonsDiag { multiple, suggestion: span },
         );
     }
 }

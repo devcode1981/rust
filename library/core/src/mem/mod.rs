@@ -5,13 +5,9 @@
 
 #![stable(feature = "rust1", since = "1.0.0")]
 
-use crate::clone;
-use crate::cmp;
-use crate::fmt;
-use crate::hash;
-use crate::intrinsics;
-use crate::marker::{Copy, DiscriminantKind, Sized};
-use crate::ptr;
+use crate::alloc::Layout;
+use crate::marker::DiscriminantKind;
+use crate::{clone, cmp, fmt, hash, intrinsics, ptr};
 
 mod manually_drop;
 #[stable(feature = "manually_drop", since = "1.20.0")]
@@ -21,14 +17,9 @@ mod maybe_uninit;
 #[stable(feature = "maybe_uninit", since = "1.36.0")]
 pub use maybe_uninit::MaybeUninit;
 
-// FIXME: This is left here for now to avoid complications around pending reverts.
-// Once <https://github.com/rust-lang/rust/issues/101899> is fully resolved,
-// this should be removed and the references in `alloc::Layout` updated.
-pub(crate) use ptr::Alignment as ValidAlign;
-
 mod transmutability;
 #[unstable(feature = "transmutability", issue = "99571")]
-pub use transmutability::{Assume, BikeshedIntrinsicFrom};
+pub use transmutability::{Assume, TransmuteFrom};
 
 #[stable(feature = "rust1", since = "1.0.0")]
 #[doc(inline)]
@@ -175,7 +166,7 @@ pub fn forget_unsized<T: ?Sized>(t: T) {
 ///
 /// The following table gives the size for primitives.
 ///
-/// Type | size_of::\<Type>()
+/// Type | `size_of::<Type>()`
 /// ---- | ---------------
 /// () | 0
 /// bool | 1
@@ -195,8 +186,8 @@ pub fn forget_unsized<T: ?Sized>(t: T) {
 ///
 /// Furthermore, `usize` and `isize` have the same size.
 ///
-/// The types `*const T`, `&T`, `Box<T>`, `Option<&T>`, and `Option<Box<T>>` all have
-/// the same size. If `T` is Sized, all of those types have the same size as `usize`.
+/// The types [`*const T`], `&T`, [`Box<T>`], [`Option<&T>`], and `Option<Box<T>>` all have
+/// the same size. If `T` is `Sized`, all of those types have the same size as `usize`.
 ///
 /// The mutability of a pointer does not change its size. As such, `&T` and `&mut T`
 /// have the same size. Likewise for `*const T` and `*mut T`.
@@ -208,7 +199,7 @@ pub fn forget_unsized<T: ?Sized>(t: T) {
 ///
 /// ## Size of Structs
 ///
-/// For `structs`, the size is determined by the following algorithm.
+/// For `struct`s, the size is determined by the following algorithm.
 ///
 /// For each field in the struct ordered by declaration order:
 ///
@@ -304,6 +295,10 @@ pub fn forget_unsized<T: ?Sized>(t: T) {
 /// ```
 ///
 /// [alignment]: align_of
+/// [`*const T`]: primitive@pointer
+/// [`Box<T>`]: ../../std/boxed/struct.Box.html
+/// [`Option<&T>`]: crate::option::Option
+///
 #[inline(always)]
 #[must_use]
 #[stable(feature = "rust1", since = "1.0.0")]
@@ -316,7 +311,7 @@ pub const fn size_of<T>() -> usize {
 
 /// Returns the size of the pointed-to value in bytes.
 ///
-/// This is usually the same as `size_of::<T>()`. However, when `T` *has* no
+/// This is usually the same as [`size_of::<T>()`]. However, when `T` *has* no
 /// statically-known size, e.g., a slice [`[T]`][slice] or a [trait object],
 /// then `size_of_val` can be used to get the dynamically-known size.
 ///
@@ -333,10 +328,12 @@ pub const fn size_of<T>() -> usize {
 /// let y: &[u8] = &x;
 /// assert_eq!(13, mem::size_of_val(y));
 /// ```
+///
+/// [`size_of::<T>()`]: size_of
 #[inline]
 #[must_use]
 #[stable(feature = "rust1", since = "1.0.0")]
-#[rustc_const_unstable(feature = "const_size_of_val", issue = "46571")]
+#[rustc_const_stable(feature = "const_size_of_val", since = "1.85.0")]
 #[cfg_attr(not(test), rustc_diagnostic_item = "mem_size_of_val")]
 pub const fn size_of_val<T: ?Sized>(val: &T) -> usize {
     // SAFETY: `val` is a reference, so it's a valid raw pointer
@@ -345,7 +342,7 @@ pub const fn size_of_val<T: ?Sized>(val: &T) -> usize {
 
 /// Returns the size of the pointed-to value in bytes.
 ///
-/// This is usually the same as `size_of::<T>()`. However, when `T` *has* no
+/// This is usually the same as [`size_of::<T>()`]. However, when `T` *has* no
 /// statically-known size, e.g., a slice [`[T]`][slice] or a [trait object],
 /// then `size_of_val_raw` can be used to get the dynamically-known size.
 ///
@@ -358,6 +355,12 @@ pub const fn size_of_val<T: ?Sized>(val: &T) -> usize {
 ///     - a [slice], then the length of the slice tail must be an initialized
 ///       integer, and the size of the *entire value*
 ///       (dynamic tail length + statically sized prefix) must fit in `isize`.
+///       For the special case where the dynamic tail length is 0, this function
+///       is safe to call.
+//        NOTE: the reason this is safe is that if an overflow were to occur already with size 0,
+//        then we would stop compilation as even the "statically known" part of the type would
+//        already be too big (or the call may be in dead code and optimized away, but then it
+//        doesn't matter).
 ///     - a [trait object], then the vtable part of the pointer must point
 ///       to a valid vtable acquired by an unsizing coercion, and the size
 ///       of the *entire value* (dynamic tail length + statically sized prefix)
@@ -368,6 +371,7 @@ pub const fn size_of_val<T: ?Sized>(val: &T) -> usize {
 ///       [`size_of_val`] on a reference to a type with an extern type tail.
 ///     - otherwise, it is conservatively not allowed to call this function.
 ///
+/// [`size_of::<T>()`]: size_of
 /// [trait object]: ../../book/ch17-02-trait-objects.html
 /// [extern type]: ../../unstable-book/language-features/extern-types.html
 ///
@@ -386,7 +390,6 @@ pub const fn size_of_val<T: ?Sized>(val: &T) -> usize {
 #[inline]
 #[must_use]
 #[unstable(feature = "layout_for_ptr", issue = "69835")]
-#[rustc_const_unstable(feature = "const_size_of_val_raw", issue = "46571")]
 pub const unsafe fn size_of_val_raw<T: ?Sized>(val: *const T) -> usize {
     // SAFETY: the caller must provide a valid raw pointer
     unsafe { intrinsics::size_of_val(val) }
@@ -411,7 +414,7 @@ pub const unsafe fn size_of_val_raw<T: ?Sized>(val: *const T) -> usize {
 #[inline]
 #[must_use]
 #[stable(feature = "rust1", since = "1.0.0")]
-#[deprecated(note = "use `align_of` instead", since = "1.2.0")]
+#[deprecated(note = "use `align_of` instead", since = "1.2.0", suggestion = "align_of")]
 pub fn min_align_of<T>() -> usize {
     intrinsics::min_align_of::<T>()
 }
@@ -434,7 +437,7 @@ pub fn min_align_of<T>() -> usize {
 #[inline]
 #[must_use]
 #[stable(feature = "rust1", since = "1.0.0")]
-#[deprecated(note = "use `align_of_val` instead", since = "1.2.0")]
+#[deprecated(note = "use `align_of_val` instead", since = "1.2.0", suggestion = "align_of_val")]
 pub fn min_align_of_val<T: ?Sized>(val: &T) -> usize {
     // SAFETY: val is a reference, so it's a valid raw pointer
     unsafe { intrinsics::min_align_of_val(val) }
@@ -481,7 +484,7 @@ pub const fn align_of<T>() -> usize {
 #[inline]
 #[must_use]
 #[stable(feature = "rust1", since = "1.0.0")]
-#[rustc_const_unstable(feature = "const_align_of_val", issue = "46571")]
+#[rustc_const_stable(feature = "const_align_of_val", since = "1.85.0")]
 #[allow(deprecated)]
 pub const fn align_of_val<T: ?Sized>(val: &T) -> usize {
     // SAFETY: val is a reference, so it's a valid raw pointer
@@ -504,6 +507,8 @@ pub const fn align_of_val<T: ?Sized>(val: &T) -> usize {
 ///     - a [slice], then the length of the slice tail must be an initialized
 ///       integer, and the size of the *entire value*
 ///       (dynamic tail length + statically sized prefix) must fit in `isize`.
+///       For the special case where the dynamic tail length is 0, this function
+///       is safe to call.
 ///     - a [trait object], then the vtable part of the pointer must point
 ///       to a valid vtable acquired by an unsizing coercion, and the size
 ///       of the *entire value* (dynamic tail length + statically sized prefix)
@@ -528,7 +533,6 @@ pub const fn align_of_val<T: ?Sized>(val: &T) -> usize {
 #[inline]
 #[must_use]
 #[unstable(feature = "layout_for_ptr", issue = "69835")]
-#[rustc_const_unstable(feature = "const_align_of_val_raw", issue = "46571")]
 pub const unsafe fn align_of_val_raw<T: ?Sized>(val: *const T) -> usize {
     // SAFETY: the caller must provide a valid raw pointer
     unsafe { intrinsics::min_align_of_val(val) }
@@ -606,7 +610,7 @@ pub const fn needs_drop<T: ?Sized>() -> bool {
 ///
 /// There is no guarantee that an all-zero byte-pattern represents a valid value
 /// of some type `T`. For example, the all-zero byte-pattern is not a valid value
-/// for reference types (`&T`, `&mut T`) and functions pointers. Using `zeroed`
+/// for reference types (`&T`, `&mut T`) and function pointers. Using `zeroed`
 /// on such types causes immediate [undefined behavior][ub] because [the Rust
 /// compiler assumes][inv] that there always is a valid value in a variable it
 /// considers initialized.
@@ -645,7 +649,8 @@ pub const fn needs_drop<T: ?Sized>() -> bool {
 #[allow(deprecated)]
 #[rustc_diagnostic_item = "mem_zeroed"]
 #[track_caller]
-pub unsafe fn zeroed<T>() -> T {
+#[rustc_const_stable(feature = "const_mem_zeroed", since = "1.75.0")]
+pub const unsafe fn zeroed<T>() -> T {
     // SAFETY: the caller must guarantee that an all-zero value is valid for `T`.
     unsafe {
         intrinsics::assert_zero_valid::<T>();
@@ -687,7 +692,7 @@ pub unsafe fn zeroed<T>() -> T {
 pub unsafe fn uninitialized<T>() -> T {
     // SAFETY: the caller must guarantee that an uninitialized value is valid for `T`.
     unsafe {
-        intrinsics::assert_uninit_valid::<T>();
+        intrinsics::assert_mem_uninitialized_valid::<T>();
         let mut val = MaybeUninit::<T>::uninit();
 
         // Fill memory with 0x01, as an imperfect mitigation for old code that uses this function on
@@ -720,69 +725,12 @@ pub unsafe fn uninitialized<T>() -> T {
 /// ```
 #[inline]
 #[stable(feature = "rust1", since = "1.0.0")]
-#[rustc_const_unstable(feature = "const_swap", issue = "83163")]
+#[rustc_const_stable(feature = "const_swap", since = "1.85.0")]
+#[rustc_diagnostic_item = "mem_swap"]
 pub const fn swap<T>(x: &mut T, y: &mut T) {
-    // NOTE(eddyb) SPIR-V's Logical addressing model doesn't allow for arbitrary
-    // reinterpretation of values as (chunkable) byte arrays, and the loop in the
-    // block optimization in `swap_slice` is hard to rewrite back
-    // into the (unoptimized) direct swapping implementation, so we disable it.
-    // FIXME(eddyb) the block optimization also prevents MIR optimizations from
-    // understanding `mem::replace`, `Option::take`, etc. - a better overall
-    // solution might be to make `ptr::swap_nonoverlapping` into an intrinsic, which
-    // a backend can choose to implement using the block optimization, or not.
-    // NOTE(scottmcm) MIRI is disabled here as reading in smaller units is a
-    // pessimization for it.  Also, if the type contains any unaligned pointers,
-    // copying those over multiple reads is difficult to support.
-    #[cfg(not(any(target_arch = "spirv", miri)))]
-    {
-        // For types that are larger multiples of their alignment, the simple way
-        // tends to copy the whole thing to stack rather than doing it one part
-        // at a time, so instead treat them as one-element slices and piggy-back
-        // the slice optimizations that will split up the swaps.
-        if size_of::<T>() / align_of::<T>() > 4 {
-            // SAFETY: exclusive references always point to one non-overlapping
-            // element and are non-null and properly aligned.
-            return unsafe { ptr::swap_nonoverlapping(x, y, 1) };
-        }
-    }
-
-    // If a scalar consists of just a small number of alignment units, let
-    // the codegen just swap those pieces directly, as it's likely just a
-    // few instructions and anything else is probably overcomplicated.
-    //
-    // Most importantly, this covers primitives and simd types that tend to
-    // have size=align where doing anything else can be a pessimization.
-    // (This will also be used for ZSTs, though any solution works for them.)
-    swap_simple(x, y);
-}
-
-/// Same as [`swap`] semantically, but always uses the simple implementation.
-///
-/// Used elsewhere in `mem` and `ptr` at the bottom layer of calls.
-#[rustc_const_unstable(feature = "const_swap", issue = "83163")]
-#[inline]
-pub(crate) const fn swap_simple<T>(x: &mut T, y: &mut T) {
-    // We arrange for this to typically be called with small types,
-    // so this reads-and-writes approach is actually better than using
-    // copy_nonoverlapping as it easily puts things in LLVM registers
-    // directly and doesn't end up inlining allocas.
-    // And LLVM actually optimizes it to 3×memcpy if called with
-    // a type larger than it's willing to keep in a register.
-    // Having typed reads and writes in MIR here is also good as
-    // it lets MIRI and CTFE understand them better, including things
-    // like enforcing type validity for them.
-    // Importantly, read+copy_nonoverlapping+write introduces confusing
-    // asymmetry to the behaviour where one value went through read+write
-    // whereas the other was copied over by the intrinsic (see #94371).
-
-    // SAFETY: exclusive references are always valid to read/write,
-    // including being aligned, and nothing here panics so it's drop-safe.
-    unsafe {
-        let a = ptr::read(x);
-        let b = ptr::read(y);
-        ptr::write(x, b);
-        ptr::write(y, a);
-    }
+    // SAFETY: `&mut` guarantees these are typed readable and writable
+    // as well as non-overlapping.
+    unsafe { intrinsics::typed_swap_nonoverlapping(x, y) }
 }
 
 /// Replaces `dest` with the default value of `T`, returning the previous `dest` value.
@@ -907,9 +855,13 @@ pub fn take<T: Default>(dest: &mut T) -> T {
 #[inline]
 #[stable(feature = "rust1", since = "1.0.0")]
 #[must_use = "if you don't need the old value, you can just assign the new value directly"]
-#[rustc_const_unstable(feature = "const_replace", issue = "83164")]
+#[rustc_const_stable(feature = "const_replace", since = "1.83.0")]
 #[cfg_attr(not(test), rustc_diagnostic_item = "mem_replace")]
 pub const fn replace<T>(dest: &mut T, src: T) -> T {
+    // It may be tempting to use `swap` to avoid `unsafe` here. Don't!
+    // The compiler optimizes the implementation below to two `memcpy`s
+    // while `swap` would require at least three. See PR#83022 for details.
+
     // SAFETY: We read from `dest` but directly write `src` into it afterwards,
     // such that the old value is not duplicated. Nothing is dropped and
     // nothing here can panic.
@@ -931,7 +883,7 @@ pub const fn replace<T>(dest: &mut T, src: T) -> T {
 /// This function is not magic; it is literally defined as
 ///
 /// ```
-/// pub fn drop<T>(_x: T) { }
+/// pub fn drop<T>(_x: T) {}
 /// ```
 ///
 /// Because `_x` is moved into the function, it is automatically dropped before
@@ -969,6 +921,7 @@ pub const fn replace<T>(dest: &mut T, src: T) -> T {
 /// Integers and other types implementing [`Copy`] are unaffected by `drop`.
 ///
 /// ```
+/// # #![allow(dropping_copy_types)]
 /// #[derive(Copy, Clone)]
 /// struct Foo(u8);
 ///
@@ -1004,7 +957,7 @@ pub fn drop<T>(_x: T) {}
 /// ```
 #[inline]
 #[unstable(feature = "mem_copy_fn", issue = "98262")]
-pub fn copy<T: Copy>(x: &T) -> T {
+pub const fn copy<T: Copy>(x: &T) -> T {
     *x
 }
 
@@ -1050,8 +1003,9 @@ pub fn copy<T: Copy>(x: &T) -> T {
 /// ```
 #[inline]
 #[must_use]
+#[track_caller]
 #[stable(feature = "rust1", since = "1.0.0")]
-#[rustc_const_unstable(feature = "const_transmute_copy", issue = "83165")]
+#[rustc_const_stable(feature = "const_transmute_copy", since = "1.74.0")]
 pub const unsafe fn transmute_copy<Src, Dst>(src: &Src) -> Dst {
     assert!(
         size_of::<Src>() >= size_of::<Dst>(),
@@ -1121,7 +1075,17 @@ impl<T> fmt::Debug for Discriminant<T> {
 /// # Stability
 ///
 /// The discriminant of an enum variant may change if the enum definition changes. A discriminant
-/// of some variant will not change between compilations with the same compiler.
+/// of some variant will not change between compilations with the same compiler. See the [Reference]
+/// for more information.
+///
+/// [Reference]: ../../reference/items/enumerations.html#custom-discriminant-values-for-fieldless-enumerations
+///
+/// The value of a [`Discriminant<T>`] is independent of any *free lifetimes* in `T`. As such,
+/// reading or writing a `Discriminant<Foo<'a>>` as a `Discriminant<Foo<'b>>` (whether via
+/// [`transmute`] or otherwise) is always sound. Note that this is **not** true for other kinds
+/// of generic parameters and for higher-ranked lifetimes; `Discriminant<Foo<A>>` and
+/// `Discriminant<Foo<B>>` as well as `Discriminant<Bar<dyn for<'a> Trait<'a>>>` and
+/// `Discriminant<Bar<dyn Trait<'static>>>` may be incompatible.
 ///
 /// # Examples
 ///
@@ -1137,8 +1101,64 @@ impl<T> fmt::Debug for Discriminant<T> {
 /// assert_eq!(mem::discriminant(&Foo::B(1)), mem::discriminant(&Foo::B(2)));
 /// assert_ne!(mem::discriminant(&Foo::B(3)), mem::discriminant(&Foo::C(3)));
 /// ```
+///
+/// ## Accessing the numeric value of the discriminant
+///
+/// Note that it is *undefined behavior* to [`transmute`] from [`Discriminant`] to a primitive!
+///
+/// If an enum has only unit variants, then the numeric value of the discriminant can be accessed
+/// with an [`as`] cast:
+///
+/// ```
+/// enum Enum {
+///     Foo,
+///     Bar,
+///     Baz,
+/// }
+///
+/// assert_eq!(0, Enum::Foo as isize);
+/// assert_eq!(1, Enum::Bar as isize);
+/// assert_eq!(2, Enum::Baz as isize);
+/// ```
+///
+/// If an enum has opted-in to having a [primitive representation] for its discriminant,
+/// then it's possible to use pointers to read the memory location storing the discriminant.
+/// That **cannot** be done for enums using the [default representation], however, as it's
+/// undefined what layout the discriminant has and where it's stored — it might not even be
+/// stored at all!
+///
+/// [`as`]: ../../std/keyword.as.html
+/// [primitive representation]: ../../reference/type-layout.html#primitive-representations
+/// [default representation]: ../../reference/type-layout.html#the-default-representation
+/// ```
+/// #[repr(u8)]
+/// enum Enum {
+///     Unit,
+///     Tuple(bool),
+///     Struct { a: bool },
+/// }
+///
+/// impl Enum {
+///     fn discriminant(&self) -> u8 {
+///         // SAFETY: Because `Self` is marked `repr(u8)`, its layout is a `repr(C)` `union`
+///         // between `repr(C)` structs, each of which has the `u8` discriminant as its first
+///         // field, so we can read the discriminant without offsetting the pointer.
+///         unsafe { *<*const _>::from(self).cast::<u8>() }
+///     }
+/// }
+///
+/// let unit_like = Enum::Unit;
+/// let tuple_like = Enum::Tuple(true);
+/// let struct_like = Enum::Struct { a: false };
+/// assert_eq!(0, unit_like.discriminant());
+/// assert_eq!(1, tuple_like.discriminant());
+/// assert_eq!(2, struct_like.discriminant());
+///
+/// // ⚠️ This is undefined behavior. Don't do this. ⚠️
+/// // assert_eq!(0, unsafe { std::mem::transmute::<_, u8>(std::mem::discriminant(&unit_like)) });
+/// ```
 #[stable(feature = "discriminant_value", since = "1.21.0")]
-#[rustc_const_unstable(feature = "const_discriminant", issue = "69821")]
+#[rustc_const_stable(feature = "const_discriminant", since = "1.75.0")]
 #[cfg_attr(not(test), rustc_diagnostic_item = "mem_discriminant")]
 #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
 pub const fn discriminant<T>(v: &T) -> Discriminant<T> {
@@ -1217,7 +1237,140 @@ pub trait SizedTypeProperties: Sized {
     #[doc(hidden)]
     #[unstable(feature = "sized_type_properties", issue = "none")]
     const IS_ZST: bool = size_of::<Self>() == 0;
+
+    #[doc(hidden)]
+    #[unstable(feature = "sized_type_properties", issue = "none")]
+    const LAYOUT: Layout = Layout::new::<Self>();
+
+    /// The largest safe length for a `[Self]`.
+    ///
+    /// Anything larger than this would make `size_of_val` overflow `isize::MAX`,
+    /// which is never allowed for a single object.
+    #[doc(hidden)]
+    #[unstable(feature = "sized_type_properties", issue = "none")]
+    const MAX_SLICE_LEN: usize = match size_of::<Self>() {
+        0 => usize::MAX,
+        n => (isize::MAX as usize) / n,
+    };
 }
 #[doc(hidden)]
 #[unstable(feature = "sized_type_properties", issue = "none")]
 impl<T> SizedTypeProperties for T {}
+
+/// Expands to the offset in bytes of a field from the beginning of the given type.
+///
+/// Structs, enums, unions and tuples are supported.
+///
+/// Nested field accesses may be used, but not array indexes.
+///
+/// If the nightly-only feature `offset_of_enum` is enabled,
+/// variants may be traversed as if they were fields.
+/// Variants themselves do not have an offset.
+///
+/// Visibility is respected - all types and fields must be visible to the call site:
+///
+/// ```
+/// mod nested {
+///     #[repr(C)]
+///     pub struct Struct {
+///         private: u8,
+///     }
+/// }
+///
+/// // assert_eq!(mem::offset_of!(nested::Struct, private), 0);
+/// // ^^^ error[E0616]: field `private` of struct `Struct` is private
+/// ```
+///
+/// Only [`Sized`] fields are supported, but the container may be unsized:
+/// ```
+/// # use core::mem;
+/// #[repr(C)]
+/// pub struct Struct {
+///     a: u8,
+///     b: [u8],
+/// }
+///
+/// assert_eq!(mem::offset_of!(Struct, a), 0); // OK
+/// // assert_eq!(mem::offset_of!(Struct, b), 1);
+/// // ^^^ error[E0277]: doesn't have a size known at compile-time
+/// ```
+///
+/// Note that type layout is, in general, [subject to change and
+/// platform-specific](https://doc.rust-lang.org/reference/type-layout.html). If
+/// layout stability is required, consider using an [explicit `repr` attribute].
+///
+/// Rust guarantees that the offset of a given field within a given type will not
+/// change over the lifetime of the program. However, two different compilations of
+/// the same program may result in different layouts. Also, even within a single
+/// program execution, no guarantees are made about types which are *similar* but
+/// not *identical*, e.g.:
+///
+/// ```
+/// struct Wrapper<T, U>(T, U);
+///
+/// type A = Wrapper<u8, u8>;
+/// type B = Wrapper<u8, i8>;
+///
+/// // Not necessarily identical even though `u8` and `i8` have the same layout!
+/// // assert_eq!(mem::offset_of!(A, 1), mem::offset_of!(B, 1));
+///
+/// #[repr(transparent)]
+/// struct U8(u8);
+///
+/// type C = Wrapper<u8, U8>;
+///
+/// // Not necessarily identical even though `u8` and `U8` have the same layout!
+/// // assert_eq!(mem::offset_of!(A, 1), mem::offset_of!(C, 1));
+///
+/// struct Empty<T>(core::marker::PhantomData<T>);
+///
+/// // Not necessarily identical even though `PhantomData` always has the same layout!
+/// // assert_eq!(mem::offset_of!(Empty<u8>, 0), mem::offset_of!(Empty<i8>, 0));
+/// ```
+///
+/// [explicit `repr` attribute]: https://doc.rust-lang.org/reference/type-layout.html#representations
+///
+/// # Examples
+///
+/// ```
+/// #![feature(offset_of_enum)]
+///
+/// use std::mem;
+/// #[repr(C)]
+/// struct FieldStruct {
+///     first: u8,
+///     second: u16,
+///     third: u8
+/// }
+///
+/// assert_eq!(mem::offset_of!(FieldStruct, first), 0);
+/// assert_eq!(mem::offset_of!(FieldStruct, second), 2);
+/// assert_eq!(mem::offset_of!(FieldStruct, third), 4);
+///
+/// #[repr(C)]
+/// struct NestedA {
+///     b: NestedB
+/// }
+///
+/// #[repr(C)]
+/// struct NestedB(u8);
+///
+/// assert_eq!(mem::offset_of!(NestedA, b.0), 0);
+///
+/// #[repr(u8)]
+/// enum Enum {
+///     A(u8, u16),
+///     B { one: u8, two: u16 },
+/// }
+///
+/// assert_eq!(mem::offset_of!(Enum, A.0), 1);
+/// assert_eq!(mem::offset_of!(Enum, B.two), 2);
+///
+/// assert_eq!(mem::offset_of!(Option<&u8>, Some.0), 0);
+/// ```
+#[stable(feature = "offset_of", since = "1.77.0")]
+#[allow_internal_unstable(builtin_syntax)]
+pub macro offset_of($Container:ty, $($fields:expr)+ $(,)?) {
+    // The `{}` is for better error messages
+    {builtin # offset_of($Container, $($fields)+)}
+}

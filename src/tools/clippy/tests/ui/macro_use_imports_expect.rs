@@ -1,9 +1,9 @@
-// aux-build:macro_rules.rs
-// aux-build:macro_use_helper.rs
-// aux-build:proc_macro_derive.rs
-// ignore-32bit
+//@ check-pass
+//@aux-build:macro_rules.rs
+//@aux-build:macro_use_helper.rs
+//@aux-build:proc_macro_derive.rs
+//@ignore-bitwidth: 32
 
-#![feature(lint_reasons)]
 #![allow(unused_imports, unreachable_code, unused_variables, dead_code, unused_attributes)]
 #![allow(clippy::single_component_path_imports)]
 #![warn(clippy::macro_use_imports)]
@@ -39,7 +39,7 @@ mod a {
         let v: ty_macro!() = Vec::default();
 
         inner::try_err!();
-        inner::foofoo!();
+        inner::mut_mut!();
         nested::string_add!();
     }
 }

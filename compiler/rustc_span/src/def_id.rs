@@ -1,24 +1,29 @@
-use crate::HashStableContext;
-use rustc_data_structures::fingerprint::Fingerprint;
-use rustc_data_structures::stable_hasher::{HashStable, StableHasher, ToStableHashKey};
-use rustc_data_structures::AtomicRef;
-use rustc_index::vec::Idx;
-use rustc_macros::HashStable_Generic;
-use rustc_serialize::{Decodable, Decoder, Encodable, Encoder};
-use std::borrow::Borrow;
 use std::fmt;
-use std::hash::{Hash, Hasher};
+use std::hash::{BuildHasherDefault, Hash, Hasher};
+
+use rustc_data_structures::AtomicRef;
+use rustc_data_structures::fingerprint::Fingerprint;
+use rustc_data_structures::stable_hasher::{HashStable, StableHasher, StableOrd, ToStableHashKey};
+use rustc_data_structures::unhash::Unhasher;
+use rustc_hashes::Hash64;
+use rustc_index::Idx;
+use rustc_macros::{Decodable, Encodable, HashStable_Generic};
+use rustc_serialize::{Decodable, Encodable};
+
+use crate::{HashStableContext, SpanDecoder, SpanEncoder, Symbol};
+
+pub type StableCrateIdMap =
+    indexmap::IndexMap<StableCrateId, CrateNum, BuildHasherDefault<Unhasher>>;
 
 rustc_index::newtype_index! {
-    pub struct CrateNum {
-        ENCODABLE = custom
-        DEBUG_FORMAT = "crate{}"
-    }
+    #[orderable]
+    #[debug_format = "crate{}"]
+    pub struct CrateNum {}
 }
 
 /// Item definitions in the currently-compiled crate would have the `CrateNum`
 /// `LOCAL_CRATE` in their `DefId`.
-pub const LOCAL_CRATE: CrateNum = CrateNum::from_u32(0);
+pub const LOCAL_CRATE: CrateNum = CrateNum::ZERO;
 
 impl CrateNum {
     #[inline]
@@ -26,29 +31,21 @@ impl CrateNum {
         CrateNum::from_usize(x)
     }
 
+    // FIXME(typed_def_id): Replace this with `as_mod_def_id`.
     #[inline]
     pub fn as_def_id(self) -> DefId {
         DefId { krate: self, index: CRATE_DEF_INDEX }
+    }
+
+    #[inline]
+    pub fn as_mod_def_id(self) -> ModDefId {
+        ModDefId::new_unchecked(DefId { krate: self, index: CRATE_DEF_INDEX })
     }
 }
 
 impl fmt::Display for CrateNum {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&self.private, f)
-    }
-}
-
-/// As a local identifier, a `CrateNum` is only meaningful within its context, e.g. within a tcx.
-/// Therefore, make sure to include the context when encode a `CrateNum`.
-impl<E: Encoder> Encodable<E> for CrateNum {
-    default fn encode(&self, s: &mut E) {
-        s.emit_u32(self.as_u32());
-    }
-}
-
-impl<D: Decoder> Decodable<D> for CrateNum {
-    default fn decode(d: &mut D) -> CrateNum {
-        CrateNum::from_u32(d.read_u32())
+        fmt::Display::fmt(&self.as_u32(), f)
     }
 }
 
@@ -102,29 +99,33 @@ impl DefPathHash {
     /// originates from.
     #[inline]
     pub fn stable_crate_id(&self) -> StableCrateId {
-        StableCrateId(self.0.as_value().0)
+        StableCrateId(self.0.split().0)
     }
 
     /// Returns the crate-local part of the [DefPathHash].
-    ///
-    /// Used for tests.
     #[inline]
-    pub fn local_hash(&self) -> u64 {
-        self.0.as_value().1
+    pub fn local_hash(&self) -> Hash64 {
+        self.0.split().1
     }
 
     /// Builds a new [DefPathHash] with the given [StableCrateId] and
     /// `local_hash`, where `local_hash` must be unique within its crate.
-    pub fn new(stable_crate_id: StableCrateId, local_hash: u64) -> DefPathHash {
+    pub fn new(stable_crate_id: StableCrateId, local_hash: Hash64) -> DefPathHash {
         DefPathHash(Fingerprint::new(stable_crate_id.0, local_hash))
     }
 }
 
-impl Borrow<Fingerprint> for DefPathHash {
-    #[inline]
-    fn borrow(&self) -> &Fingerprint {
-        &self.0
+impl Default for DefPathHash {
+    fn default() -> Self {
+        DefPathHash(Fingerprint::ZERO)
     }
+}
+
+impl StableOrd for DefPathHash {
+    const CAN_USE_UNSTABLE_SORT: bool = true;
+
+    // `DefPathHash` sort order is not affected by (de)serialization.
+    const THIS_IMPLEMENTATION_HAS_BEEN_TRIPLE_CHECKED: () = ();
 }
 
 /// A [`StableCrateId`] is a 64-bit hash of a crate name, together with all
@@ -138,20 +139,23 @@ impl Borrow<Fingerprint> for DefPathHash {
 ///
 /// For more information on the possibility of hash collisions in rustc,
 /// see the discussion in [`DefId`].
-#[derive(Copy, Clone, Hash, PartialEq, Eq, PartialOrd, Ord, Debug)]
-#[derive(HashStable_Generic, Encodable, Decodable)]
-pub struct StableCrateId(pub(crate) u64);
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[derive(Hash, HashStable_Generic, Encodable, Decodable)]
+pub struct StableCrateId(pub(crate) Hash64);
 
 impl StableCrateId {
-    pub fn to_u64(self) -> u64 {
-        self.0
-    }
-
     /// Computes the stable ID for a crate with the given name and
     /// `-Cmetadata` arguments.
-    pub fn new(crate_name: &str, is_exe: bool, mut metadata: Vec<String>) -> StableCrateId {
+    pub fn new(
+        crate_name: Symbol,
+        is_exe: bool,
+        mut metadata: Vec<String>,
+        cfg_version: &'static str,
+    ) -> StableCrateId {
         let mut hasher = StableHasher::new();
-        crate_name.hash(&mut hasher);
+        // We must hash the string text of the crate name, not the id, as the id is not stable
+        // across builds.
+        crate_name.as_str().hash(&mut hasher);
 
         // We don't want the stable crate ID to depend on the order of
         // -C metadata arguments, so sort them:
@@ -181,10 +185,21 @@ impl StableCrateId {
         if let Some(val) = std::env::var_os("RUSTC_FORCE_RUSTC_VERSION") {
             hasher.write(val.to_string_lossy().into_owned().as_bytes())
         } else {
-            hasher.write(option_env!("CFG_VERSION").unwrap_or("unknown version").as_bytes());
+            hasher.write(cfg_version.as_bytes())
         }
 
         StableCrateId(hasher.finish())
+    }
+
+    #[inline]
+    pub fn as_u64(self) -> u64 {
+        self.0.as_u64()
+    }
+}
+
+impl fmt::LowerHex for StableCrateId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::LowerHex::fmt(&self.0, f)
     }
 }
 
@@ -192,25 +207,12 @@ rustc_index::newtype_index! {
     /// A DefIndex is an index into the hir-map for a crate, identifying a
     /// particular definition. It should really be considered an interned
     /// shorthand for a particular DefPath.
+    #[orderable]
+    #[debug_format = "DefIndex({})"]
     pub struct DefIndex {
-        ENCODABLE = custom // (only encodable in metadata)
-
-        DEBUG_FORMAT = "DefIndex({})",
         /// The crate root is always assigned index 0 by the AST Map code,
         /// thanks to `NodeCollector::new`.
-        const CRATE_DEF_INDEX = 0,
-    }
-}
-
-impl<E: Encoder> Encodable<E> for DefIndex {
-    default fn encode(&self, _: &mut E) {
-        panic!("cannot encode `DefIndex` with `{}`", std::any::type_name::<E>());
-    }
-}
-
-impl<D: Decoder> Decodable<D> for DefIndex {
-    default fn decode(_: &mut D) -> DefIndex {
-        panic!("cannot decode `DefIndex` with `{}`", std::any::type_name::<D>());
+        const CRATE_DEF_INDEX = 0;
     }
 }
 
@@ -219,8 +221,6 @@ impl<D: Decoder> Decodable<D> for DefIndex {
 ///
 /// You can create a `DefId` from a `LocalDefId` using `local_def_id.to_def_id()`.
 #[derive(Clone, PartialEq, Eq, Copy)]
-// Don't derive order on 64-bit big-endian, so we can be consistent regardless of field order.
-#[cfg_attr(not(all(target_pointer_width = "64", target_endian = "big")), derive(PartialOrd, Ord))]
 // On below-64 bit systems we can simply use the derived `Hash` impl
 #[cfg_attr(not(target_pointer_width = "64"), derive(Hash))]
 #[repr(C)]
@@ -229,13 +229,19 @@ impl<D: Decoder> Decodable<D> for DefIndex {
 pub struct DefId {
     // cfg-ing the order of fields so that the `DefIndex` which is high entropy always ends up in
     // the lower bits no matter the endianness. This allows the compiler to turn that `Hash` impl
-    // into a direct call to 'u64::hash(_)`.
+    // into a direct call to `u64::hash(_)`.
     #[cfg(not(all(target_pointer_width = "64", target_endian = "big")))]
     pub index: DefIndex,
     pub krate: CrateNum,
     #[cfg(all(target_pointer_width = "64", target_endian = "big"))]
     pub index: DefIndex,
 }
+
+// To ensure correctness of incremental compilation,
+// `DefId` must not implement `Ord` or `PartialOrd`.
+// See https://github.com/rust-lang/rust/issues/90317.
+impl !Ord for DefId {}
+impl !PartialOrd for DefId {}
 
 // On 64-bit systems, we can hash the whole `DefId` as one `u64` instead of two `u32`s. This
 // improves performance without impairing `FxHash` quality. So the below code gets compiled to a
@@ -262,22 +268,6 @@ impl Hash for DefId {
     }
 }
 
-// Implement the same comparison as derived with the other field order.
-#[cfg(all(target_pointer_width = "64", target_endian = "big"))]
-impl Ord for DefId {
-    #[inline]
-    fn cmp(&self, other: &DefId) -> std::cmp::Ordering {
-        Ord::cmp(&(self.index, self.krate), &(other.index, other.krate))
-    }
-}
-#[cfg(all(target_pointer_width = "64", target_endian = "big"))]
-impl PartialOrd for DefId {
-    #[inline]
-    fn partial_cmp(&self, other: &DefId) -> Option<std::cmp::Ordering> {
-        Some(Ord::cmp(self, other))
-    }
-}
-
 impl DefId {
     /// Makes a local `DefId` from the given `DefIndex`.
     #[inline]
@@ -293,7 +283,7 @@ impl DefId {
 
     #[inline]
     pub fn as_local(self) -> Option<LocalDefId> {
-        if self.is_local() { Some(LocalDefId { local_def_index: self.index }) } else { None }
+        self.is_local().then(|| LocalDefId { local_def_index: self.index })
     }
 
     #[inline]
@@ -303,7 +293,7 @@ impl DefId {
         // i.e. don't use closures.
         match self.as_local() {
             Some(local_def_id) => local_def_id,
-            None => panic!("DefId::expect_local: `{:?}` isn't local", self),
+            None => panic!("DefId::expect_local: `{self:?}` isn't local"),
         }
     }
 
@@ -314,7 +304,7 @@ impl DefId {
 
     #[inline]
     pub fn as_crate_root(self) -> Option<CrateNum> {
-        if self.is_crate_root() { Some(self.krate) } else { None }
+        self.is_crate_root().then_some(self.krate)
     }
 
     #[inline]
@@ -326,19 +316,6 @@ impl DefId {
 impl From<LocalDefId> for DefId {
     fn from(local: LocalDefId) -> DefId {
         local.to_def_id()
-    }
-}
-
-impl<E: Encoder> Encodable<E> for DefId {
-    default fn encode(&self, s: &mut E) {
-        self.krate.encode(s);
-        self.index.encode(s);
-    }
-}
-
-impl<D: Decoder> Decodable<D> for DefId {
-    default fn decode(d: &mut D) -> DefId {
-        DefId { krate: Decodable::decode(d), index: Decodable::decode(d) }
     }
 }
 
@@ -405,13 +382,13 @@ impl fmt::Debug for LocalDefId {
     }
 }
 
-impl<E: Encoder> Encodable<E> for LocalDefId {
+impl<E: SpanEncoder> Encodable<E> for LocalDefId {
     fn encode(&self, s: &mut E) {
         self.to_def_id().encode(s);
     }
 }
 
-impl<D: Decoder> Decodable<D> for LocalDefId {
+impl<D: SpanDecoder> Decodable<D> for LocalDefId {
     fn decode(d: &mut D) -> LocalDefId {
         DefId::decode(d).expect_local()
     }
@@ -469,5 +446,103 @@ impl<CTX: HashStableContext> ToStableHashKey<CTX> for CrateNum {
     #[inline]
     fn to_stable_hash_key(&self, hcx: &CTX) -> DefPathHash {
         self.as_def_id().to_stable_hash_key(hcx)
+    }
+}
+
+impl<CTX: HashStableContext> ToStableHashKey<CTX> for DefPathHash {
+    type KeyType = DefPathHash;
+
+    #[inline]
+    fn to_stable_hash_key(&self, _: &CTX) -> DefPathHash {
+        *self
+    }
+}
+
+macro_rules! typed_def_id {
+    ($Name:ident, $LocalName:ident) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Encodable, Decodable, HashStable_Generic)]
+        pub struct $Name(DefId);
+
+        impl $Name {
+            pub const fn new_unchecked(def_id: DefId) -> Self {
+                Self(def_id)
+            }
+
+            pub fn to_def_id(self) -> DefId {
+                self.into()
+            }
+
+            pub fn is_local(self) -> bool {
+                self.0.is_local()
+            }
+
+            pub fn as_local(self) -> Option<$LocalName> {
+                self.0.as_local().map($LocalName::new_unchecked)
+            }
+        }
+
+        impl From<$LocalName> for $Name {
+            fn from(local: $LocalName) -> Self {
+                Self(local.0.to_def_id())
+            }
+        }
+
+        impl From<$Name> for DefId {
+            fn from(typed: $Name) -> Self {
+                typed.0
+            }
+        }
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Encodable, Decodable, HashStable_Generic)]
+        pub struct $LocalName(LocalDefId);
+
+        impl !Ord for $LocalName {}
+        impl !PartialOrd for $LocalName {}
+
+        impl $LocalName {
+            pub const fn new_unchecked(def_id: LocalDefId) -> Self {
+                Self(def_id)
+            }
+
+            pub fn to_def_id(self) -> DefId {
+                self.0.into()
+            }
+
+            pub fn to_local_def_id(self) -> LocalDefId {
+                self.0
+            }
+        }
+
+        impl From<$LocalName> for LocalDefId {
+            fn from(typed: $LocalName) -> Self {
+                typed.0
+            }
+        }
+
+        impl From<$LocalName> for DefId {
+            fn from(typed: $LocalName) -> Self {
+                typed.0.into()
+            }
+        }
+    };
+}
+
+// N.B.: when adding new typed `DefId`s update the corresponding trait impls in
+// `rustc_middle::dep_graph::def_node` for `DepNodeParams`.
+typed_def_id! { ModDefId, LocalModDefId }
+
+impl LocalModDefId {
+    pub const CRATE_DEF_ID: Self = Self::new_unchecked(CRATE_DEF_ID);
+}
+
+impl ModDefId {
+    pub fn is_top_level_module(self) -> bool {
+        self.0.is_top_level_module()
+    }
+}
+
+impl LocalModDefId {
+    pub fn is_top_level_module(self) -> bool {
+        self.0.is_top_level_module()
     }
 }

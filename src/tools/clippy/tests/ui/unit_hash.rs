@@ -17,12 +17,15 @@ fn main() {
 
     match my_enum {
         Foo::Empty => ().hash(&mut state),
+        //~^ unit_hash
         Foo::WithValue(x) => x.hash(&mut state),
     }
 
     let res = ();
     res.hash(&mut state);
+    //~^ unit_hash
 
     #[allow(clippy::unit_arg)]
     do_nothing().hash(&mut state);
+    //~^ unit_hash
 }

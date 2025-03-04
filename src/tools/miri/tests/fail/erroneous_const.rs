@@ -1,7 +1,5 @@
 //! Make sure we detect erroneous constants post-monomorphization even when they are unused.
 //! (https://github.com/rust-lang/miri/issues/1382)
-// Inlining changes the error location
-//@compile-flags: -Zmir-opt-level=0
 #![feature(never_type)]
 
 struct PrintName<T>(T);
@@ -11,7 +9,7 @@ impl<T> PrintName<T> {
 
 fn no_codegen<T>() {
     if false {
-        let _ = PrintName::<T>::VOID; //~ERROR: post-monomorphization error
+        let _ = PrintName::<T>::VOID; //~NOTE: constant
     }
 }
 fn main() {

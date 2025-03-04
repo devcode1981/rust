@@ -164,10 +164,10 @@
 //!     fn node_id(&'a self, n: &Nd) -> dot::Id<'a> {
 //!         dot::Id::new(format!("N{}", n)).unwrap()
 //!     }
-//!     fn node_label<'b>(&'b self, n: &Nd) -> dot::LabelText<'b> {
+//!     fn node_label(&self, n: &Nd) -> dot::LabelText<'_> {
 //!         dot::LabelText::LabelStr(self.nodes[*n].into())
 //!     }
-//!     fn edge_label<'b>(&'b self, _: &Ed) -> dot::LabelText<'b> {
+//!     fn edge_label(&self, _: &Ed<'_>) -> dot::LabelText<'_> {
 //!         dot::LabelText::LabelStr("&sube;".into())
 //!     }
 //! }
@@ -177,8 +177,8 @@
 //!     type Edge = Ed<'a>;
 //!     fn nodes(&self) -> dot::Nodes<'a,Nd> { (0..self.nodes.len()).collect() }
 //!     fn edges(&'a self) -> dot::Edges<'a,Ed<'a>> { self.edges.iter().collect() }
-//!     fn source(&self, e: &Ed) -> Nd { let & &(s,_) = e; s }
-//!     fn target(&self, e: &Ed) -> Nd { let & &(_,t) = e; t }
+//!     fn source(&self, e: &Ed<'_>) -> Nd { let & &(s,_) = e; s }
+//!     fn target(&self, e: &Ed<'_>) -> Nd { let & &(_,t) = e; t }
 //! }
 //!
 //! # pub fn main() { render_to(&mut Vec::new()) }
@@ -226,11 +226,11 @@
 //!     fn node_id(&'a self, n: &Nd<'a>) -> dot::Id<'a> {
 //!         dot::Id::new(format!("N{}", n.0)).unwrap()
 //!     }
-//!     fn node_label<'b>(&'b self, n: &Nd<'b>) -> dot::LabelText<'b> {
+//!     fn node_label(&self, n: &Nd<'_>) -> dot::LabelText<'_> {
 //!         let &(i, _) = n;
 //!         dot::LabelText::LabelStr(self.nodes[i].into())
 //!     }
-//!     fn edge_label<'b>(&'b self, _: &Ed<'b>) -> dot::LabelText<'b> {
+//!     fn edge_label(&self, _: &Ed<'_>) -> dot::LabelText<'_> {
 //!         dot::LabelText::LabelStr("&sube;".into())
 //!     }
 //! }
@@ -269,18 +269,22 @@
 //!
 //! * [DOT language](https://www.graphviz.org/doc/info/lang.html)
 
+// tidy-alphabetical-start
+#![allow(internal_features)]
 #![doc(
     html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/",
     test(attr(allow(unused_variables), deny(warnings)))
 )]
-#![deny(rustc::untranslatable_diagnostic)]
-#![deny(rustc::diagnostic_outside_of_impl)]
-
-use LabelText::*;
+#![doc(rust_logo)]
+#![feature(rustdoc_internals)]
+#![warn(unreachable_pub)]
+// tidy-alphabetical-end
 
 use std::borrow::Cow;
 use std::io;
 use std::io::prelude::*;
+
+use LabelText::*;
 
 /// The text for a graphviz label on a node or edge.
 pub enum LabelText<'a> {
@@ -410,7 +414,7 @@ impl<'a> Id<'a> {
     }
 
     pub fn as_slice(&'a self) -> &'a str {
-        &*self.name
+        &self.name
     }
 }
 
@@ -471,7 +475,11 @@ pub trait Labeller<'a> {
 /// Escape tags in such a way that it is suitable for inclusion in a
 /// Graphviz HTML label.
 pub fn escape_html(s: &str) -> String {
-    s.replace('&', "&amp;").replace('\"', "&quot;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;")
+        .replace('\"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('\n', "<br align=\"left\"/>")
 }
 
 impl<'a> LabelText<'a> {
@@ -511,36 +519,9 @@ impl<'a> LabelText<'a> {
     pub fn to_dot_string(&self) -> String {
         match *self {
             LabelStr(ref s) => format!("\"{}\"", s.escape_default()),
-            EscStr(ref s) => format!("\"{}\"", LabelText::escape_str(&s)),
-            HtmlStr(ref s) => format!("<{}>", s),
+            EscStr(ref s) => format!("\"{}\"", LabelText::escape_str(s)),
+            HtmlStr(ref s) => format!("<{s}>"),
         }
-    }
-
-    /// Decomposes content into string suitable for making EscStr that
-    /// yields same content as self. The result obeys the law
-    /// render(`lt`) == render(`EscStr(lt.pre_escaped_content())`) for
-    /// all `lt: LabelText`.
-    fn pre_escaped_content(self) -> Cow<'a, str> {
-        match self {
-            EscStr(s) => s,
-            LabelStr(s) => {
-                if s.contains('\\') {
-                    (&*s).escape_default().to_string().into()
-                } else {
-                    s
-                }
-            }
-            HtmlStr(s) => s,
-        }
-    }
-
-    /// Puts `suffix` on a line below this label, with a blank line separator.
-    pub fn suffix_line(self, suffix: LabelText<'_>) -> LabelText<'static> {
-        let mut prefix = self.pre_escaped_content().into_owned();
-        let suffix = suffix.pre_escaped_content();
-        prefix.push_str(r"\n\n");
-        prefix.push_str(&suffix);
-        EscStr(prefix.into())
     }
 }
 
@@ -618,7 +599,7 @@ where
     if let Some(fontname) = options.iter().find_map(|option| {
         if let RenderOption::Fontname(fontname) = option { Some(fontname) } else { None }
     }) {
-        font = format!(r#"fontname="{}""#, fontname);
+        font = format!(r#"fontname="{fontname}""#);
         graph_attrs.push(&font[..]);
         content_attrs.push(&font[..]);
     }
@@ -631,8 +612,8 @@ where
     if !(graph_attrs.is_empty() && content_attrs.is_empty()) {
         writeln!(w, r#"    graph[{}];"#, graph_attrs.join(" "))?;
         let content_attrs_str = content_attrs.join(" ");
-        writeln!(w, r#"    node[{}];"#, content_attrs_str)?;
-        writeln!(w, r#"    edge[{}];"#, content_attrs_str)?;
+        writeln!(w, r#"    node[{content_attrs_str}];"#)?;
+        writeln!(w, r#"    edge[{content_attrs_str}];"#)?;
     }
 
     let mut text = Vec::new();
@@ -645,7 +626,7 @@ where
         write!(text, "{}", id.as_slice()).unwrap();
 
         if !options.contains(&RenderOption::NoNodeLabels) {
-            write!(text, "[label={}]", escaped).unwrap();
+            write!(text, "[label={escaped}]").unwrap();
         }
 
         let style = g.node_style(n);
@@ -674,7 +655,7 @@ where
         write!(text, "{} -> {}", source_id.as_slice(), target_id.as_slice()).unwrap();
 
         if !options.contains(&RenderOption::NoEdgeLabels) {
-            write!(text, "[label={}]", escaped_label).unwrap();
+            write!(text, "[label={escaped_label}]").unwrap();
         }
 
         let style = g.edge_style(e);

@@ -1,545 +1,425 @@
-use super::build_sysroot;
-use super::config;
-use super::prepare;
-use super::rustc_info::get_wrapper_file_name;
-use super::utils::{cargo_command, hyperfine_command, spawn_and_wait, spawn_and_wait_with_input};
-use build_system::SysrootKind;
-use std::env;
 use std::ffi::OsStr;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
+
+use crate::path::{Dirs, RelPath};
+use crate::prepare::{GitRepo, apply_patches};
+use crate::rustc_info::get_default_sysroot;
+use crate::shared_utils::rustflags_from_env;
+use crate::utils::{CargoProject, Compiler, LogGroup, ensure_empty_dir, spawn_and_wait};
+use crate::{CodegenBackend, SysrootKind, build_sysroot, config};
+
+static BUILD_EXAMPLE_OUT_DIR: RelPath = RelPath::build("example");
 
 struct TestCase {
     config: &'static str,
-    func: &'static dyn Fn(&TestRunner),
+    cmd: TestCaseCmd,
+}
+
+enum TestCaseCmd {
+    Custom { func: &'static dyn Fn(&TestRunner<'_>) },
+    BuildLib { source: &'static str, crate_types: &'static str },
+    BuildBin { source: &'static str },
+    BuildBinAndRun { source: &'static str, args: &'static [&'static str] },
+    JitBin { source: &'static str, args: &'static str },
 }
 
 impl TestCase {
-    const fn new(config: &'static str, func: &'static dyn Fn(&TestRunner)) -> Self {
-        Self { config, func }
+    // FIXME reduce usage of custom test case commands
+    const fn custom(config: &'static str, func: &'static dyn Fn(&TestRunner<'_>)) -> Self {
+        Self { config, cmd: TestCaseCmd::Custom { func } }
+    }
+
+    const fn build_lib(
+        config: &'static str,
+        source: &'static str,
+        crate_types: &'static str,
+    ) -> Self {
+        Self { config, cmd: TestCaseCmd::BuildLib { source, crate_types } }
+    }
+
+    const fn build_bin(config: &'static str, source: &'static str) -> Self {
+        Self { config, cmd: TestCaseCmd::BuildBin { source } }
+    }
+
+    const fn build_bin_and_run(
+        config: &'static str,
+        source: &'static str,
+        args: &'static [&'static str],
+    ) -> Self {
+        Self { config, cmd: TestCaseCmd::BuildBinAndRun { source, args } }
+    }
+
+    const fn jit_bin(config: &'static str, source: &'static str, args: &'static str) -> Self {
+        Self { config, cmd: TestCaseCmd::JitBin { source, args } }
     }
 }
 
 const NO_SYSROOT_SUITE: &[TestCase] = &[
-    TestCase::new("build.mini_core", &|runner| {
-        runner.run_rustc([
-            "example/mini_core.rs",
-            "--crate-name",
-            "mini_core",
-            "--crate-type",
-            "lib,dylib",
-            "--target",
-            &runner.target_triple,
-        ]);
-    }),
-    TestCase::new("build.example", &|runner| {
-        runner.run_rustc([
-            "example/example.rs",
-            "--crate-type",
-            "lib",
-            "--target",
-            &runner.target_triple,
-        ]);
-    }),
-    TestCase::new("jit.mini_core_hello_world", &|runner| {
-        let mut jit_cmd = runner.rustc_command([
-            "-Zunstable-options",
-            "-Cllvm-args=mode=jit",
-            "-Cprefer-dynamic",
-            "example/mini_core_hello_world.rs",
-            "--cfg",
-            "jit",
-            "--target",
-            &runner.host_triple,
-        ]);
-        jit_cmd.env("CG_CLIF_JIT_ARGS", "abc bcd");
-        spawn_and_wait(jit_cmd);
-
-        eprintln!("[JIT-lazy] mini_core_hello_world");
-        let mut jit_cmd = runner.rustc_command([
-            "-Zunstable-options",
-            "-Cllvm-args=mode=jit-lazy",
-            "-Cprefer-dynamic",
-            "example/mini_core_hello_world.rs",
-            "--cfg",
-            "jit",
-            "--target",
-            &runner.host_triple,
-        ]);
-        jit_cmd.env("CG_CLIF_JIT_ARGS", "abc bcd");
-        spawn_and_wait(jit_cmd);
-    }),
-    TestCase::new("aot.mini_core_hello_world", &|runner| {
-        runner.run_rustc([
-            "example/mini_core_hello_world.rs",
-            "--crate-name",
-            "mini_core_hello_world",
-            "--crate-type",
-            "bin",
-            "-g",
-            "--target",
-            &runner.target_triple,
-        ]);
-        runner.run_out_command("mini_core_hello_world", ["abc", "bcd"]);
-    }),
+    TestCase::build_lib("build.mini_core", "example/mini_core.rs", "lib,dylib"),
+    TestCase::build_lib("build.example", "example/example.rs", "lib"),
+    TestCase::jit_bin("jit.mini_core_hello_world", "example/mini_core_hello_world.rs", "abc bcd"),
+    TestCase::build_bin_and_run(
+        "aot.mini_core_hello_world",
+        "example/mini_core_hello_world.rs",
+        &["abc", "bcd"],
+    ),
 ];
 
 const BASE_SYSROOT_SUITE: &[TestCase] = &[
-    TestCase::new("aot.arbitrary_self_types_pointers_and_wrappers", &|runner| {
+    TestCase::build_bin_and_run(
+        "aot.arbitrary_self_types_pointers_and_wrappers",
+        "example/arbitrary_self_types_pointers_and_wrappers.rs",
+        &[],
+    ),
+    TestCase::jit_bin("jit.std_example", "example/std_example.rs", "arg"),
+    TestCase::build_bin_and_run("aot.std_example", "example/std_example.rs", &["arg"]),
+    TestCase::build_bin_and_run("aot.dst_field_align", "example/dst-field-align.rs", &[]),
+    TestCase::build_bin_and_run(
+        "aot.subslice-patterns-const-eval",
+        "example/subslice-patterns-const-eval.rs",
+        &[],
+    ),
+    TestCase::build_bin_and_run(
+        "aot.track-caller-attribute",
+        "example/track-caller-attribute.rs",
+        &[],
+    ),
+    TestCase::build_bin_and_run("aot.float-minmax-pass", "example/float-minmax-pass.rs", &[]),
+    TestCase::build_bin_and_run("aot.issue-72793", "example/issue-72793.rs", &[]),
+    TestCase::build_bin("aot.issue-59326", "example/issue-59326.rs"),
+    TestCase::build_bin_and_run("aot.neon", "example/neon.rs", &[]),
+    TestCase::custom("aot.gen_block_iterate", &|runner| {
         runner.run_rustc([
-            "example/arbitrary_self_types_pointers_and_wrappers.rs",
-            "--crate-name",
-            "arbitrary_self_types_pointers_and_wrappers",
-            "--crate-type",
-            "bin",
-            "--target",
-            &runner.target_triple,
-        ]);
-        runner.run_out_command("arbitrary_self_types_pointers_and_wrappers", []);
-    }),
-    TestCase::new("aot.issue_91827_extern_types", &|runner| {
-        runner.run_rustc([
-            "example/issue-91827-extern-types.rs",
-            "--crate-name",
-            "issue_91827_extern_types",
-            "--crate-type",
-            "bin",
-            "--target",
-            &runner.target_triple,
-        ]);
-        runner.run_out_command("issue_91827_extern_types", []);
-    }),
-    TestCase::new("build.alloc_system", &|runner| {
-        runner.run_rustc([
-            "example/alloc_system.rs",
-            "--crate-type",
-            "lib",
-            "--target",
-            &runner.target_triple,
-        ]);
-    }),
-    TestCase::new("aot.alloc_example", &|runner| {
-        runner.run_rustc([
-            "example/alloc_example.rs",
-            "--crate-type",
-            "bin",
-            "--target",
-            &runner.target_triple,
-        ]);
-        runner.run_out_command("alloc_example", []);
-    }),
-    TestCase::new("jit.std_example", &|runner| {
-        runner.run_rustc([
+            "example/gen_block_iterate.rs",
+            "--edition",
+            "2024",
             "-Zunstable-options",
-            "-Cllvm-args=mode=jit",
-            "-Cprefer-dynamic",
-            "example/std_example.rs",
-            "--target",
-            &runner.host_triple,
         ]);
-
-        eprintln!("[JIT-lazy] std_example");
-        runner.run_rustc([
-            "-Zunstable-options",
-            "-Cllvm-args=mode=jit-lazy",
-            "-Cprefer-dynamic",
-            "example/std_example.rs",
-            "--target",
-            &runner.host_triple,
-        ]);
+        runner.run_out_command("gen_block_iterate", &[]);
     }),
-    TestCase::new("aot.std_example", &|runner| {
-        runner.run_rustc([
-            "example/std_example.rs",
-            "--crate-type",
-            "bin",
-            "--target",
-            &runner.target_triple,
-        ]);
-        runner.run_out_command("std_example", ["arg"]);
-    }),
-    TestCase::new("aot.dst_field_align", &|runner| {
-        runner.run_rustc([
-            "example/dst-field-align.rs",
-            "--crate-name",
-            "dst_field_align",
-            "--crate-type",
-            "bin",
-            "--target",
-            &runner.target_triple,
-        ]);
-        runner.run_out_command("dst_field_align", []);
-    }),
-    TestCase::new("aot.subslice-patterns-const-eval", &|runner| {
-        runner.run_rustc([
-            "example/subslice-patterns-const-eval.rs",
-            "--crate-type",
-            "bin",
-            "-Cpanic=abort",
-            "--target",
-            &runner.target_triple,
-        ]);
-        runner.run_out_command("subslice-patterns-const-eval", []);
-    }),
-    TestCase::new("aot.track-caller-attribute", &|runner| {
-        runner.run_rustc([
-            "example/track-caller-attribute.rs",
-            "--crate-type",
-            "bin",
-            "-Cpanic=abort",
-            "--target",
-            &runner.target_triple,
-        ]);
-        runner.run_out_command("track-caller-attribute", []);
-    }),
-    TestCase::new("aot.float-minmax-pass", &|runner| {
-        runner.run_rustc([
-            "example/float-minmax-pass.rs",
-            "--crate-type",
-            "bin",
-            "-Cpanic=abort",
-            "--target",
-            &runner.target_triple,
-        ]);
-        runner.run_out_command("float-minmax-pass", []);
-    }),
-    TestCase::new("aot.mod_bench", &|runner| {
-        runner.run_rustc([
-            "example/mod_bench.rs",
-            "--crate-type",
-            "bin",
-            "--target",
-            &runner.target_triple,
-        ]);
-        runner.run_out_command("mod_bench", []);
-    }),
+    TestCase::build_bin_and_run("aot.raw-dylib", "example/raw-dylib.rs", &[]),
 ];
 
+pub(crate) static RAND_REPO: GitRepo = GitRepo::github(
+    "rust-random",
+    "rand",
+    "1f4507a8e1cf8050e4ceef95eeda8f64645b6719",
+    "981f8bf489338978",
+    "rand",
+);
+
+static RAND: CargoProject = CargoProject::new(&RAND_REPO.source_dir(), "rand_target");
+
+pub(crate) static REGEX_REPO: GitRepo = GitRepo::github(
+    "rust-lang",
+    "regex",
+    "061ee815ef2c44101dba7b0b124600fcb03c1912",
+    "dc26aefbeeac03ca",
+    "regex",
+);
+
+static REGEX: CargoProject = CargoProject::new(&REGEX_REPO.source_dir(), "regex_target");
+
+static PORTABLE_SIMD_SRC: RelPath = RelPath::build("portable-simd");
+
+static PORTABLE_SIMD: CargoProject = CargoProject::new(&PORTABLE_SIMD_SRC, "portable-simd_target");
+
+static LIBCORE_TESTS_SRC: RelPath = RelPath::build("coretests");
+
+static LIBCORE_TESTS: CargoProject = CargoProject::new(&LIBCORE_TESTS_SRC, "coretests_target");
+
 const EXTENDED_SYSROOT_SUITE: &[TestCase] = &[
-    TestCase::new("test.rust-random/rand", &|runner| {
-        runner.in_dir(prepare::RAND.source_dir(), |runner| {
-            runner.run_cargo("clean", []);
+    TestCase::custom("test.rust-random/rand", &|runner| {
+        RAND_REPO.patch(&runner.dirs);
 
-            if runner.host_triple == runner.target_triple {
-                eprintln!("[TEST] rust-random/rand");
-                runner.run_cargo("test", ["--workspace"]);
-            } else {
-                eprintln!("[AOT] rust-random/rand");
-                runner.run_cargo("build", ["--workspace", "--tests"]);
-            }
-        });
-    }),
-    TestCase::new("bench.simple-raytracer", &|runner| {
-        runner.in_dir(prepare::SIMPLE_RAYTRACER.source_dir(), |runner| {
-            let run_runs = env::var("RUN_RUNS").unwrap_or("10".to_string()).parse().unwrap();
+        RAND.clean(&runner.dirs);
 
-            if runner.host_triple == runner.target_triple {
-                eprintln!("[BENCH COMPILE] ebobby/simple-raytracer");
-                let prepare = runner.cargo_command("clean", []);
-
-                let llvm_build_cmd = cargo_command("cargo", "build", None, Path::new("."));
-
-                let cargo_clif = runner
-                    .root_dir
-                    .clone()
-                    .join("build")
-                    .join(get_wrapper_file_name("cargo-clif", "bin"));
-                let clif_build_cmd = cargo_command(cargo_clif, "build", None, Path::new("."));
-
-                let bench_compile =
-                    hyperfine_command(1, run_runs, Some(prepare), llvm_build_cmd, clif_build_cmd);
-
-                spawn_and_wait(bench_compile);
-
-                eprintln!("[BENCH RUN] ebobby/simple-raytracer");
-                fs::copy(PathBuf::from("./target/debug/main"), PathBuf::from("raytracer_cg_clif"))
-                    .unwrap();
-
-                let bench_run = hyperfine_command(
-                    0,
-                    run_runs,
-                    None,
-                    Command::new("./raytracer_cg_llvm"),
-                    Command::new("./raytracer_cg_clif"),
-                );
-                spawn_and_wait(bench_run);
-            } else {
-                runner.run_cargo("clean", []);
-                eprintln!("[BENCH COMPILE] ebobby/simple-raytracer (skipped)");
-                eprintln!("[COMPILE] ebobby/simple-raytracer");
-                runner.run_cargo("build", []);
-                eprintln!("[BENCH RUN] ebobby/simple-raytracer (skipped)");
-            }
-        });
-    }),
-    TestCase::new("test.libcore", &|runner| {
-        runner.in_dir(
-            std::env::current_dir()
-                .unwrap()
-                .join("build_sysroot")
-                .join("sysroot_src")
-                .join("library")
-                .join("core")
-                .join("tests"),
-            |runner| {
-                runner.run_cargo("clean", []);
-
-                if runner.host_triple == runner.target_triple {
-                    runner.run_cargo("test", []);
-                } else {
-                    eprintln!("Cross-Compiling: Not running tests");
-                    runner.run_cargo("build", ["--tests"]);
-                }
-            },
-        );
-    }),
-    TestCase::new("test.regex-shootout-regex-dna", &|runner| {
-        runner.in_dir(prepare::REGEX.source_dir(), |runner| {
-            runner.run_cargo("clean", []);
-
-            // newer aho_corasick versions throw a deprecation warning
-            let lint_rust_flags = format!("{} --cap-lints warn", runner.rust_flags);
-
-            let mut build_cmd = runner.cargo_command("build", ["--example", "shootout-regex-dna"]);
-            build_cmd.env("RUSTFLAGS", lint_rust_flags.clone());
+        if runner.is_native {
+            let mut test_cmd = RAND.test(&runner.target_compiler, &runner.dirs);
+            test_cmd.arg("--workspace").arg("--").arg("-q");
+            spawn_and_wait(test_cmd);
+        } else {
+            eprintln!("Cross-Compiling: Not running tests");
+            let mut build_cmd = RAND.build(&runner.target_compiler, &runner.dirs);
+            build_cmd.arg("--workspace").arg("--tests");
             spawn_and_wait(build_cmd);
-
-            if runner.host_triple == runner.target_triple {
-                let mut run_cmd = runner.cargo_command("run", ["--example", "shootout-regex-dna"]);
-                run_cmd.env("RUSTFLAGS", lint_rust_flags);
-
-                let input =
-                    fs::read_to_string(PathBuf::from("examples/regexdna-input.txt")).unwrap();
-                let expected_path = PathBuf::from("examples/regexdna-output.txt");
-                let expected = fs::read_to_string(&expected_path).unwrap();
-
-                let output = spawn_and_wait_with_input(run_cmd, input);
-                // Make sure `[codegen mono items] start` doesn't poison the diff
-                let output = output
-                    .lines()
-                    .filter(|line| !line.contains("codegen mono items"))
-                    .chain(Some("")) // This just adds the trailing newline
-                    .collect::<Vec<&str>>()
-                    .join("\r\n");
-
-                let output_matches = expected.lines().eq(output.lines());
-                if !output_matches {
-                    let res_path = PathBuf::from("res.txt");
-                    fs::write(&res_path, &output).unwrap();
-
-                    if cfg!(windows) {
-                        println!("Output files don't match!");
-                        println!("Expected Output:\n{}", expected);
-                        println!("Actual Output:\n{}", output);
-                    } else {
-                        let mut diff = Command::new("diff");
-                        diff.arg("-u");
-                        diff.arg(res_path);
-                        diff.arg(expected_path);
-                        spawn_and_wait(diff);
-                    }
-
-                    std::process::exit(1);
-                }
-            }
-        });
+        }
     }),
-    TestCase::new("test.regex", &|runner| {
-        runner.in_dir(prepare::REGEX.source_dir(), |runner| {
-            runner.run_cargo("clean", []);
+    TestCase::custom("test.libcore", &|runner| {
+        apply_patches(
+            &runner.dirs,
+            "coretests",
+            &runner.stdlib_source.join("library/coretests"),
+            &LIBCORE_TESTS_SRC.to_path(&runner.dirs),
+        );
 
-            // newer aho_corasick versions throw a deprecation warning
-            let lint_rust_flags = format!("{} --cap-lints warn", runner.rust_flags);
+        let source_lockfile = runner.dirs.source_dir.join("patches/coretests-lock.toml");
+        let target_lockfile = LIBCORE_TESTS_SRC.to_path(&runner.dirs).join("Cargo.lock");
+        fs::copy(source_lockfile, target_lockfile).unwrap();
 
-            if runner.host_triple == runner.target_triple {
-                let mut run_cmd = runner.cargo_command(
-                    "test",
-                    [
-                        "--tests",
-                        "--",
-                        "--exclude-should-panic",
-                        "--test-threads",
-                        "1",
-                        "-Zunstable-options",
-                        "-q",
-                    ],
-                );
-                run_cmd.env("RUSTFLAGS", lint_rust_flags);
-                spawn_and_wait(run_cmd);
-            } else {
-                eprintln!("Cross-Compiling: Not running tests");
-                let mut build_cmd =
-                    runner.cargo_command("build", ["--tests", "--target", &runner.target_triple]);
-                build_cmd.env("RUSTFLAGS", lint_rust_flags.clone());
-                spawn_and_wait(build_cmd);
-            }
-        });
+        LIBCORE_TESTS.clean(&runner.dirs);
+
+        if runner.is_native {
+            let mut test_cmd = LIBCORE_TESTS.test(&runner.target_compiler, &runner.dirs);
+            test_cmd.arg("--").arg("-q");
+            spawn_and_wait(test_cmd);
+        } else {
+            eprintln!("Cross-Compiling: Not running tests");
+            let mut build_cmd = LIBCORE_TESTS.build(&runner.target_compiler, &runner.dirs);
+            build_cmd.arg("--tests");
+            spawn_and_wait(build_cmd);
+        }
     }),
-    TestCase::new("test.portable-simd", &|runner| {
-        runner.in_dir(prepare::PORTABLE_SIMD.source_dir(), |runner| {
-            runner.run_cargo("clean", []);
-            runner.run_cargo("build", ["--all-targets", "--target", &runner.target_triple]);
+    TestCase::custom("test.regex", &|runner| {
+        REGEX_REPO.patch(&runner.dirs);
 
-            if runner.host_triple == runner.target_triple {
-                runner.run_cargo("test", ["-q"]);
-            }
-        });
+        REGEX.clean(&runner.dirs);
+
+        if runner.is_native {
+            let mut run_cmd = REGEX.test(&runner.target_compiler, &runner.dirs);
+            // regex-capi and regex-debug don't have any tests. Nor do they contain any code
+            // that is useful to test with cg_clif. Skip building them to reduce test time.
+            run_cmd.args([
+                "-p",
+                "regex",
+                "-p",
+                "regex-syntax",
+                "--release",
+                "--all-targets",
+                "--",
+                "-q",
+            ]);
+            spawn_and_wait(run_cmd);
+
+            let mut run_cmd = REGEX.test(&runner.target_compiler, &runner.dirs);
+            // don't run integration tests for regex-autonata. they take like 2min each without
+            // much extra coverage of simd usage.
+            run_cmd.args(["-p", "regex-automata", "--release", "--lib", "--", "-q"]);
+            spawn_and_wait(run_cmd);
+        } else {
+            eprintln!("Cross-Compiling: Not running tests");
+            let mut build_cmd = REGEX.build(&runner.target_compiler, &runner.dirs);
+            build_cmd.arg("--tests");
+            spawn_and_wait(build_cmd);
+        }
+    }),
+    TestCase::custom("test.portable-simd", &|runner| {
+        apply_patches(
+            &runner.dirs,
+            "portable-simd",
+            &runner.stdlib_source.join("library/portable-simd"),
+            &PORTABLE_SIMD_SRC.to_path(&runner.dirs),
+        );
+
+        PORTABLE_SIMD.clean(&runner.dirs);
+
+        let mut build_cmd = PORTABLE_SIMD.build(&runner.target_compiler, &runner.dirs);
+        build_cmd.arg("--all-targets");
+        spawn_and_wait(build_cmd);
+
+        if runner.is_native {
+            let mut test_cmd = PORTABLE_SIMD.test(&runner.target_compiler, &runner.dirs);
+            test_cmd.arg("-q");
+            spawn_and_wait(test_cmd);
+        }
     }),
 ];
 
 pub(crate) fn run_tests(
-    channel: &str,
+    dirs: &Dirs,
     sysroot_kind: SysrootKind,
-    target_dir: &Path,
-    cg_clif_dylib: &Path,
-    host_triple: &str,
-    target_triple: &str,
+    use_unstable_features: bool,
+    skip_tests: &[&str],
+    cg_clif_dylib: &CodegenBackend,
+    bootstrap_host_compiler: &Compiler,
+    rustup_toolchain_name: Option<&str>,
+    target_triple: String,
 ) {
-    let runner = TestRunner::new(host_triple.to_string(), target_triple.to_string());
+    let stdlib_source =
+        get_default_sysroot(&bootstrap_host_compiler.rustc).join("lib/rustlib/src/rust");
+    assert!(stdlib_source.exists());
 
-    if config::get_bool("testsuite.no_sysroot") {
-        build_sysroot::build_sysroot(
-            channel,
+    if config::get_bool("testsuite.no_sysroot") && !skip_tests.contains(&"testsuite.no_sysroot") {
+        let target_compiler = build_sysroot::build_sysroot(
+            dirs,
             SysrootKind::None,
-            &target_dir,
             cg_clif_dylib,
-            &host_triple,
-            &target_triple,
+            bootstrap_host_compiler,
+            rustup_toolchain_name,
+            target_triple.clone(),
         );
 
-        let _ = fs::remove_dir_all(Path::new("target").join("out"));
+        let runner = TestRunner::new(
+            dirs.clone(),
+            target_compiler,
+            use_unstable_features,
+            skip_tests,
+            bootstrap_host_compiler.triple == target_triple,
+            stdlib_source.clone(),
+        );
+
+        let path = BUILD_EXAMPLE_OUT_DIR.to_path(dirs);
+        ensure_empty_dir(&path);
+
         runner.run_testsuite(NO_SYSROOT_SUITE);
     } else {
         eprintln!("[SKIP] no_sysroot tests");
     }
 
-    let run_base_sysroot = config::get_bool("testsuite.base_sysroot");
-    let run_extended_sysroot = config::get_bool("testsuite.extended_sysroot");
+    let run_base_sysroot = config::get_bool("testsuite.base_sysroot")
+        && !skip_tests.contains(&"testsuite.base_sysroot");
+    let run_extended_sysroot = config::get_bool("testsuite.extended_sysroot")
+        && !skip_tests.contains(&"testsuite.extended_sysroot");
 
     if run_base_sysroot || run_extended_sysroot {
-        build_sysroot::build_sysroot(
-            channel,
+        let target_compiler = build_sysroot::build_sysroot(
+            dirs,
             sysroot_kind,
-            &target_dir,
             cg_clif_dylib,
-            &host_triple,
-            &target_triple,
+            bootstrap_host_compiler,
+            rustup_toolchain_name,
+            target_triple.clone(),
         );
-    }
 
-    if run_base_sysroot {
-        runner.run_testsuite(BASE_SYSROOT_SUITE);
-    } else {
-        eprintln!("[SKIP] base_sysroot tests");
-    }
+        let mut runner = TestRunner::new(
+            dirs.clone(),
+            target_compiler,
+            use_unstable_features,
+            skip_tests,
+            bootstrap_host_compiler.triple == target_triple,
+            stdlib_source,
+        );
 
-    if run_extended_sysroot {
-        runner.run_testsuite(EXTENDED_SYSROOT_SUITE);
-    } else {
-        eprintln!("[SKIP] extended_sysroot tests");
+        if run_base_sysroot {
+            runner.run_testsuite(BASE_SYSROOT_SUITE);
+        } else {
+            eprintln!("[SKIP] base_sysroot tests");
+        }
+
+        if run_extended_sysroot {
+            // Rust's build system denies a couple of lints that trigger on several of the test
+            // projects. Changing the code to fix them is not worth it, so just silence all lints.
+            runner.target_compiler.rustflags.push("--cap-lints=allow".to_owned());
+            runner.run_testsuite(EXTENDED_SYSROOT_SUITE);
+        } else {
+            eprintln!("[SKIP] extended_sysroot tests");
+        }
     }
 }
 
-struct TestRunner {
-    root_dir: PathBuf,
-    out_dir: PathBuf,
+struct TestRunner<'a> {
+    is_native: bool,
     jit_supported: bool,
-    rust_flags: String,
-    run_wrapper: Vec<String>,
-    host_triple: String,
-    target_triple: String,
+    skip_tests: &'a [&'a str],
+    dirs: Dirs,
+    target_compiler: Compiler,
+    stdlib_source: PathBuf,
 }
 
-impl TestRunner {
-    pub fn new(host_triple: String, target_triple: String) -> Self {
-        let root_dir = env::current_dir().unwrap();
+impl<'a> TestRunner<'a> {
+    fn new(
+        dirs: Dirs,
+        mut target_compiler: Compiler,
+        use_unstable_features: bool,
+        skip_tests: &'a [&'a str],
+        is_native: bool,
+        stdlib_source: PathBuf,
+    ) -> Self {
+        target_compiler.rustflags.extend(rustflags_from_env("RUSTFLAGS"));
+        target_compiler.rustdocflags.extend(rustflags_from_env("RUSTDOCFLAGS"));
 
-        let mut out_dir = root_dir.clone();
-        out_dir.push("target");
-        out_dir.push("out");
+        let jit_supported = use_unstable_features
+            && is_native
+            && target_compiler.triple.contains("x86_64")
+            && !target_compiler.triple.contains("windows");
 
-        let is_native = host_triple == target_triple;
-        let jit_supported =
-            target_triple.contains("x86_64") && is_native && !host_triple.contains("windows");
-
-        let mut rust_flags = env::var("RUSTFLAGS").ok().unwrap_or("".to_string());
-        let mut run_wrapper = Vec::new();
-
-        if !is_native {
-            match target_triple.as_str() {
-                "aarch64-unknown-linux-gnu" => {
-                    // We are cross-compiling for aarch64. Use the correct linker and run tests in qemu.
-                    rust_flags = format!("-Clinker=aarch64-linux-gnu-gcc{}", rust_flags);
-                    run_wrapper = vec!["qemu-aarch64", "-L", "/usr/aarch64-linux-gnu"];
-                }
-                "x86_64-pc-windows-gnu" => {
-                    // We are cross-compiling for Windows. Run tests in wine.
-                    run_wrapper = vec!["wine"];
-                }
-                _ => {
-                    println!("Unknown non-native platform");
-                }
-            }
-        }
-
-        // FIXME fix `#[linkage = "extern_weak"]` without this
-        if host_triple.contains("darwin") {
-            rust_flags = format!("{} -Clink-arg=-undefined -Clink-arg=dynamic_lookup", rust_flags);
-        }
-
-        Self {
-            root_dir,
-            out_dir,
-            jit_supported,
-            rust_flags,
-            run_wrapper: run_wrapper.iter().map(|s| s.to_string()).collect(),
-            host_triple,
-            target_triple,
-        }
+        Self { is_native, jit_supported, skip_tests, dirs, target_compiler, stdlib_source }
     }
 
-    pub fn run_testsuite(&self, tests: &[TestCase]) {
-        for &TestCase { config, func } in tests {
+    fn run_testsuite(&self, tests: &[TestCase]) {
+        for TestCase { config, cmd } in tests {
             let (tag, testname) = config.split_once('.').unwrap();
             let tag = tag.to_uppercase();
             let is_jit_test = tag == "JIT";
 
-            if !config::get_bool(config) || (is_jit_test && !self.jit_supported) {
+            let _guard = if !config::get_bool(config)
+                || (is_jit_test && !self.jit_supported)
+                || self.skip_tests.contains(&config)
+            {
                 eprintln!("[{tag}] {testname} (skipped)");
                 continue;
             } else {
+                let guard = LogGroup::guard(&format!("[{tag}] {testname}"));
                 eprintln!("[{tag}] {testname}");
-            }
+                guard
+            };
 
-            func(self);
+            match *cmd {
+                TestCaseCmd::Custom { func } => func(self),
+                TestCaseCmd::BuildLib { source, crate_types } => {
+                    self.run_rustc([source, "--crate-type", crate_types]);
+                }
+                TestCaseCmd::BuildBin { source } => {
+                    self.run_rustc([source]);
+                }
+                TestCaseCmd::BuildBinAndRun { source, args } => {
+                    self.run_rustc([source]);
+                    self.run_out_command(
+                        source.split('/').last().unwrap().split('.').next().unwrap(),
+                        args,
+                    );
+                }
+                TestCaseCmd::JitBin { source, args } => {
+                    let mut jit_cmd = self.rustc_command([
+                        "-Zunstable-options",
+                        "-Cllvm-args=mode=jit",
+                        "-Cprefer-dynamic",
+                        source,
+                        "--cfg",
+                        "jit",
+                    ]);
+                    if !args.is_empty() {
+                        jit_cmd.env("CG_CLIF_JIT_ARGS", args);
+                    }
+                    spawn_and_wait(jit_cmd);
+
+                    eprintln!("[JIT-lazy] {testname}");
+                    let mut jit_cmd = self.rustc_command([
+                        "-Zunstable-options",
+                        "-Cllvm-args=mode=jit-lazy",
+                        "-Cprefer-dynamic",
+                        source,
+                        "--cfg",
+                        "jit",
+                    ]);
+                    if !args.is_empty() {
+                        jit_cmd.env("CG_CLIF_JIT_ARGS", args);
+                    }
+                    spawn_and_wait(jit_cmd);
+                }
+            }
         }
     }
 
-    fn in_dir(&self, new: impl AsRef<Path>, callback: impl FnOnce(&TestRunner)) {
-        let current = env::current_dir().unwrap();
-
-        env::set_current_dir(new).unwrap();
-        callback(self);
-        env::set_current_dir(current).unwrap();
-    }
-
+    #[must_use]
     fn rustc_command<I, S>(&self, args: I) -> Command
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let mut rustc_clif = self.root_dir.clone();
-        rustc_clif.push("build");
-        rustc_clif.push(get_wrapper_file_name("rustc-clif", "bin"));
-
-        let mut cmd = Command::new(rustc_clif);
-        cmd.args(self.rust_flags.split_whitespace());
+        let mut cmd = Command::new(&self.target_compiler.rustc);
+        cmd.args(&self.target_compiler.rustflags);
         cmd.arg("-L");
-        cmd.arg(format!("crate={}", self.out_dir.display()));
+        cmd.arg(format!("crate={}", BUILD_EXAMPLE_OUT_DIR.to_path(&self.dirs).display()));
         cmd.arg("--out-dir");
-        cmd.arg(format!("{}", self.out_dir.display()));
+        cmd.arg(BUILD_EXAMPLE_OUT_DIR.to_path(&self.dirs));
         cmd.arg("-Cdebuginfo=2");
+        cmd.arg("--target");
+        cmd.arg(&self.target_compiler.triple);
+        cmd.arg("-Cpanic=abort");
+        cmd.arg("--check-cfg=cfg(jit)");
         cmd.args(args);
         cmd
     }
@@ -552,59 +432,13 @@ impl TestRunner {
         spawn_and_wait(self.rustc_command(args));
     }
 
-    fn run_out_command<'a, I>(&self, name: &str, args: I)
-    where
-        I: IntoIterator<Item = &'a str>,
-    {
-        let mut full_cmd = vec![];
+    fn run_out_command(&self, name: &str, args: &[&str]) {
+        let mut cmd = self
+            .target_compiler
+            .run_with_runner(BUILD_EXAMPLE_OUT_DIR.to_path(&self.dirs).join(name));
 
-        // Prepend the RUN_WRAPPER's
-        if !self.run_wrapper.is_empty() {
-            full_cmd.extend(self.run_wrapper.iter().cloned());
-        }
-
-        full_cmd.push({
-            let mut out_path = self.out_dir.clone();
-            out_path.push(name);
-            out_path.to_str().unwrap().to_string()
-        });
-
-        for arg in args.into_iter() {
-            full_cmd.push(arg.to_string());
-        }
-
-        let mut cmd_iter = full_cmd.into_iter();
-        let first = cmd_iter.next().unwrap();
-
-        let mut cmd = Command::new(first);
-        cmd.args(cmd_iter);
+        cmd.args(args);
 
         spawn_and_wait(cmd);
-    }
-
-    fn cargo_command<'a, I>(&self, subcommand: &str, args: I) -> Command
-    where
-        I: IntoIterator<Item = &'a str>,
-    {
-        let mut cargo_clif = self.root_dir.clone();
-        cargo_clif.push("build");
-        cargo_clif.push(get_wrapper_file_name("cargo-clif", "bin"));
-
-        let mut cmd = cargo_command(
-            cargo_clif,
-            subcommand,
-            if subcommand == "clean" { None } else { Some(&self.target_triple) },
-            Path::new("."),
-        );
-        cmd.args(args);
-        cmd.env("RUSTFLAGS", &self.rust_flags);
-        cmd
-    }
-
-    fn run_cargo<'a, I>(&self, subcommand: &str, args: I)
-    where
-        I: IntoIterator<Item = &'a str>,
-    {
-        spawn_and_wait(self.cargo_command(subcommand, args));
     }
 }

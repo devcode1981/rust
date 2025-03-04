@@ -1,4 +1,4 @@
-# `aarch64-fuchsia` and `x86_64-fuchsia`
+# `aarch64-unknown-fuchsia` and `x86_64-unknown-fuchsia`
 
 **Tier: 2**
 
@@ -7,18 +7,9 @@ updatable, and performant.
 
 ## Target maintainers
 
-The [Fuchsia team]:
+See [`fuchsia.toml`] in the `team` repository for current target maintainers.
 
-- Tyler Mandry ([@tmandry](https://github.com/tmandry))
-- Dan Johnson ([@computerdruid](https://github.com/computerdruid))
-- David Koloski ([@djkoloski](https://github.com/djkoloski))
-- Andrew Pollack ([@andrewpollack](https://github.com/andrewpollack))
-- Joseph Ryan ([@P1n3appl3](https://github.com/P1n3appl3))
-
-As the team evolves over time, the specific members listed here may differ from
-the members reported by the API. The API should be considered to be
-authoritative if this occurs. Instead of pinging individual members, use
-`@rustbot ping fuchsia` to contact the team on GitHub.
+[`fuchsia.toml`]: https://github.com/rust-lang/team/blob/master/teams/fuchsia.toml
 
 ## Table of contents
 
@@ -67,7 +58,7 @@ This walkthrough will cover:
 1. Building a Fuchsia package.
 1. Publishing and running a Fuchsia package to a Fuchsia emulator.
 
-For the purposes of this walkthrough, we will only target `x86_64-fuchsia`.
+For the purposes of this walkthrough, we will only target `x86_64-unknown-fuchsia`.
 
 ## Compiling a Rust binary targeting Fuchsia
 
@@ -83,14 +74,14 @@ to handle the installation of Fuchsia targets for you. This can be done by issui
 the following commands:
 
 ```sh
-rustup target add x86_64-fuchsia
-rustup target add aarch64-fuchsia
+rustup target add x86_64-unknown-fuchsia
+rustup target add aarch64-unknown-fuchsia
 ```
 
 After installing our Fuchsia targets, we can now compile a Rust binary that targets
 Fuchsia.
 
-To create our Rust project, we can issue a standard `cargo` command as follows:
+To create our Rust project, we can use [`cargo`][cargo] as follows:
 
 **From base working directory**
 ```sh
@@ -127,7 +118,7 @@ during compilation:
 
 **`.cargo/config.toml`**
 ```txt
-[target.x86_64-fuchsia]
+[target.x86_64-unknown-fuchsia]
 
 rustflags = [
     "-Lnative=<SDK_PATH>/arch/x64/lib",
@@ -159,10 +150,10 @@ hello_fuchsia/
 Finally, we can build our rust binary as:
 
 ```sh
-cargo build --target x86_64-fuchsia
+cargo build --target x86_64-unknown-fuchsia
 ```
 
-Now we have a Rust binary at `target/x86_64-fuchsia/debug/hello_fuchsia`,
+Now we have a Rust binary at `target/x86_64-unknown-fuchsia/debug/hello_fuchsia`,
 targeting our desired Fuchsia target.
 
 **Current directory structure**
@@ -171,7 +162,7 @@ hello_fuchsia/
 ┣━ src/
 ┃  ┗━ main.rs
 ┣━ target/
-┃  ┗━ x86_64-fuchsia/
+┃  ┗━ x86_64-unknown-fuchsia/
 ┃     ┗━ debug/
 ┃        ┗━ hello_fuchsia
 ┣━ Cargo.toml
@@ -189,34 +180,68 @@ Fuchsia as well. A recent version (14+) of clang should be sufficient to compile
 Rust for Fuchsia.
 
 x86-64 and AArch64 Fuchsia targets can be enabled using the following
-configuration.
-
-In `config.toml`, add:
+configuration in `config.toml`:
 
 ```toml
 [build]
-target = ["<host_platform>", "aarch64-fuchsia", "x86_64-fuchsia"]
+target = ["<host_platform>", "aarch64-unknown-fuchsia", "x86_64-unknown-fuchsia"]
+
+[rust]
+lld = true
+
+[llvm]
+download-ci-llvm = false
+
+[target.x86_64-unknown-fuchsia]
+cc = "clang"
+cxx = "clang++"
+
+[target.aarch64-unknown-fuchsia]
+cc = "clang"
+cxx = "clang++"
 ```
 
-Additionally, the following environment variables must be configured (for
-example, using a script like `config-env.sh`):
+Though not strictly required, you may also want to use `clang` for your host
+target as well:
+
+```toml
+[target.<host_platform>]
+cc = "clang"
+cxx = "clang++"
+```
+
+By default, the Rust compiler installs itself to `/usr/local` on most UNIX
+systems. You may want to install it to another location (e.g. a local `install`
+directory) by setting a custom prefix in `config.toml`:
+
+```toml
+[install]
+# Make sure to use the absolute path to your install directory
+prefix = "<RUST_SRC_PATH>/install"
+```
+
+Next, the following environment variables must be configured. For example, using
+a script we name `config-env.sh`:
 
 ```sh
 # Configure this environment variable to be the path to the downloaded SDK
 export SDK_PATH="<SDK path goes here>"
 
-export CFLAGS_aarch64_fuchsia="--target=aarch64-fuchsia --sysroot=${SDK_PATH}/arch/arm64/sysroot -I${SDK_PATH}/pkg/fdio/include"
-export CXXFLAGS_aarch64_fuchsia="--target=aarch64-fuchsia --sysroot=${SDK_PATH}/arch/arm64/sysroot -I${SDK_PATH}/pkg/fdio/include"
-export LDFLAGS_aarch64_fuchsia="--target=aarch64-fuchsia --sysroot=${SDK_PATH}/arch/arm64/sysroot -L${SDK_PATH}/arch/arm64/lib"
-export CARGO_TARGET_AARCH64_FUCHSIA_RUSTFLAGS="-C link-arg=--sysroot=${SDK_PATH}/arch/arm64/sysroot -Lnative=${SDK_PATH}/arch/arm64/sysroot/lib -Lnative=${SDK_PATH}/arch/arm64/lib"
-export CFLAGS_x86_64_fuchsia="--target=x86_64-fuchsia --sysroot=${SDK_PATH}/arch/x64/sysroot -I${SDK_PATH}/pkg/fdio/include"
-export CXXFLAGS_x86_64_fuchsia="--target=x86_64-fuchsia --sysroot=${SDK_PATH}/arch/x64/sysroot -I${SDK_PATH}/pkg/fdio/include"
-export LDFLAGS_x86_64_fuchsia="--target=x86_64-fuchsia --sysroot=${SDK_PATH}/arch/x64/sysroot -L${SDK_PATH}/arch/x64/lib"
-export CARGO_TARGET_X86_64_FUCHSIA_RUSTFLAGS="-C link-arg=--sysroot=${SDK_PATH}/arch/x64/sysroot -Lnative=${SDK_PATH}/arch/x64/sysroot/lib -Lnative=${SDK_PATH}/arch/x64/lib"
+export CFLAGS_aarch64_unknown_fuchsia="--target=aarch64-unknown-fuchsia --sysroot=${SDK_PATH}/arch/arm64/sysroot -I${SDK_PATH}/pkg/fdio/include"
+export CXXFLAGS_aarch64_unknown_fuchsia="--target=aarch64-unknown-fuchsia --sysroot=${SDK_PATH}/arch/arm64/sysroot -I${SDK_PATH}/pkg/fdio/include"
+export LDFLAGS_aarch64_unknown_fuchsia="--target=aarch64-unknown-fuchsia --sysroot=${SDK_PATH}/arch/arm64/sysroot -L${SDK_PATH}/arch/arm64/lib"
+export CARGO_TARGET_AARCH64_UNKNOWN_FUCHSIA_RUSTFLAGS="-C link-arg=--sysroot=${SDK_PATH}/arch/arm64/sysroot -Lnative=${SDK_PATH}/arch/arm64/sysroot/lib -Lnative=${SDK_PATH}/arch/arm64/lib"
+export CFLAGS_x86_64_unknown_fuchsia="--target=x86_64-unknown-fuchsia --sysroot=${SDK_PATH}/arch/x64/sysroot -I${SDK_PATH}/pkg/fdio/include"
+export CXXFLAGS_x86_64_unknown_fuchsia="--target=x86_64-unknown-fuchsia --sysroot=${SDK_PATH}/arch/x64/sysroot -I${SDK_PATH}/pkg/fdio/include"
+export LDFLAGS_x86_64_unknown_fuchsia="--target=x86_64-unknown-fuchsia --sysroot=${SDK_PATH}/arch/x64/sysroot -L${SDK_PATH}/arch/x64/lib"
+export CARGO_TARGET_X86_64_UNKNOWN_FUCHSIA_RUSTFLAGS="-C link-arg=--sysroot=${SDK_PATH}/arch/x64/sysroot -Lnative=${SDK_PATH}/arch/x64/sysroot/lib -Lnative=${SDK_PATH}/arch/x64/lib"
 ```
 
-These can be run together in a shell environment by executing
-`(source config-env.sh && ./x.py install)`.
+Finally, the Rust compiler can be built and installed:
+
+```sh
+(source config-env.sh && ./x.py install)
+```
 
 Once `rustc` is installed, we can create a new working directory to work from,
 `hello_fuchsia` along with `hello_fuchsia/src`:
@@ -254,7 +279,7 @@ hello_fuchsia/
 Using your freshly installed `rustc`, you can compile a binary for Fuchsia using
 the following options:
 
-* `--target x86_64-fuchsia`/`--target aarch64-fuchsia`: Targets the Fuchsia
+* `--target x86_64-unknown-fuchsia`/`--target aarch64-unknown-fuchsia`: Targets the Fuchsia
   platform of your choice
 * `-Lnative ${SDK_PATH}/arch/${ARCH}/lib`: Link against Fuchsia libraries from
   the SDK
@@ -265,7 +290,7 @@ Putting it all together:
 
 ```sh
 # Configure these for the Fuchsia target of your choice
-TARGET_ARCH="<x86_64-fuchsia|aarch64-fuchsia>"
+TARGET_ARCH="<x86_64-unknown-fuchsia|aarch64-unknown-fuchsia>"
 ARCH="<x64|aarch64>"
 
 rustc \
@@ -291,16 +316,16 @@ Before moving on, double check your directory structure:
 **Current directory structure**
 ```txt
 hello_fuchsia/
-┣━ src/                     (if using rustc)
-┃   ┗━ hello_fuchsia.rs     ...
-┣━ bin/                     ...
-┃  ┗━ hello_fuchsia         ...
-┣━ src/                     (if using cargo)
-┃  ┗━ main.rs               ...
-┗━ target/                  ...
-   ┗━ x86_64-fuchsia/       ...
-      ┗━ debug/             ...
-         ┗━ hello_fuchsia   ...
+┣━ src/                         (if using rustc)
+┃   ┗━ hello_fuchsia.rs         ...
+┣━ bin/                         ...
+┃  ┗━ hello_fuchsia             ...
+┣━ src/                         (if using cargo)
+┃  ┗━ main.rs                   ...
+┗━ target/                      ...
+   ┗━ x86_64-unknown-fuchsia/   ...
+      ┗━ debug/                 ...
+         ┗━ hello_fuchsia       ...
 ```
 
 With our Rust binary built, we can move to creating a Fuchsia package.
@@ -337,7 +362,7 @@ package must contain one.
 
 **`pkg/hello_fuchsia.manifest` if using cargo**
 ```txt
-bin/hello_fuchsia=target/x86_64-fuchsia/debug/hello_fuchsia
+bin/hello_fuchsia=target/x86_64-unknown-fuchsia/debug/hello_fuchsia
 lib/ld.so.1=<SDK_PATH>/arch/x64/sysroot/dist/lib/ld.so.1
 lib/libfdio.so=<SDK_PATH>/arch/x64/dist/libfdio.so
 meta/package=pkg/meta/package
@@ -354,7 +379,7 @@ meta/hello_fuchsia.cm=pkg/meta/hello_fuchsia.cm
 ```
 
 *Note: Relative manifest paths are resolved starting from the working directory
-of `pm`. Make sure to fill out `<SDK_PATH>` with the path to the downloaded
+of `ffx`. Make sure to fill out `<SDK_PATH>` with the path to the downloaded
 SDK.*
 
 The `.manifest` file will be used to describe the contents of the package by
@@ -426,12 +451,10 @@ hello_fuchsia/
 Next, we'll build a package manifest as defined by our manifest:
 
 ```sh
-${SDK_PATH}/tools/${ARCH}/pm \
-    -api-level $(${SDK_PATH}/tools/${ARCH}/ffx version -v | grep "api-level" | head -1 |  awk -F ' ' '{print $2}') \
-    -o pkg/hello_fuchsia_manifest \
-    -m pkg/hello_fuchsia.manifest \
-    build \
-    -output-package-manifest pkg/hello_fuchsia_package_manifest
+${SDK_PATH}/tools/${ARCH}/ffx package build \
+    --api-level $(${SDK_PATH}/tools/${ARCH}/ffx --machine json version | jq .tool_version.api_level) \
+    --out pkg/hello_fuchsia_manifest \
+    pkg/hello_fuchsia.manifest
 ```
 
 This will produce `pkg/hello_fuchsia_manifest/` which is a package manifest we can
@@ -465,8 +488,7 @@ to.
 We can set up our repository with:
 
 ```sh
-${SDK_PATH}/tools/${ARCH}/pm newrepo \
-    -repo pkg/repo
+${SDK_PATH}/tools/${ARCH}/ffx repository create pkg/repo
 ```
 
 **Current directory structure**
@@ -490,17 +512,9 @@ hello_fuchsia/
 We can publish our new package to that repository with:
 
 ```sh
-${SDK_PATH}/tools/${ARCH}/pm publish \
-    -repo pkg/repo \
-    -lp -f <(echo "pkg/hello_fuchsia_package_manifest")
-```
-
-Then we can add the repository to `ffx`'s package server as `hello-fuchsia` using:
-
-```sh
-${SDK_PATH}/tools/${ARCH}/ffx repository add-from-pm \
-    pkg/repo \
-    -r hello-fuchsia
+${SDK_PATH}/tools/${ARCH}/ffx repository publish \
+    --package pkg/hello_fuchsia_package_manifest \
+    pkg/repo
 ```
 
 ## Running a Fuchsia component on an emulator
@@ -512,16 +526,16 @@ structure will look like:
 **Final directory structure**
 ```txt
 hello_fuchsia/
-┣━ src/                     (if using rustc)
-┃   ┗━ hello_fuchsia.rs     ...
-┣━ bin/                     ...
-┃  ┗━ hello_fuchsia         ...
-┣━ src/                     (if using cargo)
-┃  ┗━ main.rs               ...
-┣━ target/                  ...
-┃  ┗━ x86_64-fuchsia/       ...
-┃     ┗━ debug/             ...
-┃        ┗━ hello_fuchsia   ...
+┣━ src/                         (if using rustc)
+┃   ┗━ hello_fuchsia.rs         ...
+┣━ bin/                         ...
+┃  ┗━ hello_fuchsia             ...
+┣━ src/                         (if using cargo)
+┃  ┗━ main.rs                   ...
+┣━ target/                      ...
+┃  ┗━ x86_64-unknown-fuchsia/   ...
+┃     ┗━ debug/                 ...
+┃        ┗━ hello_fuchsia       ...
 ┗━ pkg/
    ┣━ meta/
    ┃  ┣━ package
@@ -560,7 +574,8 @@ Now, start a package repository server to serve our
 package to the emulator:
 
 ```sh
-${SDK_PATH}/tools/${ARCH}/ffx repository server start
+${SDK_PATH}/tools/${ARCH}/ffx repository server start \
+    --background --repository hello-fuchsia --repo-path pkg-repo
 ```
 
 Once the repository server is up and running, register it with the target Fuchsia system running in the emulator:
@@ -610,8 +625,8 @@ Tests can be run in the same way as a regular binary.
 
 * If using `cargo`, you can simply pass `test --no-run`
 to the `cargo` invocation and then repackage and rerun the Fuchsia package. From our previous example,
-this would look like `cargo test --target x86_64-fuchsia --no-run`, and moving the executable
-binary path found from the line `Executable unittests src/main.rs (target/x86_64-fuchsia/debug/deps/hello_fuchsia-<HASH>)`
+this would look like `cargo test --target x86_64-unknown-fuchsia --no-run`, and moving the executable
+binary path found from the line `Executable unittests src/main.rs (target/x86_64-unknown-fuchsia/debug/deps/hello_fuchsia-<HASH>)`
 into `pkg/hello_fuchsia.manifest`.
 
 * If using the compiled `rustc`, you can simply pass `--test`
@@ -641,8 +656,87 @@ available on the [Fuchsia devsite].
 
 ### Running the compiler test suite
 
-Running the Rust test suite on Fuchsia is [not currently supported], but work is
-underway to enable it.
+The commands in this section assume that they are being run from inside your
+local Rust source checkout:
+
+```sh
+cd ${RUST_SRC_PATH}
+```
+
+To run the Rust test suite on an emulated Fuchsia device, you'll also need to
+download a copy of the Fuchsia SDK. The current minimum supported SDK version is
+[20.20240412.3.1][minimum_supported_sdk_version].
+
+[minimum_supported_sdk_version]: https://chrome-infra-packages.appspot.com/p/fuchsia/sdk/core/linux-amd64/+/version:20.20240412.3.1
+
+Fuchsia's test runner interacts with the Fuchsia emulator and is located at
+`src/ci/docker/scripts/fuchsia-test-runner.py`. First, add the following
+variables to your existing `config-env.sh`:
+
+```sh
+# TEST_TOOLCHAIN_TMP_DIR can point anywhere, but it:
+#  - must be less than 108 characters, otherwise qemu can't handle the path
+#  - must be consistent across calls to this file (don't use `mktemp -d` here)
+export TEST_TOOLCHAIN_TMP_DIR="/tmp/rust-tmp"
+
+# Keep existing contents of `config-env.sh` from earlier, including SDK_PATH
+```
+
+We can then use the script to start our test environment with:
+
+```sh
+( \
+    source config-env.sh &&                                                   \
+    src/ci/docker/scripts/fuchsia-test-runner.py start                        \
+    --rust-build ${RUST_SRC_PATH}/build                                       \
+    --sdk ${SDK_PATH}                                                         \
+    --target {x86_64-unknown-fuchsia|aarch64-unknown-fuchsia}                 \
+    --verbose                                                                 \
+)
+```
+
+Where `${RUST_SRC_PATH}/build` is the `build-dir` set in `config.toml`.
+
+Once our environment is started, we can run our tests using `x.py` as usual. The
+test runner script will run the compiled tests on an emulated Fuchsia device. To
+run the full `tests/ui` test suite:
+
+```sh
+( \
+    source config-env.sh &&                                                   \
+    ./x.py                                                                    \
+    --config config.toml                                                      \
+    --stage=2                                                                 \
+    test tests/ui                                                             \
+    --target x86_64-unknown-fuchsia                                           \
+    --run=always                                                              \
+    --test-args --target-rustcflags                                           \
+    --test-args -Lnative=${SDK_PATH}/arch/{x64|arm64}/sysroot/lib             \
+    --test-args --target-rustcflags                                           \
+    --test-args -Lnative=${SDK_PATH}/arch/{x64|arm64}/lib                     \
+    --test-args --target-rustcflags                                           \
+    --test-args -Clink-arg=--undefined-version                                \
+    --test-args --remote-test-client                                          \
+    --test-args src/ci/docker/scripts/fuchsia-test-runner.py                  \
+)
+```
+
+By default, `x.py` compiles test binaries with `panic=unwind`. If you built your
+Rust toolchain with `-Cpanic=abort`, you need to tell `x.py` to compile test
+binaries with `panic=abort` as well:
+
+```sh
+    --test-args --target-rustcflags                                           \
+    --test-args -Cpanic=abort                                                 \
+    --test-args --target-rustcflags                                           \
+    --test-args -Zpanic_abort_tests                                           \
+```
+
+When finished testing, the test runner can be used to stop the test environment:
+
+```sh
+src/ci/docker/scripts/fuchsia-test-runner.py stop
+```
 
 ## Debugging
 
@@ -660,14 +754,15 @@ directory to launch `zxdb`:
 **In separate terminal**
 ```sh
 ${SDK_PATH}/tools/${ARCH}/ffx debug connect -- \
-    --symbol-path target/x86_64-fuchsia/debug
+    --symbol-path target/x86_64-unknown-fuchsia/debug
 ```
 
 * `--symbol-path` gets required symbol paths, which are
 necessary for stepping through your program.
 
-The "[displaying source code in `zxdb`](#displaying-source-code-in-zxdb)" section describes how you can
-display Rust and/or Fuchsia source code in your debugging session.
+The "[displaying source code in `zxdb`](#displaying-source-code-in-zxdb)"
+section describes how you can display Rust and/or Fuchsia source code in your
+debugging session.
 
 ### Using `zxdb`
 
@@ -756,7 +851,7 @@ source code:
 
 ```sh
 ${SDK_PATH}/tools/${ARCH}/ffx debug connect -- \
-    --symbol-path target/x86_64-fuchsia/debug \
+    --symbol-path target/x86_64-unknown-fuchsia/debug \
     --build-dir ${RUST_SRC_PATH}/rust \
     --build-dir ${FUCHSIA_SRC_PATH}/fuchsia/out/default
 ```
@@ -768,11 +863,69 @@ ${SDK_PATH}/tools/${ARCH}/ffx debug connect -- \
  Linking to a Fuchsia checkout can help with debugging Fuchsia libraries,
  such as [fdio].
 
+### Debugging the compiler test suite
+
+Debugging the compiler test suite requires some special configuration:
+
+First, we have to properly configure zxdb so it will be able to find debug
+symbols and source information for our test. The test runner can do this for us
+with:
+
+```sh
+src/ci/docker/scripts/fuchsia-test-runner.py debug                            \
+    --rust-src ${RUST_SRC_PATH}                                               \
+    --fuchsia-src ${FUCHSIA_SRC_PATH}                                         \
+    --test ${TEST}
+```
+
+where `${TEST}` is relative to Rust's `tests` directory (e.g. `ui/abi/...`).
+
+This will start a zxdb session that is properly configured for the specific test
+being run. All three arguments are optional, so you can omit `--fuchsia-src` if
+you don't have it downloaded. Now is a good time to set any desired breakpoints,
+like `b main`.
+
+Next, we have to tell `x.py` not to optimize or strip debug symbols from our
+test suite binaries. We can do this by passing some new arguments to `rustc`
+through our `x.py` invocation. The full invocation is:
+
+```sh
+( \
+    source config-env.sh &&                                                   \
+    ./x.py                                                                    \
+    --config config.toml                                                      \
+    --stage=2                                                                 \
+    test tests/${TEST}                                                        \
+    --target x86_64-unknown-fuchsia                                           \
+    --run=always                                                              \
+    --test-args --target-rustcflags                                           \
+    --test-args -Lnative=${SDK_PATH}/arch/{x64|arm64}/sysroot/lib             \
+    --test-args --target-rustcflags                                           \
+    --test-args -Lnative=${SDK_PATH}/arch/{x64|arm64}/lib                     \
+    --test-args --target-rustcflags                                           \
+    --test-args -Clink-arg=--undefined-version                                \
+    --test-args --target-rustcflags                                           \
+    --test-args -Cdebuginfo=2                                                 \
+    --test-args --target-rustcflags                                           \
+    --test-args -Copt-level=0                                                 \
+    --test-args --target-rustcflags                                           \
+    --test-args -Cstrip=none                                                  \
+    --test-args --remote-test-client                                          \
+    --test-args src/ci/docker/scripts/fuchsia-test-runner.py                  \
+)
+```
+
+*If you built your Rust toolchain with `panic=abort`, make sure to include the
+previous flags so your test binaries are also compiled with `panic=abort`.*
+
+Upon running this command, the test suite binary will be run and zxdb will
+attach and load any relevant debug symbols.
+
 [Fuchsia team]: https://team-api.infra.rust-lang.org/v1/teams/fuchsia.json
 [Fuchsia]: https://fuchsia.dev/
 [source tree]: https://fuchsia.dev/fuchsia-src/get-started/learn/build
 [rustup]: https://rustup.rs/
-[cargo]: https://doc.rust-lang.org/cargo/
+[cargo]: ../../cargo/index.html
 [Fuchsia SDK]: https://chrome-infra-packages.appspot.com/p/fuchsia/sdk/core
 [overview of CML]: https://fuchsia.dev/fuchsia-src/concepts/components/v2/component_manifests
 [reference for the file format]: https://fuchsia.dev/reference/cml

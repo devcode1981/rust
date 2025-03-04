@@ -1,7 +1,5 @@
 use super::*;
 
-use rustc_data_structures::sync::Lrc;
-
 fn init_source_map() -> SourceMap {
     let sm = SourceMap::new(FilePathMapping::empty());
     sm.new_source_file(PathBuf::from("blork.rs").into(), "first line.\nsecond line".to_string());
@@ -20,7 +18,7 @@ impl SourceMap {
     ///    * the LHS span must start at or before the RHS span.
     fn merge_spans(&self, sp_lhs: Span, sp_rhs: Span) -> Option<Span> {
         // Ensure we're at the same expansion ID.
-        if sp_lhs.ctxt() != sp_rhs.ctxt() {
+        if !sp_lhs.eq_ctxt(sp_rhs) {
             return None;
         }
 
@@ -50,6 +48,7 @@ impl SourceMap {
     fn bytepos_to_file_charpos(&self, bpos: BytePos) -> CharPos {
         let idx = self.lookup_source_file_idx(bpos);
         let sf = &(*self.files.borrow().source_files)[idx];
+        let bpos = sf.relative_position(bpos);
         sf.bytepos_to_file_charpos(bpos)
     }
 }
@@ -230,27 +229,25 @@ fn t10() {
     let SourceFile {
         name,
         src_hash,
-        start_pos,
-        end_pos,
+        checksum_hash,
+        source_len,
         lines,
         multibyte_chars,
-        non_narrow_chars,
         normalized_pos,
-        name_hash,
+        stable_id,
         ..
     } = (*src_file).clone();
 
     let imported_src_file = sm.new_imported_source_file(
         name,
         src_hash,
-        name_hash,
-        (end_pos - start_pos).to_usize(),
-        CrateNum::new(0),
-        lines,
+        checksum_hash,
+        stable_id,
+        source_len.to_u32(),
+        CrateNum::ZERO,
+        FreezeLock::new(lines.read().clone()),
         multibyte_chars,
-        non_narrow_chars,
         normalized_pos,
-        start_pos,
         0,
     );
 
@@ -260,57 +257,10 @@ fn t10() {
     );
     imported_src_file.add_external_src(|| Some(unnormalized.to_string()));
     assert_eq!(
-        imported_src_file.external_src.borrow().get_source().unwrap().as_ref(),
+        imported_src_file.external_src.borrow().get_source().unwrap(),
         normalized,
         "imported source file should be normalized"
     );
-}
-
-/// Returns the span corresponding to the `n`th occurrence of `substring` in `source_text`.
-trait SourceMapExtension {
-    fn span_substr(
-        &self,
-        file: &Lrc<SourceFile>,
-        source_text: &str,
-        substring: &str,
-        n: usize,
-    ) -> Span;
-}
-
-impl SourceMapExtension for SourceMap {
-    fn span_substr(
-        &self,
-        file: &Lrc<SourceFile>,
-        source_text: &str,
-        substring: &str,
-        n: usize,
-    ) -> Span {
-        eprintln!(
-            "span_substr(file={:?}/{:?}, substring={:?}, n={})",
-            file.name, file.start_pos, substring, n
-        );
-        let mut i = 0;
-        let mut hi = 0;
-        loop {
-            let offset = source_text[hi..].find(substring).unwrap_or_else(|| {
-                panic!(
-                    "source_text `{}` does not have {} occurrences of `{}`, only {}",
-                    source_text, n, substring, i
-                );
-            });
-            let lo = hi + offset;
-            hi = lo + substring.len();
-            if i == n {
-                let span = Span::with_root_ctxt(
-                    BytePos(lo as u32 + file.start_pos.0),
-                    BytePos(hi as u32 + file.start_pos.0),
-                );
-                assert_eq!(&self.span_to_snippet(span).unwrap()[..], substring);
-                return span;
-            }
-            i += 1;
-        }
-    }
 }
 
 // Takes a unix-style path and returns a platform specific path.
@@ -344,11 +294,18 @@ fn map_path_prefix(mapping: &FilePathMapping, p: &str) -> String {
     mapping.map_prefix(path(p)).0.to_string_lossy().to_string()
 }
 
+fn reverse_map_prefix(mapping: &FilePathMapping, p: &str) -> Option<String> {
+    mapping.reverse_map_prefix_heuristically(&path(p)).map(|q| q.to_string_lossy().to_string())
+}
+
 #[test]
 fn path_prefix_remapping() {
     // Relative to relative
     {
-        let mapping = &FilePathMapping::new(vec![(path("abc/def"), path("foo"))]);
+        let mapping = &FilePathMapping::new(
+            vec![(path("abc/def"), path("foo"))],
+            FileNameDisplayPreference::Remapped,
+        );
 
         assert_eq!(map_path_prefix(mapping, "abc/def/src/main.rs"), path_str("foo/src/main.rs"));
         assert_eq!(map_path_prefix(mapping, "abc/def"), path_str("foo"));
@@ -356,7 +313,10 @@ fn path_prefix_remapping() {
 
     // Relative to absolute
     {
-        let mapping = &FilePathMapping::new(vec![(path("abc/def"), path("/foo"))]);
+        let mapping = &FilePathMapping::new(
+            vec![(path("abc/def"), path("/foo"))],
+            FileNameDisplayPreference::Remapped,
+        );
 
         assert_eq!(map_path_prefix(mapping, "abc/def/src/main.rs"), path_str("/foo/src/main.rs"));
         assert_eq!(map_path_prefix(mapping, "abc/def"), path_str("/foo"));
@@ -364,7 +324,10 @@ fn path_prefix_remapping() {
 
     // Absolute to relative
     {
-        let mapping = &FilePathMapping::new(vec![(path("/abc/def"), path("foo"))]);
+        let mapping = &FilePathMapping::new(
+            vec![(path("/abc/def"), path("foo"))],
+            FileNameDisplayPreference::Remapped,
+        );
 
         assert_eq!(map_path_prefix(mapping, "/abc/def/src/main.rs"), path_str("foo/src/main.rs"));
         assert_eq!(map_path_prefix(mapping, "/abc/def"), path_str("foo"));
@@ -372,7 +335,10 @@ fn path_prefix_remapping() {
 
     // Absolute to absolute
     {
-        let mapping = &FilePathMapping::new(vec![(path("/abc/def"), path("/foo"))]);
+        let mapping = &FilePathMapping::new(
+            vec![(path("/abc/def"), path("/foo"))],
+            FileNameDisplayPreference::Remapped,
+        );
 
         assert_eq!(map_path_prefix(mapping, "/abc/def/src/main.rs"), path_str("/foo/src/main.rs"));
         assert_eq!(map_path_prefix(mapping, "/abc/def"), path_str("/foo"));
@@ -382,12 +348,14 @@ fn path_prefix_remapping() {
 #[test]
 fn path_prefix_remapping_expand_to_absolute() {
     // "virtual" working directory is relative path
-    let mapping =
-        &FilePathMapping::new(vec![(path("/foo"), path("FOO")), (path("/bar"), path("BAR"))]);
+    let mapping = &FilePathMapping::new(
+        vec![(path("/foo"), path("FOO")), (path("/bar"), path("BAR"))],
+        FileNameDisplayPreference::Remapped,
+    );
     let working_directory = path("/foo");
     let working_directory = RealFileName::Remapped {
         local_path: Some(working_directory.clone()),
-        virtual_name: mapping.map_prefix(working_directory).0,
+        virtual_name: mapping.map_prefix(working_directory).0.into_owned(),
     };
 
     assert_eq!(working_directory.remapped_path_if_available(), path("FOO"));
@@ -481,6 +449,47 @@ fn path_prefix_remapping_expand_to_absolute() {
 }
 
 #[test]
+fn path_prefix_remapping_reverse() {
+    // Ignores options without alphanumeric chars.
+    {
+        let mapping = &FilePathMapping::new(
+            vec![(path("abc"), path("/")), (path("def"), path("."))],
+            FileNameDisplayPreference::Remapped,
+        );
+
+        assert_eq!(reverse_map_prefix(mapping, "/hello.rs"), None);
+        assert_eq!(reverse_map_prefix(mapping, "./hello.rs"), None);
+    }
+
+    // Returns `None` if multiple options match.
+    {
+        let mapping = &FilePathMapping::new(
+            vec![(path("abc"), path("/redacted")), (path("def"), path("/redacted"))],
+            FileNameDisplayPreference::Remapped,
+        );
+
+        assert_eq!(reverse_map_prefix(mapping, "/redacted/hello.rs"), None);
+    }
+
+    // Distinct reverse mappings.
+    {
+        let mapping = &FilePathMapping::new(
+            vec![(path("abc"), path("/redacted")), (path("def/ghi"), path("/fake/dir"))],
+            FileNameDisplayPreference::Remapped,
+        );
+
+        assert_eq!(
+            reverse_map_prefix(mapping, "/redacted/path/hello.rs"),
+            Some(path_str("abc/path/hello.rs"))
+        );
+        assert_eq!(
+            reverse_map_prefix(mapping, "/fake/dir/hello.rs"),
+            Some(path_str("def/ghi/hello.rs"))
+        );
+    }
+}
+
+#[test]
 fn test_next_point() {
     let sm = SourceMap::new(FilePathMapping::empty());
     sm.new_source_file(PathBuf::from("example.rs").into(), "a…b".to_string());
@@ -511,16 +520,44 @@ fn test_next_point() {
     assert_eq!(span.lo().0, 4);
     assert_eq!(span.hi().0, 5);
 
-    // A non-empty span at the last byte should advance to create an empty
-    // span pointing at the end of the file.
+    // Reaching to the end of file, return a span that will get error with `span_to_snippet`
     let span = Span::with_root_ctxt(BytePos(4), BytePos(5));
     let span = sm.next_point(span);
     assert_eq!(span.lo().0, 5);
-    assert_eq!(span.hi().0, 5);
+    assert_eq!(span.hi().0, 6);
+    assert!(sm.span_to_snippet(span).is_err());
 
-    // Empty span pointing just past the last byte.
+    // Reaching to the end of file, return a span that will get error with `span_to_snippet`
     let span = Span::with_root_ctxt(BytePos(5), BytePos(5));
     let span = sm.next_point(span);
     assert_eq!(span.lo().0, 5);
-    assert_eq!(span.hi().0, 5);
+    assert_eq!(span.hi().0, 6);
+    assert!(sm.span_to_snippet(span).is_err());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn read_binary_file_handles_lying_stat() {
+    // read_binary_file tries to read the contents of a file into an Arc<[u8]> while
+    // never having two copies of the data in memory at once. This is an optimization
+    // to support include_bytes! with large files. But since Rust allocators are
+    // sensitive to alignment, our implementation can't be bootstrapped off calling
+    // std::fs::read. So we test that we have the same behavior even on files where
+    // fs::metadata lies.
+
+    // stat always says that /proc/self/cmdline is length 0, but it isn't.
+    let cmdline = Path::new("/proc/self/cmdline");
+    let len = std::fs::metadata(cmdline).unwrap().len() as usize;
+    let real = std::fs::read(cmdline).unwrap();
+    assert!(len < real.len());
+    let bin = RealFileLoader.read_binary_file(cmdline).unwrap();
+    assert_eq!(&real[..], &bin[..]);
+
+    // stat always says that /sys/devices/system/cpu/kernel_max is the size of a block.
+    let kernel_max = Path::new("/sys/devices/system/cpu/kernel_max");
+    let len = std::fs::metadata(kernel_max).unwrap().len() as usize;
+    let real = std::fs::read(kernel_max).unwrap();
+    assert!(len > real.len());
+    let bin = RealFileLoader.read_binary_file(kernel_max).unwrap();
+    assert_eq!(&real[..], &bin[..]);
 }
